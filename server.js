@@ -3,12 +3,18 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
+
+// ---------- آپلود عکس محصولات — روی Cloudinary ذخیره می‌شود (پایدار، برخلاف دیسک سرور) ----------
+const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
+const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
+const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
 // ---------- ذخیره‌سازی ساده روی فایل JSON (بدون نیاز به کامپایل) ----------
 const DB_FILE = path.join(__dirname, 'store-data.json');
@@ -127,6 +133,58 @@ app.get('/api/auth/me', auth, (req, res) => {
   const user = db.users.find((u) => u.id === req.user.id);
   if (!user) return res.status(404).json({ error: 'کاربر یافت نشد' });
   res.json({ user: { id: user.id, email: user.email, fullName: user.full_name } });
+});
+
+// ---------- Upload تصویر (فقط مدیر) — به‌جای دیسک سرور، روی Cloudinary ذخیره می‌شود ----------
+// ورودی: { imageBase64: "data:image/jpeg;base64,...." }
+// خروجی: { url: "https://res.cloudinary.com/.../xxxx.jpg" }
+app.post('/api/upload', auth, requireAdmin, async (req, res) => {
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
+    return res.status(500).json({ error: 'تنظیمات Cloudinary روی سرور کامل نشده است (CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET)' });
+  }
+  const { imageBase64 } = req.body || {};
+  if (!imageBase64 || typeof imageBase64 !== 'string' || !imageBase64.startsWith('data:image/')) {
+    return res.status(400).json({ error: 'فایل تصویر معتبر نیست' });
+  }
+  const match = imageBase64.match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/);
+  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط jpg, png, webp, gif)' });
+
+  // حداکثر حجم: تقریباً ۱۰ مگابایت
+  const approxBytes = Math.ceil((match[2].length * 3) / 4);
+  if (approxBytes > 10 * 1024 * 1024) {
+    return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  }
+
+  try {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const folder = 'maison-store';
+    // امضای درخواست طبق مستندات Cloudinary: sha1(پارامترها به‌ترتیب حروف‌الفبا + api_secret)
+    const signature = crypto
+      .createHash('sha1')
+      .update(`folder=${folder}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`)
+      .digest('hex');
+
+    const body = new URLSearchParams({
+      file: imageBase64,
+      api_key: CLOUDINARY_API_KEY,
+      timestamp: String(timestamp),
+      folder,
+      signature,
+    });
+
+    const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    const data = await cloudRes.json();
+    if (!cloudRes.ok || !data.secure_url) {
+      return res.status(502).json({ error: data.error?.message || 'آپلود به Cloudinary ناموفق بود' });
+    }
+    res.json({ url: data.secure_url });
+  } catch (e) {
+    res.status(500).json({ error: 'خطای سرور هنگام آپلود تصویر' });
+  }
 });
 
 // ---------- Products ----------
