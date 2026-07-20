@@ -13,14 +13,53 @@ app.use(express.json());
 // ---------- ذخیره‌سازی ساده روی فایل JSON (بدون نیاز به کامپایل) ----------
 const DB_FILE = path.join(__dirname, 'store-data.json');
 
+// فقط همین ایمیل اجازه‌ی افزودن/ویرایش/حذف محصول را دارد.
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'rezajordan2012@gmail.com').toLowerCase();
+
+const CATEGORY_LABEL = {
+  perfume: 'عطر و ادکلن',
+  beauty: 'آرایشی و بهداشتی',
+  electronics: 'لوازم برقی شخصی',
+};
+
+const SEED_PRODUCTS = [
+  { id: 'p1', name: 'بلور شب', brand: 'خانه میسان', category: 'perfume', price: 2450000, description: 'رایحه‌ای شرقی و گرم با نت‌های عود و وانیل، مناسب شب.', image: '' },
+  { id: 'p2', name: 'باغ سپید', brand: 'خانه میسان', category: 'perfume', price: 1980000, description: 'ترکیبی تازه از یاس و مرکبات برای روزهای بهاری.', image: '' },
+  { id: 'p3', name: 'سرم درخشش طلایی', brand: 'اطلس', category: 'beauty', price: 890000, description: 'سرم آبرسان با عصاره طلا، مناسب پوست‌های خشک و بی‌روح.', image: '' },
+  { id: 'p4', name: 'پالت آرایش صدف', brand: 'اطلس', category: 'beauty', price: 1250000, description: 'پالت سایه و رژ با پیگمنت بالا و بافت مخملی.', image: '' },
+  {
+    id: 'p7',
+    name: 'رژ لب مخملی',
+    brand: 'اطلس',
+    category: 'beauty',
+    price: 620000,
+    description: 'بافت مخملی و ماندگاری بالا، با طیف گسترده‌ی رنگ — رنگ و شماره را انتخاب کن.',
+    image: '',
+    variants: [
+      { id: 'v1', label: 'شماره ۱ - قرمز کلاسیک', hex: '#B0202E', image: '' },
+      { id: 'v2', label: 'شماره ۲ - صورتی ملایم', hex: '#D98CA0', image: '' },
+      { id: 'v3', label: 'شماره ۳ - نارنجی مرجانی', hex: '#E06B4E', image: '' },
+      { id: 'v4', label: 'شماره ۴ - بژ خاکی', hex: '#B98567', image: '' },
+      { id: 'v5', label: 'شماره ۵ - قرمز آجری', hex: '#8C3A2B', image: '' },
+      { id: 'v6', label: 'شماره ۶ - زرشکی تیره', hex: '#5C1A2E', image: '' },
+    ],
+  },
+  { id: 'p5', name: 'سشوار حرفه‌ای یون‌دار', brand: 'ولوره', category: 'electronics', price: 3200000, description: 'قدرت ۲۲۰۰ وات، فناوری یونیزه برای کاهش وز مو.', image: '' },
+  { id: 'p6', name: 'اپیلاتور بی‌سیم', brand: 'ولوره', category: 'electronics', price: 2100000, description: 'طراحی مینیمال، شارژ سریع و کاربرد ملایم روی پوست.', image: '' },
+];
+
 function readDB() {
   if (!fs.existsSync(DB_FILE)) {
-    return { users: [], orders: [], nextUserId: 1, nextOrderId: 1 };
+    return { users: [], orders: [], products: SEED_PRODUCTS, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
   }
   try {
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    const data = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    // فایل‌های قدیمی‌تر ممکن است فیلد products را نداشته باشند؛ در آن صورت با مقادیر پیش‌فرض پر می‌شود.
+    if (!Array.isArray(data.products)) data.products = SEED_PRODUCTS;
+    if (!data.nextProductId) data.nextProductId = 8;
+    return data;
   } catch (e) {
-    return { users: [], orders: [], nextUserId: 1, nextOrderId: 1 };
+    return { users: [], orders: [], products: SEED_PRODUCTS, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
   }
 }
 
@@ -43,6 +82,14 @@ function auth(req, res, next) {
   } catch {
     res.status(401).json({ error: 'نشست نامعتبر است، دوباره وارد شوید' });
   }
+}
+
+// فقط بعد از auth استفاده شود: تضمین می‌کند کاربر همان ایمیل مدیر سایت است.
+function requireAdmin(req, res, next) {
+  if (!req.user || String(req.user.email || '').toLowerCase() !== ADMIN_EMAIL) {
+    return res.status(403).json({ error: 'اجازه‌ی دسترسی به این بخش را نداری' });
+  }
+  next();
 }
 
 // ---------- Auth ----------
@@ -80,6 +127,67 @@ app.get('/api/auth/me', auth, (req, res) => {
   const user = db.users.find((u) => u.id === req.user.id);
   if (!user) return res.status(404).json({ error: 'کاربر یافت نشد' });
   res.json({ user: { id: user.id, email: user.email, fullName: user.full_name } });
+});
+
+// ---------- Products ----------
+// مشاهده‌ی محصولات برای همه آزاد است (فروشگاه عمومی)
+app.get('/api/products', (req, res) => {
+  const db = readDB();
+  res.json(db.products || []);
+});
+
+// افزودن، ویرایش و حذف محصول فقط برای مدیر سایت (auth + requireAdmin)
+app.post('/api/products', auth, requireAdmin, (req, res) => {
+  const p = req.body || {};
+  if (!p.name || !p.price) return res.status(400).json({ error: 'نام و قیمت محصول الزامی است' });
+  const db = readDB();
+  const id = 'p' + db.nextProductId++;
+  const product = {
+    id,
+    name: p.name,
+    brand: p.brand || '',
+    category: p.category || 'perfume',
+    price: Number(p.price),
+    description: p.description || '',
+    image: p.image || '',
+    ...(Array.isArray(p.variants) && p.variants.length > 0 ? { variants: p.variants } : {}),
+  };
+  db.products.push(product);
+  writeDB(db);
+  res.json(product);
+});
+
+app.put('/api/products/:id', auth, requireAdmin, (req, res) => {
+  const db = readDB();
+  const idx = db.products.findIndex((x) => x.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'محصول یافت نشد' });
+  const p = req.body || {};
+  const updated = {
+    ...db.products[idx],
+    name: p.name ?? db.products[idx].name,
+    brand: p.brand ?? db.products[idx].brand,
+    category: p.category ?? db.products[idx].category,
+    price: p.price !== undefined ? Number(p.price) : db.products[idx].price,
+    description: p.description ?? db.products[idx].description,
+    image: p.image ?? db.products[idx].image,
+  };
+  if (Array.isArray(p.variants) && p.variants.length > 0) {
+    updated.variants = p.variants;
+  } else if (p.variants !== undefined) {
+    delete updated.variants;
+  }
+  db.products[idx] = updated;
+  writeDB(db);
+  res.json(updated);
+});
+
+app.delete('/api/products/:id', auth, requireAdmin, (req, res) => {
+  const db = readDB();
+  const before = db.products.length;
+  db.products = db.products.filter((x) => x.id !== req.params.id);
+  if (db.products.length === before) return res.status(404).json({ error: 'محصول یافت نشد' });
+  writeDB(db);
+  res.json({ ok: true });
 });
 
 // ---------- Orders ----------
