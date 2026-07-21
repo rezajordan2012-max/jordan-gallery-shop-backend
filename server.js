@@ -29,15 +29,16 @@ const CATEGORY_LABEL = {
 };
 
 const SEED_PRODUCTS = [
-  { id: 'p1', name: 'بلور شب', brand: 'خانه میسان', category: 'perfume', price: 2450000, description: 'رایحه‌ای شرقی و گرم با نت‌های عود و وانیل، مناسب شب.', image: '' },
-  { id: 'p2', name: 'باغ سپید', brand: 'خانه میسان', category: 'perfume', price: 1980000, description: 'ترکیبی تازه از یاس و مرکبات برای روزهای بهاری.', image: '' },
-  { id: 'p3', name: 'سرم درخشش طلایی', brand: 'اطلس', category: 'beauty', price: 890000, description: 'سرم آبرسان با عصاره طلا، مناسب پوست‌های خشک و بی‌روح.', image: '' },
-  { id: 'p4', name: 'پالت آرایش صدف', brand: 'اطلس', category: 'beauty', price: 1250000, description: 'پالت سایه و رژ با پیگمنت بالا و بافت مخملی.', image: '' },
+  { id: 'p1', name: 'بلور شب', brand: 'خانه میسان', category: 'perfume', subcategory: 'women', price: 2450000, description: 'رایحه‌ای شرقی و گرم با نت‌های عود و وانیل، مناسب شب.', image: '' },
+  { id: 'p2', name: 'باغ سپید', brand: 'خانه میسان', category: 'perfume', subcategory: 'unisex', price: 1980000, description: 'ترکیبی تازه از یاس و مرکبات برای روزهای بهاری.', image: '' },
+  { id: 'p3', name: 'سرم درخشش طلایی', brand: 'اطلس', category: 'makeup', subcategory: 'face', price: 890000, description: 'سرم آبرسان با عصاره طلا، مناسب پوست‌های خشک و بی‌روح.', image: '' },
+  { id: 'p4', name: 'پالت سایه صدف', brand: 'اطلس', category: 'makeup', subcategory: 'eye', price: 1250000, description: 'پالت سایه با پیگمنت بالا و بافت مخملی.', image: '' },
   {
     id: 'p7',
     name: 'رژ لب مخملی',
     brand: 'اطلس',
-    category: 'beauty',
+    category: 'makeup',
+    subcategory: 'lip',
     price: 620000,
     description: 'بافت مخملی و ماندگاری بالا، با طیف گسترده‌ی رنگ — رنگ و شماره را انتخاب کن.',
     image: '',
@@ -50,8 +51,12 @@ const SEED_PRODUCTS = [
       { id: 'v6', label: 'شماره ۶ - زرشکی تیره', hex: '#5C1A2E', image: '' },
     ],
   },
-  { id: 'p5', name: 'سشوار حرفه‌ای یون‌دار', brand: 'ولوره', category: 'electronics', price: 3200000, description: 'قدرت ۲۲۰۰ وات، فناوری یونیزه برای کاهش وز مو.', image: '' },
-  { id: 'p6', name: 'اپیلاتور بی‌سیم', brand: 'ولوره', category: 'electronics', price: 2100000, description: 'طراحی مینیمال، شارژ سریع و کاربرد ملایم روی پوست.', image: '' },
+  { id: 'p8', name: 'کیف لوازم آرایش', brand: 'اطلس', category: 'makeup', subcategory: 'accessory', price: 540000, description: 'کیف مخملی جادار برای نگهداری از لوازم آرایشی.', image: '' },
+  { id: 'p9', name: 'شامپو ترمیم‌کننده', brand: 'ولوره', category: 'hygiene', subcategory: 'hair', price: 380000, description: 'شامپو بدون سولفات، مناسب موهای آسیب‌دیده.', image: '' },
+  { id: 'p10', name: 'لوسیون آبرسان بدن', brand: 'ولوره', category: 'hygiene', subcategory: 'body', price: 420000, description: 'لوسیون سبک و سریع‌جذب برای آبرسانی روزانه‌ی پوست.', image: '' },
+  { id: 'p5', name: 'سشوار حرفه‌ای یون‌دار', brand: 'ولوره', category: 'electronics', subcategory: 'hair', price: 3200000, description: 'قدرت ۲۲۰۰ وات، فناوری یونیزه برای کاهش وز مو.', image: '' },
+  { id: 'p6', name: 'اپیلاتور بی‌سیم', brand: 'ولوره', category: 'electronics', subcategory: 'body', price: 2100000, description: 'طراحی مینیمال، شارژ سریع و کاربرد ملایم روی پوست.', image: '' },
+  { id: 'p11', name: 'دستگاه پاکسازی صورت', brand: 'ولوره', category: 'electronics', subcategory: 'face', price: 1650000, description: 'برس سونیک برای پاکسازی عمیق منافذ پوست صورت.', image: '' },
 ];
 
 function readDB() {
@@ -205,6 +210,7 @@ app.post('/api/products', auth, requireAdmin, (req, res) => {
     name: p.name,
     brand: p.brand || '',
     category: p.category || 'perfume',
+    subcategory: p.subcategory || '',
     price: Number(p.price),
     description: p.description || '',
     image: p.image || '',
@@ -225,6 +231,7 @@ app.put('/api/products/:id', auth, requireAdmin, (req, res) => {
     name: p.name ?? db.products[idx].name,
     brand: p.brand ?? db.products[idx].brand,
     category: p.category ?? db.products[idx].category,
+    subcategory: p.subcategory !== undefined ? p.subcategory : db.products[idx].subcategory,
     price: p.price !== undefined ? Number(p.price) : db.products[idx].price,
     description: p.description ?? db.products[idx].description,
     image: p.image ?? db.products[idx].image,
