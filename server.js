@@ -62,16 +62,17 @@ const SEED_PRODUCTS = [
 
 function readDB() {
   if (!fs.existsSync(DB_FILE)) {
-    return { users: [], orders: [], products: SEED_PRODUCTS, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
+    return { users: [], orders: [], products: SEED_PRODUCTS, settings: {}, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
   }
   try {
     const data = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
     // فایل‌های قدیمی‌تر ممکن است فیلد products را نداشته باشند؛ در آن صورت با مقادیر پیش‌فرض پر می‌شود.
     if (!Array.isArray(data.products)) data.products = SEED_PRODUCTS;
     if (!data.nextProductId) data.nextProductId = 8;
+    if (!data.settings || typeof data.settings !== 'object') data.settings = {};
     return data;
   } catch (e) {
-    return { users: [], orders: [], products: SEED_PRODUCTS, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
+    return { users: [], orders: [], products: SEED_PRODUCTS, settings: {}, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
   }
 }
 
@@ -191,6 +192,19 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'خطای سرور هنگام آپلود تصویر' });
   }
+});
+
+// ---------- Settings (مثل تصویر Hero صفحه‌ی اصلی) ----------
+app.get('/api/settings', (req, res) => {
+  const db = readDB();
+  res.json(db.settings || {});
+});
+
+app.put('/api/settings', auth, requireAdmin, (req, res) => {
+  const db = readDB();
+  db.settings = { ...db.settings, ...(req.body || {}) };
+  writeDB(db);
+  res.json(db.settings);
 });
 
 // ---------- Products ----------
