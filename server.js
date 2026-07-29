@@ -230,6 +230,8 @@ app.post('/api/products', auth, requireAdmin, (req, res) => {
     facets: (p.facets && typeof p.facets === 'object') ? p.facets : {},
     price: Number(p.price),
     description: p.description || '',
+    properties: p.properties || '',
+    ingredients: p.ingredients || '',
     image: p.image || '',
     ...(Array.isArray(p.variants) && p.variants.length > 0 ? { variants: p.variants } : {}),
   };
@@ -253,6 +255,8 @@ app.put('/api/products/:id', auth, requireAdmin, (req, res) => {
     facets: p.facets !== undefined ? p.facets : db.products[idx].facets,
     price: p.price !== undefined ? Number(p.price) : db.products[idx].price,
     description: p.description ?? db.products[idx].description,
+    properties: p.properties !== undefined ? p.properties : db.products[idx].properties,
+    ingredients: p.ingredients !== undefined ? p.ingredients : db.products[idx].ingredients,
     image: p.image ?? db.products[idx].image,
   };
   if (Array.isArray(p.variants) && p.variants.length > 0) {
