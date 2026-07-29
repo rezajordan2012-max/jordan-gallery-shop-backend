@@ -232,6 +232,7 @@ app.post('/api/products', auth, requireAdmin, (req, res) => {
     description: p.description || '',
     properties: p.properties || '',
     ingredients: p.ingredients || '',
+    discountPercent: Number(p.discountPercent) || 0,
     image: p.image || '',
     ...(Array.isArray(p.variants) && p.variants.length > 0 ? { variants: p.variants } : {}),
   };
@@ -257,6 +258,7 @@ app.put('/api/products/:id', auth, requireAdmin, (req, res) => {
     description: p.description ?? db.products[idx].description,
     properties: p.properties !== undefined ? p.properties : db.products[idx].properties,
     ingredients: p.ingredients !== undefined ? p.ingredients : db.products[idx].ingredients,
+    discountPercent: p.discountPercent !== undefined ? (Number(p.discountPercent) || 0) : db.products[idx].discountPercent,
     image: p.image ?? db.products[idx].image,
   };
   if (Array.isArray(p.variants) && p.variants.length > 0) {
