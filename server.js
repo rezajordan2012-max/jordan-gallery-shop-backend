@@ -4,8 +4,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 app.use(cors());
@@ -16,21 +15,36 @@ const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
-// ---------- ذخیره‌سازی ساده روی فایل JSON (بدون نیاز به کامپایل) ----------
-const DB_FILE = path.join(__dirname, 'store-data.json');
+// ----------------------------------------------------------------------------------
+// ذخیره‌سازی داده‌ها — قبلاً روی یک فایل JSON کنار کد ذخیره می‌شد که باعث می‌شد با هر
+// ری‌استارت یا دیپلوی سرویس (مثلاً روی Render)، دیسک سرور پاک بشه و اطلاعات از بین برن.
+// حالا همه چیز روی MongoDB ذخیره می‌شود که پایدار است و با ری‌استارت سرور از بین نمی‌رود.
+//
+// برای فعال کردنش، متغیر محیطی MONGODB_URI رو روی سرور (Render) تنظیم کن؛ مقدارش
+// آدرس اتصال یک دیتابیس رایگان MongoDB Atlas است (mongodb+srv://...).
+// اگر این متغیر تنظیم نشود، سرور به‌جای کرش کردن، از یک حافظه‌ی موقت (in-memory) استفاده
+// می‌کند تا سایت کار کند، اما هشدار می‌دهد که این حالت هم با هر ری‌استارت سرور پاک می‌شود.
+// ----------------------------------------------------------------------------------
+const MONGODB_URI = process.env.MONGODB_URI;
+
+let mongoClientPromise = null;
+let inMemoryFallback = null; // فقط وقتی MONGODB_URI تنظیم نشده استفاده می‌شود
+
+if (!MONGODB_URI) {
+  console.warn(
+    '⚠️  هشدار مهم: متغیر محیطی MONGODB_URI تنظیم نشده است. اطلاعات فروشگاه (محصولات، کاربران، تنظیمات) ' +
+    'روی حافظه‌ی موقت سرور نگه داشته می‌شود و با هر ری‌استارت یا دیپلوی جدید کاملاً پاک خواهد شد. ' +
+    'برای رفع همیشگی این مشکل، یک دیتابیس رایگان MongoDB Atlas بساز و آدرس اتصالش را در متغیر ' +
+    'محیطی MONGODB_URI روی Render قرار بده.'
+  );
+}
 
 // فقط همین ایمیل اجازه‌ی افزودن/ویرایش/حذف محصول را دارد.
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'rezajordan2012@gmail.com').toLowerCase();
 
-const CATEGORY_LABEL = {
-  perfume: 'عطر و ادکلن',
-  beauty: 'آرایشی و بهداشتی',
-  electronics: 'لوازم برقی شخصی',
-};
-
 const SEED_PRODUCTS = [
-  { id: 'p1', name: 'بلور شب', brand: 'خانه میسان', category: 'perfume', subcategory: 'womenPerfume', price: 2450000, description: 'رایحه‌ای شرقی و گرم با نت‌های عود و وانیل، مناسب شب.', image: '' },
-  { id: 'p2', name: 'باغ سپید', brand: 'خانه میسان', category: 'perfume', subcategory: 'menPerfume', price: 1980000, description: 'ترکیبی تازه از یاس و مرکبات برای روزهای بهاری.', image: '' },
+  { id: 'p1', name: 'بلور شب', brand: 'جردن', category: 'perfume', subcategory: 'womenPerfume', price: 2450000, description: 'رایحه‌ای شرقی و گرم با نت‌های عود و وانیل، مناسب شب.', image: '' },
+  { id: 'p2', name: 'باغ سپید', brand: 'جردن', category: 'perfume', subcategory: 'menPerfume', price: 1980000, description: 'ترکیبی تازه از یاس و مرکبات برای روزهای بهاری.', image: '' },
   { id: 'p3', name: 'کانسیلر پوششی', brand: 'اطلس', category: 'makeup', subcategory: 'face', type: 'concealer', price: 890000, description: 'کانسیلر با پوشش بالا، مناسب پوست‌های خشک و بی‌روح.', image: '' },
   { id: 'p4', name: 'پالت سایه صدف', brand: 'اطلس', category: 'makeup', subcategory: 'eye', type: 'eyeshadow', price: 1250000, description: 'پالت سایه با پیگمنت بالا و بافت مخملی.', image: '' },
   {
@@ -60,24 +74,49 @@ const SEED_PRODUCTS = [
   { id: 'p11', name: 'دستگاه پاکسازی صورت', brand: 'ولوره', category: 'electronics', subcategory: 'face', price: 1650000, description: 'برس سونیک برای پاکسازی عمیق منافذ پوست صورت.', image: '' },
 ];
 
-function readDB() {
-  if (!fs.existsSync(DB_FILE)) {
-    return { users: [], orders: [], products: SEED_PRODUCTS, settings: {}, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
-  }
-  try {
-    const data = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-    // فایل‌های قدیمی‌تر ممکن است فیلد products را نداشته باشند؛ در آن صورت با مقادیر پیش‌فرض پر می‌شود.
-    if (!Array.isArray(data.products)) data.products = SEED_PRODUCTS;
-    if (!data.nextProductId) data.nextProductId = 8;
-    if (!data.settings || typeof data.settings !== 'object') data.settings = {};
-    return data;
-  } catch (e) {
-    return { users: [], orders: [], products: SEED_PRODUCTS, settings: {}, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
-  }
+function defaultState() {
+  return { users: [], orders: [], products: SEED_PRODUCTS, settings: {}, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
 }
 
-function writeDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
+async function getCollection() {
+  if (!mongoClientPromise) {
+    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
+    mongoClientPromise = client.connect().then(() => client);
+  }
+  const client = await mongoClientPromise;
+  return client.db('jordan_gallery').collection('store_state');
+}
+
+// همیشه یک شیء کامل و معتبر برمی‌گرداند (چه از Mongo، چه از حافظه‌ی موقت)
+async function readDB() {
+  if (!MONGODB_URI) {
+    if (!inMemoryFallback) inMemoryFallback = defaultState();
+    return inMemoryFallback;
+  }
+  const col = await getCollection();
+  let doc = await col.findOne({ _id: 'main' });
+  if (!doc) {
+    doc = { _id: 'main', ...defaultState() };
+    await col.insertOne(doc);
+  }
+  if (!Array.isArray(doc.products) || doc.products.length === 0) doc.products = SEED_PRODUCTS;
+  if (!doc.nextProductId) doc.nextProductId = 8;
+  if (!doc.settings || typeof doc.settings !== 'object') doc.settings = {};
+  if (!Array.isArray(doc.users)) doc.users = [];
+  if (!Array.isArray(doc.orders)) doc.orders = [];
+  if (!doc.nextUserId) doc.nextUserId = 1;
+  if (!doc.nextOrderId) doc.nextOrderId = 1;
+  return doc;
+}
+
+async function writeDB(data) {
+  if (!MONGODB_URI) {
+    inMemoryFallback = data;
+    return;
+  }
+  const col = await getCollection();
+  const { _id, ...rest } = data;
+  await col.replaceOne({ _id: 'main' }, { _id: 'main', ...rest }, { upsert: true });
 }
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret';
@@ -105,46 +144,57 @@ function requireAdmin(req, res, next) {
   next();
 }
 
+// هر مسیری که با دیتابیس کار می‌کند (readDB/writeDB) ممکن است خطای اتصال بدهد؛
+// این wrapper خطاها را با پیام فارسی روشن برمی‌گرداند به‌جای کرش کردن سرور.
+function withDb(handler) {
+  return async (req, res) => {
+    try {
+      await handler(req, res);
+    } catch (e) {
+      console.error('DB error:', e);
+      res.status(500).json({ error: 'مشکل در اتصال به پایگاه‌داده — لطفاً چند لحظه بعد دوباره امتحان کن' });
+    }
+  };
+}
+
 // ---------- Auth ----------
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', withDb(async (req, res) => {
   const { email, password, fullName } = req.body || {};
   if (!email || !password || password.length < 6) {
     return res.status(400).json({ error: 'ایمیل و رمز عبور (حداقل ۶ کاراکتر) الزامی است' });
   }
-  const db = readDB();
+  const db = await readDB();
   const exists = db.users.find((u) => u.email === email);
   if (exists) return res.status(409).json({ error: 'این ایمیل قبلاً ثبت شده است' });
 
   const hash = await bcrypt.hash(password, 10);
   const user = { id: db.nextUserId++, email, password_hash: hash, full_name: fullName || '', created_at: new Date().toISOString() };
   db.users.push(user);
-  writeDB(db);
+  await writeDB(db);
 
   const token = jwt.sign({ id: user.id, email }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, user: { id: user.id, email, fullName: user.full_name } });
-});
+}));
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', withDb(async (req, res) => {
   const { email, password } = req.body || {};
-  const db = readDB();
+  const db = await readDB();
   const user = db.users.find((u) => u.email === email);
   if (!user) return res.status(401).json({ error: 'ایمیل یا رمز عبور اشتباه است' });
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: 'ایمیل یا رمز عبور اشتباه است' });
   const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, user: { id: user.id, email: user.email, fullName: user.full_name } });
-});
+}));
 
-app.get('/api/auth/me', auth, (req, res) => {
-  const db = readDB();
+app.get('/api/auth/me', auth, withDb(async (req, res) => {
+  const db = await readDB();
   const user = db.users.find((u) => u.id === req.user.id);
   if (!user) return res.status(404).json({ error: 'کاربر یافت نشد' });
   res.json({ user: { id: user.id, email: user.email, fullName: user.full_name } });
-});
+}));
 
-// ---------- Upload تصویر (فقط مدیر) — به‌جای دیسک سرور، روی Cloudinary ذخیره می‌شود ----------
-// ورودی: { imageBase64: "data:image/jpeg;base64,...." }
-// خروجی: { url: "https://res.cloudinary.com/.../xxxx.jpg" }
+// ---------- Upload تصویر (فقط مدیر) — روی Cloudinary ذخیره می‌شود ----------
 app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
     return res.status(500).json({ error: 'تنظیمات Cloudinary روی سرور کامل نشده است (CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET)' });
@@ -165,7 +215,6 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   try {
     const timestamp = Math.floor(Date.now() / 1000);
     const folder = 'maison-store';
-    // امضای درخواست طبق مستندات Cloudinary: sha1(پارامترها به‌ترتیب حروف‌الفبا + api_secret)
     const signature = crypto
       .createHash('sha1')
       .update(`folder=${folder}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`)
@@ -194,31 +243,31 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// ---------- Settings (مثل تصویر Hero صفحه‌ی اصلی) ----------
-app.get('/api/settings', (req, res) => {
-  const db = readDB();
+// ---------- Settings (مثل تصویر Hero صفحه‌ی اصلی و تخفیف همگانی) ----------
+app.get('/api/settings', withDb(async (req, res) => {
+  const db = await readDB();
   res.json(db.settings || {});
-});
+}));
 
-app.put('/api/settings', auth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.put('/api/settings', auth, requireAdmin, withDb(async (req, res) => {
+  const db = await readDB();
   db.settings = { ...db.settings, ...(req.body || {}) };
-  writeDB(db);
+  await writeDB(db);
   res.json(db.settings);
-});
+}));
 
 // ---------- Products ----------
 // مشاهده‌ی محصولات برای همه آزاد است (فروشگاه عمومی)
-app.get('/api/products', (req, res) => {
-  const db = readDB();
+app.get('/api/products', withDb(async (req, res) => {
+  const db = await readDB();
   res.json(db.products || []);
-});
+}));
 
 // افزودن، ویرایش و حذف محصول فقط برای مدیر سایت (auth + requireAdmin)
-app.post('/api/products', auth, requireAdmin, (req, res) => {
+app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
   const p = req.body || {};
   if (!p.name || !p.price) return res.status(400).json({ error: 'نام و قیمت محصول الزامی است' });
-  const db = readDB();
+  const db = await readDB();
   const id = 'p' + db.nextProductId++;
   const product = {
     id,
@@ -237,12 +286,12 @@ app.post('/api/products', auth, requireAdmin, (req, res) => {
     ...(Array.isArray(p.variants) && p.variants.length > 0 ? { variants: p.variants } : {}),
   };
   db.products.push(product);
-  writeDB(db);
+  await writeDB(db);
   res.json(product);
-});
+}));
 
-app.put('/api/products/:id', auth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
+  const db = await readDB();
   const idx = db.products.findIndex((x) => x.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: 'محصول یافت نشد' });
   const p = req.body || {};
@@ -267,30 +316,30 @@ app.put('/api/products/:id', auth, requireAdmin, (req, res) => {
     delete updated.variants;
   }
   db.products[idx] = updated;
-  writeDB(db);
+  await writeDB(db);
   res.json(updated);
-});
+}));
 
-app.delete('/api/products/:id', auth, requireAdmin, (req, res) => {
-  const db = readDB();
+app.delete('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
+  const db = await readDB();
   const before = db.products.length;
   db.products = db.products.filter((x) => x.id !== req.params.id);
   if (db.products.length === before) return res.status(404).json({ error: 'محصول یافت نشد' });
-  writeDB(db);
+  await writeDB(db);
   res.json({ ok: true });
-});
+}));
 
 // ---------- Orders ----------
-app.get('/api/orders', auth, (req, res) => {
-  const db = readDB();
+app.get('/api/orders', auth, withDb(async (req, res) => {
+  const db = await readDB();
   const orders = db.orders
     .filter((o) => o.user_id === req.user.id)
     .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   res.json(orders);
-});
+}));
 
 // ---------- Zarinpal payment ----------
-app.post('/api/payment/request', auth, async (req, res) => {
+app.post('/api/payment/request', auth, withDb(async (req, res) => {
   const { items, amount, description } = req.body || {};
   if (!amount || amount < 1000) return res.status(400).json({ error: 'مبلغ نامعتبر است' });
   if (!ZARINPAL_MERCHANT_ID) return res.status(500).json({ error: 'ZARINPAL_MERCHANT_ID تنظیم نشده است' });
@@ -309,7 +358,7 @@ app.post('/api/payment/request', auth, async (req, res) => {
     const data = await zRes.json();
     if (data.data && data.data.code === 100) {
       const authority = data.data.authority;
-      const db = readDB();
+      const db = await readDB();
       const order = {
         id: db.nextOrderId++,
         user_id: req.user.id,
@@ -321,7 +370,7 @@ app.post('/api/payment/request', auth, async (req, res) => {
         created_at: new Date().toISOString(),
       };
       db.orders.push(order);
-      writeDB(db);
+      await writeDB(db);
       res.json({ paymentUrl: `https://www.zarinpal.com/pg/StartPay/${authority}` });
     } else {
       res.status(400).json({ error: 'خطا در اتصال به درگاه پرداخت', detail: data });
@@ -329,18 +378,23 @@ app.post('/api/payment/request', auth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'خطای سرور در ارتباط با درگاه' });
   }
-});
+}));
 
 // Zarinpal redirects the buyer's browser here after payment
 app.get('/payment/callback', async (req, res) => {
   const { Authority, Status } = req.query;
-  const db = readDB();
+  let db;
+  try {
+    db = await readDB();
+  } catch (e) {
+    return res.redirect(`${FRONTEND_URL}/payment/result?status=error`);
+  }
   const order = db.orders.find((o) => o.authority === Authority);
   if (!order) return res.redirect(`${FRONTEND_URL}/payment/result?status=notfound`);
 
   if (Status !== 'OK') {
     order.status = 'canceled';
-    writeDB(db);
+    await writeDB(db);
     return res.redirect(`${FRONTEND_URL}/payment/result?status=canceled`);
   }
 
@@ -358,11 +412,11 @@ app.get('/payment/callback', async (req, res) => {
     if (data.data && (data.data.code === 100 || data.data.code === 101)) {
       order.status = 'paid';
       order.ref_id = String(data.data.ref_id);
-      writeDB(db);
+      await writeDB(db);
       return res.redirect(`${FRONTEND_URL}/payment/result?status=success&ref=${data.data.ref_id}`);
     }
     order.status = 'failed';
-    writeDB(db);
+    await writeDB(db);
     res.redirect(`${FRONTEND_URL}/payment/result?status=failed`);
   } catch (e) {
     res.redirect(`${FRONTEND_URL}/payment/result?status=error`);
