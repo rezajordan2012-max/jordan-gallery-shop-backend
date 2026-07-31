@@ -245,6 +245,7 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
 
 // ---------- Settings (مثل تصویر Hero صفحه‌ی اصلی و تخفیف همگانی) ----------
 app.get('/api/settings', withDb(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   const db = await readDB();
   res.json(db.settings || {});
 }));
@@ -259,6 +260,7 @@ app.put('/api/settings', auth, requireAdmin, withDb(async (req, res) => {
 // ---------- Products ----------
 // مشاهده‌ی محصولات برای همه آزاد است (فروشگاه عمومی)
 app.get('/api/products', withDb(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   const db = await readDB();
   res.json(db.products || []);
 }));
