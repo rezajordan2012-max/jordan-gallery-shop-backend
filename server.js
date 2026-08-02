@@ -157,6 +157,17 @@ function withDb(handler) {
   };
 }
 
+// همه‌ی GET های داده‌ی زنده (محصولات و تنظیمات) هرگز نباید کش شوند — نه توسط مرورگر، نه توسط
+// هیچ پراکسی/CDN بین‌راهی (مثل بعضی اپراتورهای موبایل) — وگرنه گوشی‌های مختلف نسخه‌های متفاوتی
+// از داده را می‌بینند. این همان چیزی بود که باعث می‌شد محصول جدید فقط روی گوشی خودت دیده شود.
+function noCache(req, res, next) {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+  next();
+}
+
 // ---------- Auth ----------
 app.post('/api/auth/register', withDb(async (req, res) => {
   const { email, password, fullName } = req.body || {};
@@ -244,8 +255,7 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
 });
 
 // ---------- Settings (مثل تصویر Hero صفحه‌ی اصلی و تخفیف همگانی) ----------
-app.get('/api/settings', withDb(async (req, res) => {
-  res.set('Cache-Control', 'no-store');
+app.get('/api/settings', noCache, withDb(async (req, res) => {
   const db = await readDB();
   res.json(db.settings || {});
 }));
@@ -259,8 +269,7 @@ app.put('/api/settings', auth, requireAdmin, withDb(async (req, res) => {
 
 // ---------- Products ----------
 // مشاهده‌ی محصولات برای همه آزاد است (فروشگاه عمومی)
-app.get('/api/products', withDb(async (req, res) => {
-  res.set('Cache-Control', 'no-store');
+app.get('/api/products', noCache, withDb(async (req, res) => {
   const db = await readDB();
   res.json(db.products || []);
 }));
@@ -332,7 +341,7 @@ app.delete('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
 }));
 
 // ---------- Orders ----------
-app.get('/api/orders', auth, withDb(async (req, res) => {
+app.get('/api/orders', auth, noCache, withDb(async (req, res) => {
   const db = await readDB();
   const orders = db.orders
     .filter((o) => o.user_id === req.user.id)
