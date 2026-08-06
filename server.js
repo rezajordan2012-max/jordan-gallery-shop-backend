@@ -8,9 +8,11 @@ const { MongoClient } = require('mongodb');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '15mb' }));
+// حد حجم بدنه‌ی درخواست از ۱۵ مگابایت به ۵۰ مگابایت افزایش یافت تا آپلود کلیپ‌های ویدئویی
+// کوتاه (که به‌صورت base64 حدود ۳۳٪ حجیم‌تر از فایل اصلی می‌شوند) هم امکان‌پذیر باشد.
+app.use(express.json({ limit: '50mb' }));
 
-// ---------- آپلود عکس محصولات — روی Cloudinary ذخیره می‌شود (پایدار، برخلاف دیسک سرور) ----------
+// ---------- آپلود عکس/ویدیو محصولات و بنرها — روی Cloudinary ذخیره می‌شود (پایدار، برخلاف دیسک سرور) ----------
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
@@ -205,22 +207,38 @@ app.get('/api/auth/me', auth, withDb(async (req, res) => {
   res.json({ user: { id: user.id, email: user.email, fullName: user.full_name } });
 }));
 
-// ---------- Upload تصویر (فقط مدیر) — روی Cloudinary ذخیره می‌شود ----------
+// ---------- Upload تصویر یا ویدیو (فقط مدیر) — روی Cloudinary ذخیره می‌شود ----------
+// این مسیر هم عکس (برای محصولات و بنرها) و هم کلیپ ویدئویی کوتاه (فقط برای بنرهای صفحه‌ی اصلی)
+// را می‌پذیرد. نوع فایل از پیشوند data-URL (data:image/... یا data:video/...) تشخیص داده می‌شود
+// و بر همان اساس یا به Cloudinary image-upload یا به video-upload فرستاده می‌شود.
 app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
     return res.status(500).json({ error: 'تنظیمات Cloudinary روی سرور کامل نشده است (CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET)' });
   }
   const { imageBase64 } = req.body || {};
-  if (!imageBase64 || typeof imageBase64 !== 'string' || !imageBase64.startsWith('data:image/')) {
-    return res.status(400).json({ error: 'فایل تصویر معتبر نیست' });
+  if (!imageBase64 || typeof imageBase64 !== 'string') {
+    return res.status(400).json({ error: 'فایل معتبر نیست' });
   }
-  const match = imageBase64.match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/);
-  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط jpg, png, webp, gif)' });
 
-  // حداکثر حجم: تقریباً ۱۰ مگابایت
-  const approxBytes = Math.ceil((match[2].length * 3) / 4);
-  if (approxBytes > 10 * 1024 * 1024) {
-    return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  const imageMatch = imageBase64.match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/);
+  const videoMatch = imageBase64.match(/^data:video\/(mp4|webm|quicktime|ogg|mov);base64,(.+)$/);
+
+  if (!imageMatch && !videoMatch) {
+    return res.status(400).json({ error: 'فرمت فایل پشتیبانی نمی‌شود (عکس: jpg, png, webp, gif — ویدیو: mp4, webm, mov)' });
+  }
+
+  const isVideo = !!videoMatch;
+  const dataPart = isVideo ? videoMatch[2] : imageMatch[2];
+
+  // حداکثر حجم: عکس تا ۱۰ مگابایت، ویدیو تا ۳۰ مگابایت (کلیپ‌های کوتاه بنر)
+  const approxBytes = Math.ceil((dataPart.length * 3) / 4);
+  const maxBytes = isVideo ? 30 * 1024 * 1024 : 10 * 1024 * 1024;
+  if (approxBytes > maxBytes) {
+    return res.status(413).json({
+      error: isVideo
+        ? 'حجم ویدیو بیش از حد مجاز است (حداکثر ۳۰ مگابایت — یک کلیپ کوتاه‌تر انتخاب کن)'
+        : 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)',
+    });
   }
 
   try {
@@ -239,7 +257,8 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
       signature,
     });
 
-    const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {
+    const resourceType = isVideo ? 'video' : 'image';
+    const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body,
@@ -248,13 +267,13 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
     if (!cloudRes.ok || !data.secure_url) {
       return res.status(502).json({ error: data.error?.message || 'آپلود به Cloudinary ناموفق بود' });
     }
-    res.json({ url: data.secure_url });
+    res.json({ url: data.secure_url, type: isVideo ? 'video' : 'image' });
   } catch (e) {
-    res.status(500).json({ error: 'خطای سرور هنگام آپلود تصویر' });
+    res.status(500).json({ error: 'خطای سرور هنگام آپلود فایل' });
   }
 });
 
-// ---------- Settings (مثل تصویر Hero صفحه‌ی اصلی و تخفیف همگانی) ----------
+// ---------- Settings (مثل تصویر/ویدیوی Hero صفحه‌ی اصلی و تخفیف همگانی) ----------
 app.get('/api/settings', noCache, withDb(async (req, res) => {
   const db = await readDB();
   res.json(db.settings || {});
@@ -294,6 +313,10 @@ app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
     ingredients: p.ingredients || '',
     discountPercent: Number(p.discountPercent) || 0,
     image: p.image || '',
+    imageFit: p.imageFit === 'cover' ? 'cover' : 'contain',
+    imagePosX: Number.isFinite(Number(p.imagePosX)) ? Number(p.imagePosX) : 50,
+    imagePosY: Number.isFinite(Number(p.imagePosY)) ? Number(p.imagePosY) : 50,
+    imageZoom: Number.isFinite(Number(p.imageZoom)) && Number(p.imageZoom) > 0 ? Number(p.imageZoom) : 1,
     ...(Array.isArray(p.variants) && p.variants.length > 0 ? { variants: p.variants } : {}),
   };
   db.products.push(product);
@@ -320,6 +343,10 @@ app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
     ingredients: p.ingredients !== undefined ? p.ingredients : db.products[idx].ingredients,
     discountPercent: p.discountPercent !== undefined ? (Number(p.discountPercent) || 0) : db.products[idx].discountPercent,
     image: p.image ?? db.products[idx].image,
+    imageFit: p.imageFit !== undefined ? (p.imageFit === 'cover' ? 'cover' : 'contain') : (db.products[idx].imageFit || 'contain'),
+    imagePosX: p.imagePosX !== undefined ? (Number(p.imagePosX) || 50) : (db.products[idx].imagePosX ?? 50),
+    imagePosY: p.imagePosY !== undefined ? (Number(p.imagePosY) || 50) : (db.products[idx].imagePosY ?? 50),
+    imageZoom: p.imageZoom !== undefined ? (Number(p.imageZoom) || 1) : (db.products[idx].imageZoom ?? 1),
   };
   if (Array.isArray(p.variants) && p.variants.length > 0) {
     updated.variants = p.variants;
