@@ -186,7 +186,7 @@ app.post('/api/auth/register', withDb(async (req, res) => {
   await writeDB(db);
 
   const token = jwt.sign({ id: user.id, email }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, user: { id: user.id, email, fullName: user.full_name } });
+  res.json({ token, user: { id: user.id, email, fullName: user.full_name, createdAt: user.created_at } });
 }));
 
 app.post('/api/auth/login', withDb(async (req, res) => {
@@ -197,14 +197,14 @@ app.post('/api/auth/login', withDb(async (req, res) => {
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: 'ایمیل یا رمز عبور اشتباه است' });
   const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, user: { id: user.id, email: user.email, fullName: user.full_name } });
+  res.json({ token, user: { id: user.id, email: user.email, fullName: user.full_name, createdAt: user.created_at || null } });
 }));
 
 app.get('/api/auth/me', auth, withDb(async (req, res) => {
   const db = await readDB();
   const user = db.users.find((u) => u.id === req.user.id);
   if (!user) return res.status(404).json({ error: 'کاربر یافت نشد' });
-  res.json({ user: { id: user.id, email: user.email, fullName: user.full_name } });
+  res.json({ user: { id: user.id, email: user.email, fullName: user.full_name, createdAt: user.created_at || null } });
 }));
 
 // ---------- Upload تصویر یا ویدیو (فقط مدیر) — روی Cloudinary ذخیره می‌شود ----------
