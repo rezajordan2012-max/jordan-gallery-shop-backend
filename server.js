@@ -8,40 +8,21 @@ const { MongoClient } = require('mongodb');
 
 const app = express();
 app.use(cors());
-// حد حجم بدنه‌ی درخواست از ۱۵ مگابایت به ۵۰ مگابایت افزایش یافت تا آپلود کلیپ‌های ویدئویی
-// کوتاه (که به‌صورت base64 حدود ۳۳٪ حجیم‌تر از فایل اصلی می‌شوند) هم امکان‌پذیر باشد.
 app.use(express.json({ limit: '50mb' }));
 
-// ---------- آپلود عکس/ویدیو محصولات و بنرها — روی Cloudinary ذخیره می‌شود (پایدار، برخلاف دیسک سرور) ----------
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
-// ----------------------------------------------------------------------------------
-// ذخیره‌سازی داده‌ها — قبلاً روی یک فایل JSON کنار کد ذخیره می‌شد که باعث می‌شد با هر
-// ری‌استارت یا دیپلوی سرویس (مثلاً روی Render)، دیسک سرور پاک بشه و اطلاعات از بین برن.
-// حالا همه چیز روی MongoDB ذخیره می‌شود که پایدار است و با ری‌استارت سرور از بین نمی‌رود.
-//
-// برای فعال کردنش، متغیر محیطی MONGODB_URI رو روی سرور (Render) تنظیم کن؛ مقدارش
-// آدرس اتصال یک دیتابیس رایگان MongoDB Atlas است (mongodb+srv://...).
-// اگر این متغیر تنظیم نشود، سرور به‌جای کرش کردن، از یک حافظه‌ی موقت (in-memory) استفاده
-// می‌کند تا سایت کار کند، اما هشدار می‌دهد که این حالت هم با هر ری‌استارت سرور پاک می‌شود.
-// ----------------------------------------------------------------------------------
 const MONGODB_URI = process.env.MONGODB_URI;
 
 let mongoClientPromise = null;
-let inMemoryFallback = null; // فقط وقتی MONGODB_URI تنظیم نشده استفاده می‌شود
+let inMemoryFallback = null;
 
 if (!MONGODB_URI) {
-  console.warn(
-    '⚠️  هشدار مهم: متغیر محیطی MONGODB_URI تنظیم نشده است. اطلاعات فروشگاه (محصولات، کاربران، تنظیمات) ' +
-    'روی حافظه‌ی موقت سرور نگه داشته می‌شود و با هر ری‌استارت یا دیپلوی جدید کاملاً پاک خواهد شد. ' +
-    'برای رفع همیشگی این مشکل، یک دیتابیس رایگان MongoDB Atlas بساز و آدرس اتصالش را در متغیر ' +
-    'محیطی MONGODB_URI روی Render قرار بده.'
-  );
+  console.warn('⚠️  هشدار: MONGODB_URI تنظیم نشده — از حافظه‌ی موقت استفاده می‌شود.');
 }
 
-// فقط همین ایمیل اجازه‌ی افزودن/ویرایش/حذف محصول را دارد.
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'rezajordan2012@gmail.com').toLowerCase();
 
 const SEED_PRODUCTS = [
@@ -89,7 +70,6 @@ async function getCollection() {
   return client.db('jordan_gallery').collection('store_state');
 }
 
-// همیشه یک شیء کامل و معتبر برمی‌گرداند (چه از Mongo، چه از حافظه‌ی موقت)
 async function readDB() {
   if (!MONGODB_URI) {
     if (!inMemoryFallback) inMemoryFallback = defaultState();
@@ -138,7 +118,6 @@ function auth(req, res, next) {
   }
 }
 
-// فقط بعد از auth استفاده شود: تضمین می‌کند کاربر همان ایمیل مدیر سایت است.
 function requireAdmin(req, res, next) {
   if (!req.user || String(req.user.email || '').toLowerCase() !== ADMIN_EMAIL) {
     return res.status(403).json({ error: 'اجازه‌ی دسترسی به این بخش را نداری' });
@@ -146,8 +125,6 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-// هر مسیری که با دیتابیس کار می‌کند (readDB/writeDB) ممکن است خطای اتصال بدهد؛
-// این wrapper خطاها را با پیام فارسی روشن برمی‌گرداند به‌جای کرش کردن سرور.
 function withDb(handler) {
   return async (req, res) => {
     try {
@@ -159,9 +136,6 @@ function withDb(handler) {
   };
 }
 
-// همه‌ی GET های داده‌ی زنده (محصولات و تنظیمات) هرگز نباید کش شوند — نه توسط مرورگر، نه توسط
-// هیچ پراکسی/CDN بین‌راهی (مثل بعضی اپراتورهای موبایل) — وگرنه گوشی‌های مختلف نسخه‌های متفاوتی
-// از داده را می‌بینند. این همان چیزی بود که باعث می‌شد محصول جدید فقط روی گوشی خودت دیده شود.
 function noCache(req, res, next) {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
@@ -170,7 +144,6 @@ function noCache(req, res, next) {
   next();
 }
 
-// ---------- Auth ----------
 app.post('/api/auth/register', withDb(async (req, res) => {
   const { email, password, fullName } = req.body || {};
   if (!email || !password || password.length < 6) {
@@ -207,13 +180,9 @@ app.get('/api/auth/me', auth, withDb(async (req, res) => {
   res.json({ user: { id: user.id, email: user.email, fullName: user.full_name, createdAt: user.created_at || null } });
 }));
 
-// ---------- Upload تصویر یا ویدیو (فقط مدیر) — روی Cloudinary ذخیره می‌شود ----------
-// این مسیر هم عکس (برای محصولات و بنرها) و هم کلیپ ویدئویی کوتاه (فقط برای بنرهای صفحه‌ی اصلی)
-// را می‌پذیرد. نوع فایل از پیشوند data-URL (data:image/... یا data:video/...) تشخیص داده می‌شود
-// و بر همان اساس یا به Cloudinary image-upload یا به video-upload فرستاده می‌شود.
 app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
-    return res.status(500).json({ error: 'تنظیمات Cloudinary روی سرور کامل نشده است (CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET)' });
+    return res.status(500).json({ error: 'تنظیمات Cloudinary روی سرور کامل نشده است' });
   }
   const { imageBase64 } = req.body || {};
   if (!imageBase64 || typeof imageBase64 !== 'string') {
@@ -224,20 +193,17 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   const videoMatch = imageBase64.match(/^data:video\/(mp4|webm|quicktime|ogg|mov);base64,(.+)$/);
 
   if (!imageMatch && !videoMatch) {
-    return res.status(400).json({ error: 'فرمت فایل پشتیبانی نمی‌شود (عکس: jpg, png, webp, gif — ویدیو: mp4, webm, mov)' });
+    return res.status(400).json({ error: 'فرمت فایل پشتیبانی نمی‌شود' });
   }
 
   const isVideo = !!videoMatch;
   const dataPart = isVideo ? videoMatch[2] : imageMatch[2];
 
-  // حداکثر حجم: عکس تا ۱۰ مگابایت، ویدیو تا ۳۰ مگابایت (کلیپ‌های کوتاه بنر)
   const approxBytes = Math.ceil((dataPart.length * 3) / 4);
   const maxBytes = isVideo ? 30 * 1024 * 1024 : 10 * 1024 * 1024;
   if (approxBytes > maxBytes) {
     return res.status(413).json({
-      error: isVideo
-        ? 'حجم ویدیو بیش از حد مجاز است (حداکثر ۳۰ مگابایت — یک کلیپ کوتاه‌تر انتخاب کن)'
-        : 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)',
+      error: isVideo ? 'حجم ویدیو بیش از حد مجاز است (حداکثر ۳۰ مگابایت)' : 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)',
     });
   }
 
@@ -273,7 +239,6 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// ---------- Settings (مثل تصویر/ویدیوی Hero صفحه‌ی اصلی و تخفیف همگانی) ----------
 app.get('/api/settings', noCache, withDb(async (req, res) => {
   const db = await readDB();
   res.json(db.settings || {});
@@ -286,14 +251,12 @@ app.put('/api/settings', auth, requireAdmin, withDb(async (req, res) => {
   res.json(db.settings);
 }));
 
-// ---------- Products ----------
-// مشاهده‌ی محصولات برای همه آزاد است (فروشگاه عمومی)
 app.get('/api/products', noCache, withDb(async (req, res) => {
   const db = await readDB();
   res.json(db.products || []);
 }));
 
-// افزودن، ویرایش و حذف محصول فقط برای مدیر سایت (auth + requireAdmin)
+// افزودن محصول — فیلد nameEn (نام انگلیسی، اختیاری) هم اضافه شد
 app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
   const p = req.body || {};
   if (!p.name || !p.price) return res.status(400).json({ error: 'نام و قیمت محصول الزامی است' });
@@ -302,6 +265,7 @@ app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
   const product = {
     id,
     name: p.name,
+    nameEn: p.nameEn || '',
     brand: p.brand || '',
     category: p.category || 'perfume',
     subcategory: p.subcategory || '',
@@ -324,6 +288,7 @@ app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
   res.json(product);
 }));
 
+// ویرایش محصول — فیلد nameEn هم به‌روزرسانی می‌شود
 app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
   const db = await readDB();
   const idx = db.products.findIndex((x) => x.id === req.params.id);
@@ -332,6 +297,7 @@ app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
   const updated = {
     ...db.products[idx],
     name: p.name ?? db.products[idx].name,
+    nameEn: p.nameEn !== undefined ? p.nameEn : (db.products[idx].nameEn || ''),
     brand: p.brand ?? db.products[idx].brand,
     category: p.category ?? db.products[idx].category,
     subcategory: p.subcategory !== undefined ? p.subcategory : db.products[idx].subcategory,
@@ -367,7 +333,6 @@ app.delete('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// ---------- Orders ----------
 app.get('/api/orders', auth, noCache, withDb(async (req, res) => {
   const db = await readDB();
   const orders = db.orders
@@ -376,7 +341,6 @@ app.get('/api/orders', auth, noCache, withDb(async (req, res) => {
   res.json(orders);
 }));
 
-// ---------- Zarinpal payment ----------
 app.post('/api/payment/request', auth, withDb(async (req, res) => {
   const { items, amount, description } = req.body || {};
   if (!amount || amount < 1000) return res.status(400).json({ error: 'مبلغ نامعتبر است' });
@@ -418,7 +382,6 @@ app.post('/api/payment/request', auth, withDb(async (req, res) => {
   }
 }));
 
-// Zarinpal redirects the buyer's browser here after payment
 app.get('/payment/callback', async (req, res) => {
   const { Authority, Status } = req.query;
   let db;
