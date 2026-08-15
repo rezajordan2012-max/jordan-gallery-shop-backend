@@ -14,6 +14,9 @@ const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 
+// برای ویژگی «تشخیص هوشمند مشخصات محصول از روی عکس» — کلید API آنتروپیک را در محیط سرور تنظیم کن
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
 const MONGODB_URI = process.env.MONGODB_URI;
 
 let mongoClientPromise = null;
@@ -236,6 +239,91 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
     res.json({ url: data.secure_url, type: isVideo ? 'video' : 'image' });
   } catch (e) {
     res.status(500).json({ error: 'خطای سرور هنگام آپلود فایل' });
+  }
+});
+
+// ---------- تشخیص هوشمند مشخصات محصول از روی عکس (فقط مدیر) ----------
+// عکسی از جعبه/برچسب/صفحه‌ی مرجع محصول (مثلاً عطر) می‌گیرد، آن را به مدل بینایی Claude می‌دهد،
+// و یک JSON ساختاریافته با فیلدهای قابل‌تشخیص برمی‌گرداند تا پنل مدیریت آن‌ها را در فرم پر کند.
+app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY روی سرور تنظیم نشده است — برای فعال‌سازی این ویژگی، کلید API آنتروپیک را در متغیرهای محیطی سرور (Render) اضافه کن' });
+  }
+  const { imageBase64 } = req.body || {};
+  if (!imageBase64 || typeof imageBase64 !== 'string') {
+    return res.status(400).json({ error: 'تصویر معتبر نیست' });
+  }
+  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/);
+  if (!match) {
+    return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png, jpg, webp)' });
+  }
+  const mediaType = match[1];
+  const data = match[2];
+  const approxBytes = Math.ceil((data.length * 3) / 4);
+  if (approxBytes > 10 * 1024 * 1024) {
+    return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  }
+
+  const instruction = `تصویر پیوست‌شده را با دقت بررسی کن. این تصویر می‌تواند جعبه، برچسب، بطری یک محصول (مثلاً عطر/ادکلن) یا اسکرین‌شاتی از یک سایت مرجع عطر (مثل Fragrantica) باشد. هر اطلاعاتی که با اطمینان از روی تصویر قابل تشخیص است را استخراج کن. اگر مطمئن نیستی یا چیزی در تصویر دیده نمی‌شود، آن فیلد را خالی ("") بگذار — هرگز حدس نزن یا اطلاعات جعلی نساز.
+
+قانون مهم و اجباری درباره‌ی زبان خروجی: تمام فیلدهای زیر باید به فارسی نوشته شوند، حتی اگر متن روی خود تصویر انگلیسی یا هر زبان دیگری باشد — یعنی باید ترجمه یا آوانویسی رایج فارسی همان کلمه را بنویسی، نه متن اصلی به زبان مبدأ. تنها استثنا فیلد "nameEn" است که باید دقیقاً همان‌طور که روی تصویر نوشته شده (به زبان اصلی) باقی بماند. برای نمونه اگر برند "Chanel" است در فیلد brand بنویس "شنل"؛ اگر کشور سازنده "France" است بنویس "فرانسه"؛ اگر نتی به اسم "Bergamot" روی تصویر است در فیلدهای نت، "برگاموت" بنویس. حتی توضیح (description) هم باید کاملاً فارسی و روان نوشته شود.
+
+فقط و فقط یک شیء JSON معتبر برگردان (بدون توضیح اضافه، بدون Markdown، بدون backtick)، دقیقاً با این ساختار:
+{
+  "name": "نام محصول به فارسی (اگر روی تصویر انگلیسی است، به فارسی رایج/معمول ترجمه یا آوانویسی کن)",
+  "nameEn": "نام دقیق محصول همان‌طور که روی تصویر/جعبه نوشته شده (تنها فیلدی که به زبان اصلی/انگلیسی می‌ماند)",
+  "brand": "نام برند، به فارسی رایج (آوانویسی‌شده)، مثلاً Chanel -> شنل، Dior -> دیور، Lalique -> لالیک",
+  "concentration": "نوع غلظت در صورت مشاهده، دقیقاً یکی از این مقادیر انگلیسی (این یکی فقط استثنائاً انگلیسی می‌ماند چون داخلی و کدی است): Extrait de Parfum, Parfum, Eau de Parfum, Eau de Parfum Intense, Eau de Toilette, Eau de Cologne, Eau Fraiche — یا خالی",
+  "topNotes": "نت‌های آغازین دیده‌شده، با ویرگول فارسی (،) جدا از هم، همه به فارسی رایج نام نت (مثلاً «برگاموت، لیمو») حتی اگر روی تصویر انگلیسی نوشته شده باشند",
+  "middleNotes": "نت‌های میانی به همین شکل، همه به فارسی",
+  "baseNotes": "نت‌های پایه به همین شکل، همه به فارسی",
+  "perfumer": "نام عطار در صورت مشاهده، به فارسی آوانویسی‌شده",
+  "countryOfOrigin": "کشور سازنده در صورت مشاهده، به فارسی (مثلاً France -> فرانسه، Italy -> ایتالیا)",
+  "yearMade": "سال ساخت در صورت مشاهده (فقط عدد)",
+  "description": "یک توضیح کوتاه دو تا سه جمله‌ای کاملاً فارسی درباره‌ی محصول بر پایه‌ی آنچه از تصویر برداشت می‌شود (اختیاری، فقط اگر اطلاعات کافی برای یک توضیح معنادار وجود دارد)"
+}`;
+
+  try {
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        max_tokens: 1200,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: mediaType, data } },
+              { type: 'text', text: instruction },
+            ],
+          },
+        ],
+      }),
+    });
+    const aiData = await aiRes.json();
+    if (!aiRes.ok) {
+      return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی' });
+    }
+    const textBlock = (aiData.content || []).find((c) => c.type === 'text');
+    if (!textBlock) {
+      return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
+    }
+    let parsed;
+    try {
+      const cleaned = textBlock.text.replace(/```json/gi, '').replace(/```/g, '').trim();
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      return res.status(502).json({ error: 'پاسخ هوش مصنوعی قابل تفسیر نبود — دوباره امتحان کن' });
+    }
+    res.json(parsed);
+  } catch (e) {
+    console.error('AI extract error:', e);
+    res.status(500).json({ error: 'خطای سرور هنگام تحلیل تصویر' });
   }
 });
 
