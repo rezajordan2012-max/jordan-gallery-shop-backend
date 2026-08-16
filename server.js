@@ -17,6 +17,10 @@ const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
 // برای ویژگی «تشخیص هوشمند مشخصات محصول از روی عکس» — کلید API آنتروپیک را در محیط سرور تنظیم کن
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
+// برای ویژگی «جستجوی مشخصات ادکلن بر اساس نام محصول» — کلید رایگان از fraganty.ai
+const FRAGANTY_API_KEY = process.env.FRAGANTY_API_KEY;
+const FRAGANTY_BASE_URL = 'https://fraganty.ai';
+
 const MONGODB_URI = process.env.MONGODB_URI;
 
 let mongoClientPromise = null;
@@ -324,6 +328,66 @@ app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
   } catch (e) {
     console.error('AI extract error:', e);
     res.status(500).json({ error: 'خطای سرور هنگام تحلیل تصویر' });
+  }
+});
+
+// ---------- جستجوی مشخصات ادکلن بر اساس نام محصول (فقط مدیر) — از دیتابیس رایگان fraganty.ai ----------
+// مرحله‌ی ۱: جستجو با اسم، لیست کوتاهی از محصولات محتمل برمی‌گرداند تا مدیر مورد درست را انتخاب کند.
+app.get('/api/ai/search-perfume', auth, requireAdmin, async (req, res) => {
+  if (!FRAGANTY_API_KEY) {
+    return res.status(500).json({ error: 'FRAGANTY_API_KEY روی سرور تنظیم نشده است — کلید رایگان را از fraganty.ai بگیر و در متغیرهای محیطی سرور اضافه کن' });
+  }
+  const q = (req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'نام محصول را وارد کن' });
+
+  try {
+    const url = `${FRAGANTY_BASE_URL}/api/perfumes?q=${encodeURIComponent(q)}&limit=8`;
+    const fRes = await fetch(url, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
+    const fData = await fRes.json();
+    if (!fRes.ok) {
+      return res.status(fRes.status === 429 ? 429 : 502).json({
+        error: fRes.status === 429
+          ? 'سهمیه‌ی ماهانه‌ی رایگان fraganty.ai تمام شده — تا ماه بعد صبر کن یا پلن پولی بگیر'
+          : (fData && fData.error) || 'خطا در ارتباط با fraganty.ai',
+      });
+    }
+    const results = (fData.data || []).map((p) => ({
+      id: p.id,
+      name: p.name,
+      brand: p.brand,
+      year: p.year,
+      image: p.image,
+    }));
+    res.json({ data: results });
+  } catch (e) {
+    console.error('Fraganty search error:', e);
+    res.status(500).json({ error: 'خطای سرور هنگام جستجو در fraganty.ai' });
+  }
+});
+
+// مرحله‌ی ۲: بعد از انتخاب مدیر، جزئیات کامل همان محصول (نت‌ها، غلظت، عطار، سال و ...) را می‌گیرد.
+app.get('/api/ai/perfume-details', auth, requireAdmin, async (req, res) => {
+  if (!FRAGANTY_API_KEY) {
+    return res.status(500).json({ error: 'FRAGANTY_API_KEY روی سرور تنظیم نشده است' });
+  }
+  const slug = (req.query.slug || '').trim();
+  if (!slug) return res.status(400).json({ error: 'شناسه‌ی محصول نامعتبر است' });
+
+  try {
+    const url = `${FRAGANTY_BASE_URL}/api/perfumes/${encodeURIComponent(slug)}`;
+    const fRes = await fetch(url, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
+    const fData = await fRes.json();
+    if (!fRes.ok) {
+      return res.status(fRes.status === 429 ? 429 : 502).json({
+        error: fRes.status === 429
+          ? 'سهمیه‌ی ماهانه‌ی رایگان fraganty.ai تمام شده'
+          : (fData && fData.error) || 'خطا در دریافت جزئیات از fraganty.ai',
+      });
+    }
+    res.json(fData);
+  } catch (e) {
+    console.error('Fraganty details error:', e);
+    res.status(500).json({ error: 'خطای سرور هنگام دریافت جزئیات از fraganty.ai' });
   }
 });
 
