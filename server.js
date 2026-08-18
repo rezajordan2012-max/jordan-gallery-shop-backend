@@ -21,6 +21,9 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const FRAGANTY_API_KEY = process.env.FRAGANTY_API_KEY;
 const FRAGANTY_BASE_URL = 'https://fraganty.ai';
 
+// برای ویژگی «اسکن بارکد» — UPCitemdb پلن رایگانش نیازی به ثبت‌نام یا کلید ندارد (۱۰۰ درخواست در روز)
+const UPCITEMDB_TRIAL_URL = 'https://api.upcitemdb.com/prod/trial/lookup';
+
 const MONGODB_URI = process.env.MONGODB_URI;
 
 let mongoClientPromise = null;
@@ -391,6 +394,48 @@ app.get('/api/ai/perfume-details', auth, requireAdmin, async (req, res) => {
   }
 });
 
+// ---------- اسکن بارکد (فقط مدیر) ----------
+// مرحله‌ی ۱: اول دیتابیس خودمان را چک می‌کند — اگر این بارکد قبلاً برای یک محصول ثبت شده،
+// همیشه و قطعاً پیدا می‌شود (این بخش هیچ وابستگی خارجی ندارد و ۱۰۰٪ رایگان و قابل‌اتکاست).
+// مرحله‌ی ۲: اگر در دیتابیس خودمان نبود، به‌صورت best-effort از UPCitemdb (رایگان، بدون نیاز
+// به ثبت‌نام) نام/برند را می‌گیرد — پوشش این سرویس عمدتاً برای کالاهای بازار آمریکا/اروپاست،
+// پس برای خیلی از محصولات وارداتی/موازیِ بازار ایران ممکن است چیزی پیدا نکند؛ در آن صورت پیام
+// روشن برمی‌گردد تا مدیر بداند باید دستی وارد کند، نه اینکه چیزی جعل یا حدس زده شود.
+app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
+  const code = (req.query.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
+
+  const db = await readDB();
+  const ownMatch = db.products.find((p) => p.barcode && p.barcode === code);
+  if (ownMatch) {
+    return res.json({
+      foundInOwnDb: true,
+      product: { id: ownMatch.id, name: ownMatch.name, category: ownMatch.category, subcategory: ownMatch.subcategory },
+    });
+  }
+
+  try {
+    const upcRes = await fetch(`${UPCITEMDB_TRIAL_URL}?upc=${encodeURIComponent(code)}`);
+    const upcData = await upcRes.json();
+    const item = upcData && upcData.code === 'OK' && Array.isArray(upcData.items) && upcData.items[0];
+    if (item) {
+      return res.json({
+        foundInOwnDb: false,
+        external: {
+          title: item.title || '',
+          brand: item.brand || '',
+          image: (Array.isArray(item.images) && item.images[0]) || '',
+        },
+      });
+    }
+    return res.json({ foundInOwnDb: false, external: null });
+  } catch (e) {
+    console.error('UPCitemdb error:', e);
+    // خطای شبکه در سرویس رایگان نباید کل فرآیند را متوقف کند — فقط یعنی چیزی پیدا نشد
+    return res.json({ foundInOwnDb: false, external: null });
+  }
+}));
+
 app.get('/api/settings', noCache, withDb(async (req, res) => {
   const db = await readDB();
   res.json(db.settings || {});
@@ -436,6 +481,7 @@ app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
     countryOfOrigin: p.countryOfOrigin || '',
     yearMade: p.yearMade || '',
     fragranticaRating: p.fragranticaRating || '',
+    barcode: p.barcode || '',
     discountPercent: Number(p.discountPercent) || 0,
     image: p.image || '',
     imageFit: p.imageFit === 'cover' ? 'cover' : 'contain',
@@ -477,6 +523,7 @@ app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
     countryOfOrigin: p.countryOfOrigin !== undefined ? p.countryOfOrigin : (db.products[idx].countryOfOrigin || ''),
     yearMade: p.yearMade !== undefined ? p.yearMade : (db.products[idx].yearMade || ''),
     fragranticaRating: p.fragranticaRating !== undefined ? p.fragranticaRating : (db.products[idx].fragranticaRating || ''),
+    barcode: p.barcode !== undefined ? p.barcode : (db.products[idx].barcode || ''),
     discountPercent: p.discountPercent !== undefined ? (Number(p.discountPercent) || 0) : db.products[idx].discountPercent,
     image: p.image ?? db.products[idx].image,
     imageFit: p.imageFit !== undefined ? (p.imageFit === 'cover' ? 'cover' : 'contain') : (db.products[idx].imageFit || 'contain'),
