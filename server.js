@@ -21,8 +21,10 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const FRAGANTY_API_KEY = process.env.FRAGANTY_API_KEY;
 const FRAGANTY_BASE_URL = 'https://fraganty.ai';
 
-// برای ویژگی «اسکن بارکد» — UPCitemdb پلن رایگانش نیازی به ثبت‌نام یا کلید ندارد (۱۰۰ درخواست در روز)
-const UPCITEMDB_TRIAL_URL = 'https://api.upcitemdb.com/prod/trial/lookup';
+// برای ویژگی «اسکن بارکد» — از هوش مصنوعی Claude با قابلیت جستجوی زنده‌ی وب استفاده می‌شود
+// (نیازی به کلید یا سرویس جداگانه نیست، همان ANTHROPIC_API_KEY بالا کافی است). این جایگزین
+// UPCitemdb شد چون UPCitemdb عمدتاً بازار آمریکا/اروپا را پوشش می‌داد و برای کالای وارداتی/موازیِ
+// بازار ایران (به‌خصوص عطر) تقریباً همیشه نتیجه‌ی خالی برمی‌گرداند.
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -481,10 +483,11 @@ app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) 
 // ---------- اسکن بارکد (فقط مدیر) ----------
 // مرحله‌ی ۱: اول دیتابیس خودمان را چک می‌کند — اگر این بارکد قبلاً برای یک محصول ثبت شده،
 // همیشه و قطعاً پیدا می‌شود (این بخش هیچ وابستگی خارجی ندارد و ۱۰۰٪ رایگان و قابل‌اتکاست).
-// مرحله‌ی ۲: اگر در دیتابیس خودمان نبود، به‌صورت best-effort از UPCitemdb (رایگان، بدون نیاز
-// به ثبت‌نام) نام/برند را می‌گیرد — پوشش این سرویس عمدتاً برای کالاهای بازار آمریکا/اروپاست،
-// پس برای خیلی از محصولات وارداتی/موازیِ بازار ایران ممکن است چیزی پیدا نکند؛ در آن صورت پیام
-// روشن برمی‌گردد تا مدیر بداند باید دستی وارد کند، نه اینکه چیزی جعل یا حدس زده شود.
+// مرحله‌ی ۲: اگر در دیتابیس خودمان نبود، از Claude با ابزار جستجوی وب می‌خواهیم خودش این بارکد
+// را در پایگاه‌های بارکد، سایت‌های فروشگاهی و (در صورت احتمال عطر بودن) پایگاه‌های تخصصی عطر
+// جستجو کند و محصول واقعی را شناسایی کند — نتیجه شامل نام، برند، تصویر، توضیح، ویژگی‌ها، ترکیبات
+// و (برای عطر) نت‌ها/عطار/غلظت است، همه از قبل ترجمه‌شده به فارسیِ روان. اگر با جستجوی کامل هم
+// نتواند با اطمینان شناسایی کند، به‌جای حدس زدن یا جعل اطلاعات، صریحاً «پیدا نشد» برمی‌گرداند.
 app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
   const code = (req.query.code || '').trim();
   if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
@@ -498,25 +501,107 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
     });
   }
 
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY روی سرور تنظیم نشده است — برای فعال‌سازی شناسایی بارکد از طریق جستجوی وب، کلید API آنتروپیک را در متغیرهای محیطی سرور اضافه کن' });
+  }
+
+  const instruction = `کد بارکد زیر متعلق به یک محصول است: ${code}
+
+با استفاده از جستجوی وب، این بارکد را در پایگاه‌های بارکد معتبر (مثل barcodelookup.com، UPCitemdb، Amazon، eBay، Google Shopping)، سایت‌های فروشگاهی، و — در صورت احتمال عطر/ادکلن بودن — پایگاه‌های تخصصی عطر مثل Fragrantica جستجو کن و محصول واقعیِ متناظر با این بارکد را شناسایی کن. اگر بعد از جستجوی کامل هم نتوانستی این بارکد را با اطمینان معقول شناسایی کنی، هرگز حدس نزن و اطلاعات جعلی نساز — در این صورت فقط "found": false برگردان و بقیه‌ی فیلدها را خالی بگذار.
+
+قانون مهم و اجباری درباره‌ی زبان خروجی: تمام فیلدهای متنی زیر باید کاملاً به فارسی نوشته شوند، حتی اگر منبع اصلی انگلیسی یا هر زبان دیگری باشد — یعنی باید ترجمه یا آوانویسی رایج فارسیِ همان مطلب را بنویسی، نه متن اصلی به زبان مبدأ. دو استثنا: فیلد "nameEn" که باید دقیقاً همان‌طور که در منابع رسمی نوشته شده (زبان اصلی) بماند؛ و فیلد "concentration" که باید دقیقاً یکی از این مقادیر انگلیسی باشد (چون داخلی و کدی است): Extrait de Parfum, Parfum, Eau de Parfum, Eau de Parfum Intense, Eau de Toilette, Eau de Cologne, Eau Fraiche — یا خالی.
+
+فقط و فقط بعد از پایان جستجو، یک شیء JSON معتبر برگردان (هیچ متن یا Markdown یا backtick قبل یا بعدش)، دقیقاً با این ساختار:
+{
+  "found": true یا false,
+  "isPerfume": true یا false,
+  "name": "نام محصول به فارسی (ترجمه یا آوانویسی رایج)",
+  "nameEn": "نام دقیق محصول به همان زبان اصلی/انگلیسیِ منبع",
+  "brand": "نام برند به فارسی رایج (مثلاً Chanel -> شنل، Dior -> دیور)",
+  "imageUrl": "لینک مستقیم یک تصویر معتبر از خود محصول در صورت پیدا شدن، وگرنه رشته‌ی خالی",
+  "description": "توضیح کوتاه دو تا سه جمله‌ای، کاملاً فارسی و روان",
+  "properties": "چند ویژگی یا خاصیت کلیدی محصول، هر کدام در یک خط جدا (خط‌ها را با \\n از هم جدا کن)، کاملاً فارسی، حداکثر ۵ خط",
+  "ingredients": "ترکیبات/مواد تشکیل‌دهنده در صورت پیدا شدن (فقط برای محصولات غیرعطر مثل آرایشی-بهداشتی)، با ویرگول فارسی (،) از هم جدا، کاملاً فارسی — اگر عطر است یا ترکیبات پیدا نشد، رشته‌ی خالی بگذار",
+  "concentration": "فقط اگر عطر است و غلظتش مشخص شد، وگرنه خالی",
+  "topNotes": "فقط اگر عطر است — نت‌های آغازین، با ویرگول فارسی (،) جدا از هم، کاملاً فارسی",
+  "middleNotes": "فقط اگر عطر است — نت‌های میانی، همین شکل",
+  "baseNotes": "فقط اگر عطر است — نت‌های پایه، همین شکل",
+  "perfumer": "فقط اگر عطر است و عطار مشخص شد، به فارسی آوانویسی‌شده",
+  "countryOfOrigin": "کشور سازنده در صورت پیدا شدن، به فارسی (مثلاً France -> فرانسه)",
+  "yearMade": "سال ساخت در صورت پیدا شدن (فقط عدد)"
+}`;
+
   try {
-    const upcRes = await fetch(`${UPCITEMDB_TRIAL_URL}?upc=${encodeURIComponent(code)}`);
-    const upcData = await upcRes.json();
-    const item = upcData && upcData.code === 'OK' && Array.isArray(upcData.items) && upcData.items[0];
-    if (item) {
-      return res.json({
-        foundInOwnDb: false,
-        external: {
-          title: item.title || '',
-          brand: item.brand || '',
-          image: (Array.isArray(item.images) && item.images[0]) || '',
-        },
-      });
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        max_tokens: 2000,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: instruction }],
+      }),
+    });
+    const aiData = await aiRes.json();
+    if (!aiRes.ok) {
+      console.error('Claude barcode identify failed:', aiRes.status, aiData);
+      return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی' });
     }
-    return res.json({ foundInOwnDb: false, external: null });
+    const textCombined = (aiData.content || [])
+      .filter((c) => c.type === 'text')
+      .map((c) => c.text)
+      .join('\n')
+      .trim();
+    if (!textCombined) {
+      return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
+    }
+    let parsed;
+    try {
+      // اگر هوش مصنوعی چیزی قبل/بعد از JSON اضافه کرده باشد، فقط قسمت بین اولین { و آخرین } را برمی‌داریم
+      const start = textCombined.indexOf('{');
+      const end = textCombined.lastIndexOf('}');
+      const cleaned = (start >= 0 && end >= start ? textCombined.slice(start, end + 1) : textCombined)
+        .replace(/```json/gi, '')
+        .replace(/```/g, '')
+        .trim();
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      console.error('Barcode identify JSON parse failed. Raw text:', textCombined);
+      return res.status(502).json({ error: 'پاسخ هوش مصنوعی قابل تفسیر نبود — دوباره امتحان کن' });
+    }
+
+    if (!parsed || !parsed.found || !parsed.name) {
+      return res.json({ foundInOwnDb: false, external: null });
+    }
+
+    return res.json({
+      foundInOwnDb: false,
+      external: {
+        found: true,
+        isPerfume: !!parsed.isPerfume,
+        name: parsed.name || '',
+        title: parsed.nameEn || '',
+        brand: parsed.brand || '',
+        image: parsed.imageUrl || '',
+        description: parsed.description || '',
+        properties: parsed.properties || '',
+        ingredients: parsed.ingredients || '',
+        concentration: parsed.concentration || '',
+        topNotes: parsed.topNotes || '',
+        middleNotes: parsed.middleNotes || '',
+        baseNotes: parsed.baseNotes || '',
+        perfumer: parsed.perfumer || '',
+        countryOfOrigin: parsed.countryOfOrigin || '',
+        yearMade: parsed.yearMade ? String(parsed.yearMade) : '',
+      },
+    });
   } catch (e) {
-    console.error('UPCitemdb error:', e);
-    // خطای شبکه در سرویس رایگان نباید کل فرآیند را متوقف کند — فقط یعنی چیزی پیدا نشد
-    return res.json({ foundInOwnDb: false, external: null });
+    console.error('Barcode identify error:', e);
+    return res.status(500).json({ error: 'خطای سرور هنگام شناسایی بارکد' });
   }
 }));
 
