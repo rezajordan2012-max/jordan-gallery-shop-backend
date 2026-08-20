@@ -336,6 +336,11 @@ app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
 
 // ---------- جستجوی مشخصات ادکلن بر اساس نام محصول (فقط مدیر) — از دیتابیس رایگان fraganty.ai ----------
 // مرحله‌ی ۱: جستجو با اسم، لیست کوتاهی از محصولات محتمل برمی‌گرداند تا مدیر مورد درست را انتخاب کند.
+// پیام یکسان برای سهمیه‌ی تمام‌شده — پلن رایگان fraganty.ai فقط ۲۰ درخواست در ماه اجازه می‌دهد
+// (هر جستجو یک درخواست، و هر انتخاب/جزئیات هم یک درخواست جدا حساب می‌شود؛ رجوع به fraganty.ai/pricing)
+const FRAGANTY_QUOTA_MESSAGE =
+  'سهمیه‌ی ماهانه‌ی رایگان fraganty.ai (۲۰ درخواست در ماه) تمام شده — تا ماه بعد صبر کن یا از fraganty.ai/pricing پلن پولی بگیر';
+
 app.get('/api/ai/search-perfume', auth, requireAdmin, async (req, res) => {
   if (!FRAGANTY_API_KEY) {
     return res.status(500).json({ error: 'FRAGANTY_API_KEY روی سرور تنظیم نشده است — کلید رایگان را از fraganty.ai بگیر و در متغیرهای محیطی سرور اضافه کن' });
@@ -348,19 +353,22 @@ app.get('/api/ai/search-perfume', auth, requireAdmin, async (req, res) => {
     const fRes = await fetch(url, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
     const fData = await fRes.json();
     if (!fRes.ok) {
+      console.error('Fraganty search failed:', fRes.status, fData);
       return res.status(fRes.status === 429 ? 429 : 502).json({
-        error: fRes.status === 429
-          ? 'سهمیه‌ی ماهانه‌ی رایگان fraganty.ai تمام شده — تا ماه بعد صبر کن یا پلن پولی بگیر'
-          : (fData && fData.error) || 'خطا در ارتباط با fraganty.ai',
+        error: fRes.status === 429 ? FRAGANTY_QUOTA_MESSAGE : (fData && fData.error) || 'خطا در ارتباط با fraganty.ai',
       });
     }
-    const results = (fData.data || []).map((p) => ({
-      id: p.id,
-      name: p.name,
-      brand: p.brand,
-      year: p.year,
-      image: p.image,
-    }));
+    const results = (Array.isArray(fData.data) ? fData.data : [])
+      // موردی که شناسه (id) نداشته باشد قابل استفاده در مرحله‌ی جزئیات نیست — از لیست حذف می‌شود
+      // تا مدیر روی نتیجه‌ای کلیک نکند که بعداً با شکست مواجه می‌شود.
+      .filter((p) => p && p.id)
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        brand: p.brand,
+        year: p.year,
+        image: p.image,
+      }));
     res.json({ data: results });
   } catch (e) {
     console.error('Fraganty search error:', e);
@@ -381,16 +389,92 @@ app.get('/api/ai/perfume-details', auth, requireAdmin, async (req, res) => {
     const fRes = await fetch(url, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
     const fData = await fRes.json();
     if (!fRes.ok) {
-      return res.status(fRes.status === 429 ? 429 : 502).json({
-        error: fRes.status === 429
-          ? 'سهمیه‌ی ماهانه‌ی رایگان fraganty.ai تمام شده'
-          : (fData && fData.error) || 'خطا در دریافت جزئیات از fraganty.ai',
+      console.error('Fraganty details failed:', slug, fRes.status, fData);
+      return res.status(fRes.status === 429 ? 429 : fRes.status === 404 ? 404 : 502).json({
+        error:
+          fRes.status === 429
+            ? FRAGANTY_QUOTA_MESSAGE
+            : fRes.status === 404
+              ? 'این محصول در fraganty.ai پیدا نشد — یک نتیجه‌ی دیگر را امتحان کن'
+              : (fData && fData.error) || 'خطا در دریافت جزئیات از fraganty.ai',
       });
+    }
+    // بعضی وقت‌ها fraganty.ai برای یک شناسه‌ی نامعتبر/قدیمی، به‌جای خطای ۴۰۴، پاسخ موفق (۲۰۰) ولی
+    // بدون داده‌ی واقعی برمی‌گرداند — بدون این بررسی، فرم پنل مدیریت بی‌سروصدا با مقادیر خالی پر
+    // می‌شد. این‌جا چنین حالتی را هم یک خطای روشن به فرانت‌اند برمی‌گردانیم.
+    if (!fData || !fData.name) {
+      console.error('Fraganty details returned empty payload for slug:', slug, fData);
+      return res.status(502).json({ error: 'این محصول در fraganty.ai اطلاعات کاملی ندارد — یک نتیجه‌ی دیگر را امتحان کن یا فیلدها را دستی پر کن.' });
     }
     res.json(fData);
   } catch (e) {
     console.error('Fraganty details error:', e);
     res.status(500).json({ error: 'خطای سرور هنگام دریافت جزئیات از fraganty.ai' });
+  }
+});
+
+// ---------- ترجمه‌ی توضیح کوتاه و ویژگی‌های عطر به فارسی (فقط مدیر) ----------
+// بعد از انتخاب یک عطر از نتایج fraganty.ai، توضیح انگلیسیِ آن (در صورت وجود) به‌همراه آکوردها،
+// فصل‌های مناسب و زمان استفاده (روز/شب) را می‌گیرد و با هوش مصنوعی Claude یک توضیح کوتاه و یک
+// لیست ویژگی، هر دو کاملاً به فارسیِ روان، تولید می‌کند. این درخواست کاملاً جدا از fraganty.ai
+// است و از سهمیه‌ی ماهانه‌ی آن مصرف نمی‌کند.
+app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) => {
+  if (!ANTHROPIC_API_KEY) {
+    return res.status(500).json({ error: 'ANTHROPIC_API_KEY روی سرور تنظیم نشده است — برای فعال‌سازی این ویژگی، کلید API آنتروپیک را در متغیرهای محیطی سرور اضافه کن' });
+  }
+  const { name, brand, description, accords, seasons, dayNight, gender, rating } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'نام محصول لازم است' });
+
+  const instruction = `اطلاعات زیر درباره‌ی یک عطر است (از یک دیتابیس انگلیسی‌زبان عطر گرفته شده):
+نام: ${name}
+برند: ${brand || ''}
+جنسیت: ${gender || ''}
+امتیاز کاربران: ${rating || ''}
+توضیح اصلی (انگلیسی، ممکن است خالی باشد): ${description || ''}
+آکوردهای اصلی: ${Array.isArray(accords) ? accords.map((a) => (typeof a === 'string' ? a : a.name)).filter(Boolean).join('، ') : ''}
+مناسب‌ترین فصل‌ها (درصد تناسب): ${seasons ? JSON.stringify(seasons) : ''}
+مناسب‌ترین زمان استفاده (درصد تناسب روز/شب): ${dayNight ? JSON.stringify(dayNight) : ''}
+
+بر اساس این اطلاعات، فقط و فقط یک شیء JSON معتبر برگردان (بدون Markdown، بدون backtick، بدون هیچ توضیح اضافه)، دقیقاً با این ساختار:
+{
+  "description": "یک توضیح کوتاه دو تا سه جمله‌ای، کاملاً فارسی و روان، درباره‌ی حال‌وهوا و شخصیت این عطر — اگر توضیح اصلی انگلیسی موجود بود بر پایه‌ی همان بنویس (ترجمه‌ی خلاصه و روان، نه لغت‌به‌لغت)؛ اگر خالی بود، از روی آکوردها و مشخصات یک توضیح معنادار بساز",
+  "properties": "چند ویژگی کلیدی، هر ویژگی در یک خط جدا (خط‌ها را با \\n از هم جدا کن)، کاملاً به فارسی — مثلاً مناسب‌ترین فصل‌ها، بهترین زمان استفاده (روز/شب)، حال‌وهوای کلی رایحه بر پایه‌ی آکوردها. حداکثر ۵ خط، هر خط کوتاه و کاربردی."
+}`;
+
+  try {
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        max_tokens: 700,
+        messages: [{ role: 'user', content: instruction }],
+      }),
+    });
+    const aiData = await aiRes.json();
+    if (!aiRes.ok) {
+      console.error('Claude translate failed:', aiRes.status, aiData);
+      return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی' });
+    }
+    const textBlock = (aiData.content || []).find((c) => c.type === 'text');
+    if (!textBlock) {
+      return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
+    }
+    let parsed;
+    try {
+      const cleaned = textBlock.text.replace(/```json/gi, '').replace(/```/g, '').trim();
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      return res.status(502).json({ error: 'پاسخ هوش مصنوعی قابل تفسیر نبود — دوباره امتحان کن' });
+    }
+    res.json({ description: parsed.description || '', properties: parsed.properties || '' });
+  } catch (e) {
+    console.error('AI translate-perfume-text error:', e);
+    res.status(500).json({ error: 'خطای سرور هنگام ترجمه‌ی توضیحات' });
   }
 });
 
