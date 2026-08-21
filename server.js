@@ -192,62 +192,90 @@ app.get('/api/auth/me', auth, withDb(async (req, res) => {
   res.json({ user: { id: user.id, email: user.email, fullName: user.full_name, createdAt: user.created_at || null } });
 }));
 
-app.post('/api/upload', auth, requireAdmin, async (req, res) => {
+// تابع کمکی مشترک برای آپلود یک data-URI (base64) روی Cloudinary — هم توسط endpoint آپلود مستقیم
+// (از گالری گوشی) و هم توسط شناسایی هوشمند بارکد (برای بارگذاری عکس پیداشده از وب روی Cloudinary
+// خودمان، تا بعداً بشود برش/پس‌زمینه‌ی سفید را با تبدیل‌های Cloudinary رویش اعمال کرد) استفاده می‌شود.
+async function uploadDataUriToCloudinary(dataUri) {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
-    return res.status(500).json({ error: 'تنظیمات Cloudinary روی سرور کامل نشده است' });
+    throw new Error('تنظیمات Cloudinary روی سرور کامل نشده است');
   }
+  const imageMatch = dataUri.match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/);
+  const videoMatch = dataUri.match(/^data:video\/(mp4|webm|quicktime|ogg|mov);base64,(.+)$/);
+  if (!imageMatch && !videoMatch) {
+    throw new Error('فرمت فایل پشتیبانی نمی‌شود');
+  }
+  const isVideo = !!videoMatch;
+  const dataPart = isVideo ? videoMatch[2] : imageMatch[2];
+  const approxBytes = Math.ceil((dataPart.length * 3) / 4);
+  const maxBytes = isVideo ? 30 * 1024 * 1024 : 10 * 1024 * 1024;
+  if (approxBytes > maxBytes) {
+    throw new Error(isVideo ? 'حجم ویدیو بیش از حد مجاز است (حداکثر ۳۰ مگابایت)' : 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)');
+  }
+
+  const timestamp = Math.floor(Date.now() / 1000);
+  const folder = 'maison-store';
+  const signature = crypto
+    .createHash('sha1')
+    .update(`folder=${folder}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`)
+    .digest('hex');
+
+  const body = new URLSearchParams({
+    file: dataUri,
+    api_key: CLOUDINARY_API_KEY,
+    timestamp: String(timestamp),
+    folder,
+    signature,
+  });
+
+  const resourceType = isVideo ? 'video' : 'image';
+  const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body,
+  });
+  const data = await cloudRes.json();
+  if (!cloudRes.ok || !data.secure_url) {
+    throw new Error((data && data.error && data.error.message) || 'آپلود به Cloudinary ناموفق بود');
+  }
+  return { url: data.secure_url, type: isVideo ? 'video' : 'image' };
+}
+
+// یک لینک عکس بیرونی (مثلاً پیداشده از جستجوی هوشمند بارکد) را دانلود و روی Cloudinary خودمان
+// آپلود می‌کند تا بشود بعداً برش/پس‌زمینه‌ی سفید را رویش اعمال کرد. اگر دانلود یا آپلود به هر
+// دلیلی شکست بخورد (مثلاً لینک منقضی یا محدودیت دسترسی)، فقط null برمی‌گرداند و خطا پرتاب
+// نمی‌کند — چون این یک بهبود جانبی است و نباید کل شناسایی بارکد را متوقف کند.
+async function mirrorRemoteImageToCloudinary(remoteUrl) {
+  try {
+    if (!remoteUrl || typeof remoteUrl !== 'string' || !/^https?:\/\//i.test(remoteUrl)) return null;
+    const imgRes = await fetch(remoteUrl);
+    if (!imgRes.ok) return null;
+    const contentType = imgRes.headers.get('content-type') || '';
+    if (!contentType.startsWith('image/')) return null;
+    const buffer = Buffer.from(await imgRes.arrayBuffer());
+    if (buffer.length > 10 * 1024 * 1024) return null;
+    const mimeForDataUri = contentType.split(';')[0].replace('image/jpg', 'image/jpeg');
+    const supported = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+    if (!supported.includes(mimeForDataUri)) return null;
+    const dataUri = `data:${mimeForDataUri};base64,${buffer.toString('base64')}`;
+    const uploaded = await uploadDataUriToCloudinary(dataUri);
+    return uploaded.url;
+  } catch (e) {
+    console.error('mirrorRemoteImageToCloudinary failed:', e.message);
+    return null;
+  }
+}
+
+app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   const { imageBase64 } = req.body || {};
   if (!imageBase64 || typeof imageBase64 !== 'string') {
     return res.status(400).json({ error: 'فایل معتبر نیست' });
   }
-
-  const imageMatch = imageBase64.match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/);
-  const videoMatch = imageBase64.match(/^data:video\/(mp4|webm|quicktime|ogg|mov);base64,(.+)$/);
-
-  if (!imageMatch && !videoMatch) {
-    return res.status(400).json({ error: 'فرمت فایل پشتیبانی نمی‌شود' });
-  }
-
-  const isVideo = !!videoMatch;
-  const dataPart = isVideo ? videoMatch[2] : imageMatch[2];
-
-  const approxBytes = Math.ceil((dataPart.length * 3) / 4);
-  const maxBytes = isVideo ? 30 * 1024 * 1024 : 10 * 1024 * 1024;
-  if (approxBytes > maxBytes) {
-    return res.status(413).json({
-      error: isVideo ? 'حجم ویدیو بیش از حد مجاز است (حداکثر ۳۰ مگابایت)' : 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)',
-    });
-  }
-
   try {
-    const timestamp = Math.floor(Date.now() / 1000);
-    const folder = 'maison-store';
-    const signature = crypto
-      .createHash('sha1')
-      .update(`folder=${folder}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`)
-      .digest('hex');
-
-    const body = new URLSearchParams({
-      file: imageBase64,
-      api_key: CLOUDINARY_API_KEY,
-      timestamp: String(timestamp),
-      folder,
-      signature,
-    });
-
-    const resourceType = isVideo ? 'video' : 'image';
-    const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
-    });
-    const data = await cloudRes.json();
-    if (!cloudRes.ok || !data.secure_url) {
-      return res.status(502).json({ error: data.error?.message || 'آپلود به Cloudinary ناموفق بود' });
-    }
-    res.json({ url: data.secure_url, type: isVideo ? 'video' : 'image' });
+    const uploaded = await uploadDataUriToCloudinary(imageBase64);
+    res.json(uploaded);
   } catch (e) {
-    res.status(500).json({ error: 'خطای سرور هنگام آپلود فایل' });
+    const statusMap = { 'تنظیمات Cloudinary روی سرور کامل نشده است': 500, 'فرمت فایل پشتیبانی نمی‌شود': 400 };
+    res.status(statusMap[e.message] || (e.message && e.message.includes('حجم') ? 413 : 502)).json({ error: e.message || 'آپلود ناموفق بود' });
   }
 });
 
@@ -578,6 +606,12 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
       return res.json({ foundInOwnDb: false, external: null });
     }
 
+    // عکس پیداشده از وب را روی Cloudinary خودمان آینه (mirror) می‌کنیم تا برش خودکار و پس‌زمینه‌ی
+    // سفیدِ یکپارچه (که سمت فرانت‌اند با تبدیل‌های Cloudinary اعمال می‌شود) رویش کار کند؛ لینک‌های
+    // مستقیم بیرونی از این تبدیل بی‌بهره می‌مانند. اگر آینه کردن شکست بخورد، همان لینک اصلی
+    // (بدون برش خودکار) به‌عنوان جایگزین استفاده می‌شود تا لااقل خودِ عکس از دست نرود.
+    const mirroredImage = parsed.imageUrl ? await mirrorRemoteImageToCloudinary(parsed.imageUrl) : null;
+
     return res.json({
       foundInOwnDb: false,
       external: {
@@ -586,7 +620,7 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
         name: parsed.name || '',
         title: parsed.nameEn || '',
         brand: parsed.brand || '',
-        image: parsed.imageUrl || '',
+        image: mirroredImage || parsed.imageUrl || '',
         description: parsed.description || '',
         properties: parsed.properties || '',
         ingredients: parsed.ingredients || '',
@@ -650,6 +684,7 @@ app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
     countryOfOrigin: p.countryOfOrigin || '',
     yearMade: p.yearMade || '',
     fragranticaRating: p.fragranticaRating || '',
+    volume: p.volume || '',
     barcode: p.barcode || '',
     discountPercent: Number(p.discountPercent) || 0,
     image: p.image || '',
@@ -692,6 +727,7 @@ app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
     countryOfOrigin: p.countryOfOrigin !== undefined ? p.countryOfOrigin : (db.products[idx].countryOfOrigin || ''),
     yearMade: p.yearMade !== undefined ? p.yearMade : (db.products[idx].yearMade || ''),
     fragranticaRating: p.fragranticaRating !== undefined ? p.fragranticaRating : (db.products[idx].fragranticaRating || ''),
+    volume: p.volume !== undefined ? p.volume : (db.products[idx].volume || ''),
     barcode: p.barcode !== undefined ? p.barcode : (db.products[idx].barcode || ''),
     discountPercent: p.discountPercent !== undefined ? (Number(p.discountPercent) || 0) : db.products[idx].discountPercent,
     image: p.image ?? db.products[idx].image,
