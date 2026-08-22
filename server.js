@@ -511,28 +511,45 @@ app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) 
 // ---------- اسکن بارکد (فقط مدیر) ----------
 // مرحله‌ی ۱: اول دیتابیس خودمان را چک می‌کند — اگر این بارکد قبلاً برای یک محصول ثبت شده،
 // همیشه و قطعاً پیدا می‌شود (این بخش هیچ وابستگی خارجی ندارد و ۱۰۰٪ رایگان و قابل‌اتکاست).
-// مرحله‌ی ۲: اگر در دیتابیس خودمان نبود، از Claude با ابزار جستجوی وب می‌خواهیم خودش این بارکد
-// را در پایگاه‌های بارکد، سایت‌های فروشگاهی و (در صورت احتمال عطر بودن) پایگاه‌های تخصصی عطر
-// جستجو کند و محصول واقعی را شناسایی کند — نتیجه شامل نام، برند، تصویر، توضیح، ویژگی‌ها، ترکیبات
-// و (برای عطر) نت‌ها/عطار/غلظت است، همه از قبل ترجمه‌شده به فارسیِ روان. اگر با جستجوی کامل هم
-// نتواند با اطمینان شناسایی کند، به‌جای حدس زدن یا جعل اطلاعات، صریحاً «پیدا نشد» برمی‌گرداند.
-app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
-  const code = (req.query.code || '').trim();
-  if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
+// مرحله‌ی ۲: از پایگاه‌های باز و کاملاً رایگانِ Open Beauty Facts (تخصصی آرایشی/عطر) و Open Food
+// Facts جستجو می‌کند — بدون نیاز به کلید API، بدون پرداخت، و بدون هیچ محدودیت جغرافیایی (روی
+// ایران هم مثل همه‌جای دنیا کار می‌کند). این منبع اصلی و همیشه‌فعالِ شناسایی بارکد است.
+// مرحله‌ی ۳ (اختیاری): اگر ANTHROPIC_API_KEY روی سرور تنظیم شده باشد، علاوه بر مرحله‌ی ۲، از
+// Claude با ابزار جستجوی وب هم برای غنی‌سازی نتیجه (ترجمه‌ی فارسی، توضیح، ویژگی‌ها، و برای عطر:
+// نت‌ها/عطار/غلظت) استفاده می‌شود؛ اگر این کلید تنظیم نشده باشد یا این مرحله با خطا مواجه شود،
+// بدون توقف کل فرآیند نادیده گرفته می‌شود و نتیجه‌ی مرحله‌ی ۲ به‌تنهایی برگردانده می‌شود.
 
-  const db = await readDB();
-  const ownMatch = db.products.find((p) => p.barcode && p.barcode === code);
-  if (ownMatch) {
-    return res.json({
-      foundInOwnDb: true,
-      product: { id: ownMatch.id, name: ownMatch.name, category: ownMatch.category, subcategory: ownMatch.subcategory },
-    });
+// جستجوی رایگان و بدون کلید در Open Beauty Facts (اولویت، چون این فروشگاه عطر/آرایشی است) و در
+// صورت نبود نتیجه، Open Food Facts. هر دو پایگاه‌داده‌ی باز و غیرانتفاعی‌اند و از هر کشوری
+// (از جمله ایران) بدون فیلتر یا نیاز به پرداخت در دسترس‌اند.
+async function lookupOpenFacts(code) {
+  const bases = ['https://world.openbeautyfacts.org/api/v2/product', 'https://world.openfoodfacts.org/api/v2/product'];
+  for (const base of bases) {
+    try {
+      const r = await fetch(`${base}/${encodeURIComponent(code)}.json`);
+      if (!r.ok) continue;
+      const data = await r.json();
+      if (!data || data.status !== 1 || !data.product) continue;
+      const p = data.product;
+      const title = (p.product_name || p.product_name_en || p.generic_name || '').trim();
+      if (!title) continue;
+      const brand = (p.brands || '').split(',')[0].trim();
+      const image = p.image_front_url || p.image_url || '';
+      const ingredients = (p.ingredients_text || p.ingredients_text_en || '').trim();
+      const volMatch = (p.quantity || p.product_quantity || '').toString().match(/([\d.,]+)\s*m?\s*l\b/i);
+      const volume = volMatch ? volMatch[1].replace(',', '.') : '';
+      return { title, brand, image, ingredients, volume };
+    } catch (e) {
+      console.error('Open Facts lookup failed:', base, e.message);
+    }
   }
+  return null;
+}
 
-  if (!ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY روی سرور تنظیم نشده است — برای فعال‌سازی شناسایی بارکد از طریق جستجوی وب، کلید API آنتروپیک را در متغیرهای محیطی سرور اضافه کن' });
-  }
-
+// شناسایی غنی (فارسی، با نت‌های عطر در صورت لزوم) از طریق Claude با ابزار جستجوی وب — کاملاً
+// اختیاری و فقط وقتی ANTHROPIC_API_KEY تنظیم شده باشد صدا زده می‌شود. اگر با جستجوی کامل هم
+// نتواند با اطمینان معقول شناسایی کند، null برمی‌گرداند (نه حدس یا اطلاعات جعلی).
+async function identifyBarcodeWithAI(code) {
   const instruction = `کد بارکد زیر متعلق به یک محصول است: ${code}
 
 با استفاده از جستجوی وب، این بارکد را در پایگاه‌های بارکد معتبر (مثل barcodelookup.com، UPCitemdb، Amazon، eBay، Google Shopping)، سایت‌های فروشگاهی، و — در صورت احتمال عطر/ادکلن بودن — پایگاه‌های تخصصی عطر مثل Fragrantica جستجو کن و محصول واقعیِ متناظر با این بارکد را شناسایی کن. اگر بعد از جستجوی کامل هم نتوانستی این بارکد را با اطمینان معقول شناسایی کنی، هرگز حدس نزن و اطلاعات جعلی نساز — در این صورت فقط "found": false برگردان و بقیه‌ی فیلدها را خالی بگذار.
@@ -550,6 +567,7 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
   "description": "توضیح کوتاه دو تا سه جمله‌ای، کاملاً فارسی و روان",
   "properties": "چند ویژگی یا خاصیت کلیدی محصول، هر کدام در یک خط جدا (خط‌ها را با \\n از هم جدا کن)، کاملاً فارسی، حداکثر ۵ خط",
   "ingredients": "ترکیبات/مواد تشکیل‌دهنده در صورت پیدا شدن (فقط برای محصولات غیرعطر مثل آرایشی-بهداشتی)، با ویرگول فارسی (،) از هم جدا، کاملاً فارسی — اگر عطر است یا ترکیبات پیدا نشد، رشته‌ی خالی بگذار",
+  "volume": "حجم محصول به میلی‌لیتر در صورت پیدا شدن، فقط عدد (مثلاً 100)",
   "concentration": "فقط اگر عطر است و غلظتش مشخص شد، وگرنه خالی",
   "topNotes": "فقط اگر عطر است — نت‌های آغازین، با ویرگول فارسی (،) جدا از هم، کاملاً فارسی",
   "middleNotes": "فقط اگر عطر است — نت‌های میانی، همین شکل",
@@ -559,84 +577,119 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
   "yearMade": "سال ساخت در صورت پیدا شدن (فقط عدد)"
 }`;
 
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-5',
+      max_tokens: 2000,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{ role: 'user', content: instruction }],
+    }),
+  });
+  const aiData = await aiRes.json();
+  if (!aiRes.ok) {
+    console.error('Claude barcode identify failed:', aiRes.status, aiData);
+    throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
+  }
+  const textCombined = (aiData.content || [])
+    .filter((c) => c.type === 'text')
+    .map((c) => c.text)
+    .join('\n')
+    .trim();
+  if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
+
+  let parsed;
   try {
-    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: 'claude-sonnet-5',
-        max_tokens: 2000,
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        messages: [{ role: 'user', content: instruction }],
-      }),
-    });
-    const aiData = await aiRes.json();
-    if (!aiRes.ok) {
-      console.error('Claude barcode identify failed:', aiRes.status, aiData);
-      return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی' });
-    }
-    const textCombined = (aiData.content || [])
-      .filter((c) => c.type === 'text')
-      .map((c) => c.text)
-      .join('\n')
+    // اگر هوش مصنوعی چیزی قبل/بعد از JSON اضافه کرده باشد، فقط قسمت بین اولین { و آخرین } را برمی‌داریم
+    const start = textCombined.indexOf('{');
+    const end = textCombined.lastIndexOf('}');
+    const cleaned = (start >= 0 && end >= start ? textCombined.slice(start, end + 1) : textCombined)
+      .replace(/```json/gi, '')
+      .replace(/```/g, '')
       .trim();
-    if (!textCombined) {
-      return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
-    }
-    let parsed;
+    parsed = JSON.parse(cleaned);
+  } catch (e) {
+    console.error('Barcode identify JSON parse failed. Raw text:', textCombined);
+    throw new Error('پاسخ هوش مصنوعی قابل تفسیر نبود');
+  }
+  if (!parsed || !parsed.found || !parsed.name) return null;
+  return parsed;
+}
+
+app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
+  const code = (req.query.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
+
+  const db = await readDB();
+  const ownMatch = db.products.find((p) => p.barcode && p.barcode === code);
+  if (ownMatch) {
+    return res.json({
+      foundInOwnDb: true,
+      product: { id: ownMatch.id, name: ownMatch.name, category: ownMatch.category, subcategory: ownMatch.subcategory },
+    });
+  }
+
+  let free = null;
+  try {
+    free = await lookupOpenFacts(code);
+  } catch (e) {
+    console.error('lookupOpenFacts error:', e.message);
+  }
+
+  let ai = null;
+  let aiError = null;
+  if (ANTHROPIC_API_KEY) {
     try {
-      // اگر هوش مصنوعی چیزی قبل/بعد از JSON اضافه کرده باشد، فقط قسمت بین اولین { و آخرین } را برمی‌داریم
-      const start = textCombined.indexOf('{');
-      const end = textCombined.lastIndexOf('}');
-      const cleaned = (start >= 0 && end >= start ? textCombined.slice(start, end + 1) : textCombined)
-        .replace(/```json/gi, '')
-        .replace(/```/g, '')
-        .trim();
-      parsed = JSON.parse(cleaned);
+      ai = await identifyBarcodeWithAI(code);
     } catch (e) {
-      console.error('Barcode identify JSON parse failed. Raw text:', textCombined);
-      return res.status(502).json({ error: 'پاسخ هوش مصنوعی قابل تفسیر نبود — دوباره امتحان کن' });
+      // این مرحله کاملاً اختیاری است — یک خطا در آن نباید نتیجه‌ی معتبرِ پایگاه‌ی رایگان (در صورت وجود) را از بین ببرد
+      aiError = e.message;
+      console.error('identifyBarcodeWithAI failed (non-fatal):', aiError);
     }
+  }
 
-    if (!parsed || !parsed.found || !parsed.name) {
-      return res.json({ foundInOwnDb: false, external: null });
-    }
-
-    // عکس پیداشده از وب را روی Cloudinary خودمان آینه (mirror) می‌کنیم تا برش خودکار و پس‌زمینه‌ی
-    // سفیدِ یکپارچه (که سمت فرانت‌اند با تبدیل‌های Cloudinary اعمال می‌شود) رویش کار کند؛ لینک‌های
-    // مستقیم بیرونی از این تبدیل بی‌بهره می‌مانند. اگر آینه کردن شکست بخورد، همان لینک اصلی
-    // (بدون برش خودکار) به‌عنوان جایگزین استفاده می‌شود تا لااقل خودِ عکس از دست نرود.
-    const mirroredImage = parsed.imageUrl ? await mirrorRemoteImageToCloudinary(parsed.imageUrl) : null;
-
+  if (!free && !ai) {
     return res.json({
       foundInOwnDb: false,
-      external: {
-        found: true,
-        isPerfume: !!parsed.isPerfume,
-        name: parsed.name || '',
-        title: parsed.nameEn || '',
-        brand: parsed.brand || '',
-        image: mirroredImage || parsed.imageUrl || '',
-        description: parsed.description || '',
-        properties: parsed.properties || '',
-        ingredients: parsed.ingredients || '',
-        concentration: parsed.concentration || '',
-        topNotes: parsed.topNotes || '',
-        middleNotes: parsed.middleNotes || '',
-        baseNotes: parsed.baseNotes || '',
-        perfumer: parsed.perfumer || '',
-        countryOfOrigin: parsed.countryOfOrigin || '',
-        yearMade: parsed.yearMade ? String(parsed.yearMade) : '',
-      },
+      external: null,
+      note: aiError ? `جستجوی هوش مصنوعی هم با خطا مواجه شد: ${aiError}` : undefined,
     });
-  } catch (e) {
-    console.error('Barcode identify error:', e);
-    return res.status(500).json({ error: 'خطای سرور هنگام شناسایی بارکد' });
   }
+
+  // عکس پیداشده (چه از پایگاه‌ی رایگان، چه از هوش مصنوعی) را روی Cloudinary خودمان آینه (mirror)
+  // می‌کنیم تا برش خودکار و پس‌زمینه‌ی سفیدِ یکپارچه رویش کار کند. اولویت با تصویر هوش مصنوعی است
+  // چون معمولاً باکیفیت‌تر و مطمئن‌تر است؛ در نبودش از تصویر پایگاه‌ی رایگان استفاده می‌شود.
+  const rawImage = (ai && ai.imageUrl) || (free && free.image) || '';
+  const mirroredImage = rawImage ? await mirrorRemoteImageToCloudinary(rawImage) : null;
+
+  return res.json({
+    foundInOwnDb: false,
+    external: {
+      found: true,
+      source: ai ? (free ? 'ai+free' : 'ai') : 'free',
+      isPerfume: ai ? !!ai.isPerfume : null,
+      name: (ai && ai.name) || '',
+      title: (ai && ai.nameEn) || (free && free.title) || '',
+      brand: (ai && ai.brand) || (free && free.brand) || '',
+      image: mirroredImage || rawImage || '',
+      description: (ai && ai.description) || '',
+      properties: (ai && ai.properties) || '',
+      ingredients: (ai && ai.ingredients) || (free && free.ingredients) || '',
+      volume: (ai && ai.volume) || (free && free.volume) || '',
+      concentration: (ai && ai.concentration) || '',
+      topNotes: (ai && ai.topNotes) || '',
+      middleNotes: (ai && ai.middleNotes) || '',
+      baseNotes: (ai && ai.baseNotes) || '',
+      perfumer: (ai && ai.perfumer) || '',
+      countryOfOrigin: (ai && ai.countryOfOrigin) || '',
+      yearMade: ai && ai.yearMade ? String(ai.yearMade) : '',
+    },
+  });
 }));
 
 app.get('/api/settings', noCache, withDb(async (req, res) => {
