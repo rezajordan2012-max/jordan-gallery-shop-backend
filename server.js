@@ -646,6 +646,7 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
   if (ANTHROPIC_API_KEY) {
     try {
       ai = await identifyBarcodeWithAI(code);
+      if (!ai) aiError = 'محصول با جستجوی هوش مصنوعی هم شناسایی نشد';
     } catch (e) {
       // این مرحله کاملاً اختیاری است — یک خطا در آن نباید نتیجه‌ی معتبرِ پایگاه‌ی رایگان (در صورت وجود) را از بین ببرد
       aiError = e.message;
@@ -653,12 +654,19 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
     }
   }
 
+  // این پیام همیشه (چه چیزی پیدا شده باشد چه نه) توضیح می‌دهد که چرا فیلدهای فارسی/توضیح/نت‌ها
+  // پر نشدند — قبلاً این پیام فقط وقتی می‌رفت که هیچ‌چیزی پیدا نشده بود، پس اگر پایگاه‌ی رایگان
+  // چیزی پیدا می‌کرد ولی هوش مصنوعی شکست می‌خورد، مدیر هیچ توضیحی نمی‌دید و فقط چند فیلد بی‌دلیل
+  // خالی می‌ماند.
+  let note = null;
+  if (!ai) {
+    note = !ANTHROPIC_API_KEY
+      ? 'کلید هوش مصنوعی (ANTHROPIC_API_KEY) روی سرور تنظیم نشده — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی.'
+      : `غنی‌سازی با هوش مصنوعی ناموفق بود (${aiError}) — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی.`;
+  }
+
   if (!free && !ai) {
-    return res.json({
-      foundInOwnDb: false,
-      external: null,
-      note: aiError ? `جستجوی هوش مصنوعی هم با خطا مواجه شد: ${aiError}` : undefined,
-    });
+    return res.json({ foundInOwnDb: false, external: null, note });
   }
 
   // عکس پیداشده (چه از پایگاه‌ی رایگان، چه از هوش مصنوعی) را روی Cloudinary خودمان آینه (mirror)
@@ -669,6 +677,7 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
 
   return res.json({
     foundInOwnDb: false,
+    note,
     external: {
       found: true,
       source: ai ? (free ? 'ai+free' : 'ai') : 'free',
