@@ -21,6 +21,12 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const FRAGANTY_API_KEY = process.env.FRAGANTY_API_KEY;
 const FRAGANTY_BASE_URL = 'https://fraganty.ai';
 
+// برای ویژگی «حذف خودکار پس‌زمینه‌ی عکس محصول» — کلید سرویس remove.bg (سرویسی تخصصی و حرفه‌ای
+// برای جداسازی سوژه از پس‌زمینه، با یک لایه‌ی رایگان محدود برای شروع). این حذفِ پس‌زمینه دقیقاً
+// در لحظه‌ی آپلود انجام می‌شود (نه با یک تبدیل نمایشیِ لحظه‌ای روی Cloudinary) تا نتیجه همیشه
+// قابل‌اتکا باشد و به فعال‌بودن هیچ افزونه‌ی اختیاری/پولی روی حساب Cloudinary وابسته نباشد.
+const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
+
 // برای ویژگی «اسکن بارکد» — از هوش مصنوعی Claude با قابلیت جستجوی زنده‌ی وب استفاده می‌شود
 // (نیازی به کلید یا سرویس جداگانه نیست، همان ANTHROPIC_API_KEY بالا کافی است). این جایگزین
 // UPCitemdb شد چون UPCitemdb عمدتاً بازار آمریکا/اروپا را پوشش می‌داد و برای کالای وارداتی/موازیِ
@@ -192,9 +198,50 @@ app.get('/api/auth/me', auth, withDb(async (req, res) => {
   res.json({ user: { id: user.id, email: user.email, fullName: user.full_name, createdAt: user.created_at || null } });
 }));
 
+// حذف حرفه‌ای پس‌زمینه‌ی عکس محصول با سرویس remove.bg — درست در لحظه‌ی آپلود انجام می‌شود (نه با
+// یک تبدیل نمایشیِ لحظه‌ای روی Cloudinary که به فعال‌بودن یک افزونه‌ی پولیِ اختیاری وابسته است)
+// تا نتیجه همیشه قابل‌اتکا باشد. پارامتر bg_color=white باعث می‌شود remove.bg خودش مستقیماً سوژه
+// را روی یک پس‌زمینه‌ی سفیدِ یکدست بچسباند (نه پس‌زمینه‌ی شفاف) — دقیقاً همان چیزی که خواسته شده.
+// این تابع هرگز پرتاب خطا نمی‌کند: اگر کلید تنظیم نشده باشد یا درخواست به هر دلیلی (شبکه، سهمیه،
+// فرمت) شکست بخورد، همان تصویر اصلیِ بدون تغییر را برمی‌گرداند تا آپلود هیچ‌وقت به‌طور کامل متوقف
+// نشود — فقط در بدترین حالت، پس‌زمینه‌ی اصلی (به‌جای سفید) باقی می‌ماند.
+async function removeBackgroundFromDataUri(dataUri) {
+  if (!REMOVEBG_API_KEY) {
+    console.warn('REMOVEBG_API_KEY تنظیم نشده — حذف پس‌زمینه نادیده گرفته شد.');
+    return dataUri;
+  }
+  const match = dataUri.match(/^data:image\/(png|jpe?g|webp);base64,(.+)$/);
+  if (!match) return dataUri; // فرمت پشتیبانی‌نشده برای remove.bg (مثلاً gif) — بدون تغییر برگردانده می‌شود
+  try {
+    const res = await fetch('https://api.remove.bg/v1.0/removebg', {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': REMOVEBG_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        image_file_b64: match[2],
+        size: 'auto',
+        format: 'png',
+        bg_color: 'white',
+      }),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.error('remove.bg failed:', res.status, errBody);
+      return dataUri;
+    }
+    const buffer = Buffer.from(await res.arrayBuffer());
+    return `data:image/png;base64,${buffer.toString('base64')}`;
+  } catch (e) {
+    console.error('remove.bg request failed (non-fatal):', e.message);
+    return dataUri;
+  }
+}
+
 // تابع کمکی مشترک برای آپلود یک data-URI (base64) روی Cloudinary — هم توسط endpoint آپلود مستقیم
 // (از گالری گوشی) و هم توسط شناسایی هوشمند بارکد (برای بارگذاری عکس پیداشده از وب روی Cloudinary
-// خودمان، تا بعداً بشود برش/پس‌زمینه‌ی سفید را با تبدیل‌های Cloudinary رویش اعمال کرد) استفاده می‌شود.
+// خودمان، تا بعداً بشود اندازه‌ی یکسان روی همه‌ی تصاویر اعمال کرد) استفاده می‌شود.
 async function uploadDataUriToCloudinary(dataUri) {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) {
     throw new Error('تنظیمات Cloudinary روی سرور کامل نشده است');
@@ -240,10 +287,11 @@ async function uploadDataUriToCloudinary(dataUri) {
   return { url: data.secure_url, type: isVideo ? 'video' : 'image' };
 }
 
-// یک لینک عکس بیرونی (مثلاً پیداشده از جستجوی هوشمند بارکد) را دانلود و روی Cloudinary خودمان
-// آپلود می‌کند تا بشود بعداً برش/پس‌زمینه‌ی سفید را رویش اعمال کرد. اگر دانلود یا آپلود به هر
-// دلیلی شکست بخورد (مثلاً لینک منقضی یا محدودیت دسترسی)، فقط null برمی‌گرداند و خطا پرتاب
-// نمی‌کند — چون این یک بهبود جانبی است و نباید کل شناسایی بارکد را متوقف کند.
+// یک لینک عکس بیرونی (مثلاً پیداشده از جستجوی هوشمند بارکد) را دانلود، پس‌زمینه‌اش را حذف و با
+// یک زمینه‌ی سفیدِ یکدست جایگزین می‌کند (چون این همیشه عکس یک محصول است، نه یک بنر تبلیغاتی)، و
+// نتیجه را روی Cloudinary خودمان آپلود می‌کند. اگر دانلود یا آپلود به هر دلیلی شکست بخورد (مثلاً
+// لینک منقضی یا محدودیت دسترسی)، فقط null برمی‌گرداند و خطا پرتاب نمی‌کند — چون این یک بهبود
+// جانبی است و نباید کل شناسایی بارکد را متوقف کند.
 async function mirrorRemoteImageToCloudinary(remoteUrl) {
   try {
     if (!remoteUrl || typeof remoteUrl !== 'string' || !/^https?:\/\//i.test(remoteUrl)) return null;
@@ -257,7 +305,8 @@ async function mirrorRemoteImageToCloudinary(remoteUrl) {
     const supported = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
     if (!supported.includes(mimeForDataUri)) return null;
     const dataUri = `data:${mimeForDataUri};base64,${buffer.toString('base64')}`;
-    const uploaded = await uploadDataUriToCloudinary(dataUri);
+    const cleaned = await removeBackgroundFromDataUri(dataUri);
+    const uploaded = await uploadDataUriToCloudinary(cleaned);
     return uploaded.url;
   } catch (e) {
     console.error('mirrorRemoteImageToCloudinary failed:', e.message);
@@ -265,13 +314,20 @@ async function mirrorRemoteImageToCloudinary(remoteUrl) {
   }
 }
 
+// نکته‌ی مهم درباره‌ی حذف پس‌زمینه: این endpoint برای همه‌جور آپلود (عکس محصول، طیف رنگ، بنر
+// صفحه‌ی اصلی، بنر دسته‌بندی، رسانه‌ی باکس دسته‌بندی) استفاده می‌شود، اما حذف پس‌زمینه فقط باید
+// روی عکس محصول/طیف رنگ اعمال شود — نه روی بنرهای تبلیغاتی که خودِ پس‌زمینه‌شان بخشی از طراحی
+// است. به همین دلیل فرانت‌اند برای عکس محصول و طیف رنگ، فلگ removeBackground را true می‌فرستد؛
+// برای بقیه‌ی موارد این فلگ ارسال نمی‌شود (پیش‌فرض false) و تصویر دست‌نخورده باقی می‌ماند.
 app.post('/api/upload', auth, requireAdmin, async (req, res) => {
-  const { imageBase64 } = req.body || {};
+  const { imageBase64, removeBackground } = req.body || {};
   if (!imageBase64 || typeof imageBase64 !== 'string') {
     return res.status(400).json({ error: 'فایل معتبر نیست' });
   }
   try {
-    const uploaded = await uploadDataUriToCloudinary(imageBase64);
+    const isVideo = imageBase64.startsWith('data:video/');
+    const dataToUpload = removeBackground && !isVideo ? await removeBackgroundFromDataUri(imageBase64) : imageBase64;
+    const uploaded = await uploadDataUriToCloudinary(dataToUpload);
     res.json(uploaded);
   } catch (e) {
     const statusMap = { 'تنظیمات Cloudinary روی سرور کامل نشده است': 500, 'فرمت فایل پشتیبانی نمی‌شود': 400 };
