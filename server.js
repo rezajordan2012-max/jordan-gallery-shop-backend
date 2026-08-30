@@ -769,9 +769,26 @@ app.put('/api/settings', auth, requireAdmin, withDb(async (req, res) => {
   res.json(db.settings);
 }));
 
+// تعداد خرید هر محصول را از سفارش‌های پرداخت‌شده می‌شمارد — برای بخش «پرفروش‌ترین‌های هر دسته»
+// در صفحه‌ی اصلی. شمارش هر بار در لحظه‌ی درخواست انجام می‌شود (نه ذخیره‌شده روی خودِ محصول) تا
+// همیشه با آخرین وضعیت سفارش‌ها به‌روز باشد.
+function computeSalesCounts(orders) {
+  const counts = {};
+  (orders || []).forEach((order) => {
+    if (order.status !== 'paid') return;
+    (order.items || []).forEach((item) => {
+      if (!item || !item.id) return;
+      counts[item.id] = (counts[item.id] || 0) + (Number(item.qty) || 0);
+    });
+  });
+  return counts;
+}
+
 app.get('/api/products', noCache, withDb(async (req, res) => {
   const db = await readDB();
-  res.json(db.products || []);
+  const salesCounts = computeSalesCounts(db.orders);
+  const products = (db.products || []).map((p) => ({ ...p, salesCount: salesCounts[p.id] || 0 }));
+  res.json(products);
 }));
 
 // افزودن محصول — فیلد nameEn (نام انگلیسی، اختیاری) هم اضافه شد
