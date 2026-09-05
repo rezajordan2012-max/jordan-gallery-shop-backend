@@ -242,31 +242,37 @@ app.post('/api/upload', auth, requireAdmin, async (req, res) => {
   }
 });
 
-// Existing Anthropic image extraction endpoint — unchanged in purpose.
+// Existing image extraction endpoint — Gemini free-tier model
 app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
-  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'کلید ANTHROPIC_API_KEY روی سرور تنظیم نشده است' });
+  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
   const { imageBase64 } = req.body || {};
   if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
-  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/);
+  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
   if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، webp)' });
-  const mediaType = match[1];
-  const data = match[2];
-  const approxBytes = Math.ceil((data.length * 3) / 4);
+  const approxBytes = Math.ceil((match[2].length * 3) / 4);
   if (approxBytes > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
-
-  const instruction = buildProductExtractionPrompt();
   try {
-    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 1700, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: mediaType, data } }, { type: 'text', text: instruction }] }] }),
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+    const aiRes = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [
+          { inline_data: { mime_type: match[1], data: match[2] } },
+          { text: buildProductExtractionPrompt() },
+        ] }],
+        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+      }),
     });
-    const aiData = await aiRes.json();
-    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی' });
-    const textBlock = (aiData.content || []).find((c) => c.type === 'text');
-    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
-    const parsed = parseJsonObject(textBlock.text);
-    res.json(parsed);
-  } catch (e) { console.error('AI extract error:', e); res.status(500).json({ error: 'خطای سرور هنگام تحلیل تصویر' }); }
+    const aiData = await aiRes.json().catch(() => ({}));
+    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || `خطا در ارتباط با Gemini (${aiRes.status})` });
+    const textBlock = (aiData.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((c) => c.text || '').join('').trim();
+    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    res.json(parseJsonObject(textBlock));
+  } catch (e) {
+    console.error('Gemini image extraction error:', e);
+    res.status(502).json({ error: e.message || 'خطای سرور هنگام تحلیل تصویر با Gemini' });
+  }
 });
 
 function buildProductExtractionPrompt() {
@@ -448,10 +454,7 @@ async function callGeminiText(prompt) {
   const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
   const r = await fetch(endpoint, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': GEMINI_API_KEY,
-    },
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
     body: JSON.stringify({
       contents: [{ role: 'user', parts: [{ text: prompt }] }],
       generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
@@ -510,11 +513,11 @@ app.post('/api/ai/extract-product-from-image', auth, requireAdmin, async (req, r
   const approxBytes = Math.ceil((match[2].length * 3) / 4);
   if (approxBytes > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
   try {
-    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
     const prompt = buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار.', 'image');
     const r = await fetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [{ inline_data: { mime_type: match[1], data: match[2] } }, { text: prompt }] }],
         generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
@@ -527,6 +530,53 @@ app.post('/api/ai/extract-product-from-image', auth, requireAdmin, async (req, r
     res.json(parseJsonObject(text));
   } catch (e) {
     console.error('Gemini image extraction error:', e);
+    res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
+  }
+});
+
+// Current App endpoint aliases — no frontend change required.
+app.post('/api/ai/import-product-url', auth, requireAdmin, async (req, res) => {
+  const url = validateProductUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'لینک محصول معتبر نیست' });
+  try {
+    const page = await fetchProductPage(url);
+    const sourceText = stripHtmlForGemini(page.html);
+    if (!sourceText) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
+    const product = await callGeminiText(buildGeminiProductPrompt(sourceText, page.finalUrl));
+    res.json({ ...product, sourceUrl: page.finalUrl });
+  } catch (e) {
+    console.error('Gemini URL extraction error:', e);
+    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
+  }
+});
+
+app.post('/api/ai/analyze-perfume-image', auth, requireAdmin, async (req, res) => {
+  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
+  const imageBase64 = req.body && req.body.imageBase64;
+  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
+  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
+  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، jpeg، webp)' });
+  if (Math.ceil((match[2].length * 3) / 4) > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  try {
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [
+          { inline_data: { mime_type: match[1], data: match[2] } },
+          { text: buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار و هرگز حدس نزن.', 'image') },
+        ] }],
+        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || `خطا در ارتباط با Gemini (${r.status})` });
+    const resultText = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
+    if (!resultText) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    res.json(parseJsonObject(resultText));
+  } catch (e) {
+    console.error('Gemini perfume image error:', e);
     res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
   }
 });
