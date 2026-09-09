@@ -526,6 +526,174 @@ app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res
     res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
   }
 });
+   const data = await r.json();
+    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini' });
+    const text = (data.candidates || []).flatMap((c) => c.content && c.content.parts || []).map((p) => p.text || '').join('').trim();
+    if (!text) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    res.json(parseJsonObject(text));
+  } catch (e) {
+    console.error('Gemini image extraction error:', e);
+    res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
+  }
+});
+
+// Current App endpoint aliases — no frontend change required.
+app.post('/api/ai/import-product-url', auth, requireAdmin, async (req, res) => {
+  const url = validateProductUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'لینک محصول معتبر نیست' });
+  try {
+    const page = await fetchProductPage(url);
+    const sourceText = stripHtmlForGemini(page.html);
+    if (!sourceText) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
+    const product = await callGeminiText(buildGeminiProductPrompt(sourceText, page.finalUrl));
+    // همان منطقِ mirror کردنِ عکسِ اصلیِ صفحه (og:image/twitter:image) روی Cloudinary — این
+    // endpoint همان چیزی است که فرانت‌اند برای «ورود محصول با لینک» واقعاً صدا می‌زند.
+    const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
+    const mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
+    res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
+  } catch (e) {
+    console.error('Gemini URL extraction error:', e);
+    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
+  }
+});
+
+app.post('/api/ai/analyze-perfume-image', auth, requireAdmin, async (req, res) => {
+  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
+  const imageBase64 = req.body && req.body.imageBase64;
+  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
+  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
+  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، jpeg، webp)' });
+  if (Math.ceil((match[2].length * 3) / 4) > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  try {
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [
+          { inline_data: { mime_type: match[1], data: match[2] } },
+          { text: buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار و هرگز حدس نزن.', 'image') },
+        ] }],
+        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || `خطا در ارتباط با Gemini (${r.status})` });
+    const resultText = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
+    if (!resultText) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    res.json(parseJsonObject(resultText));
+  } catch (e) {
+    console.error('Gemini perfume image error:', e);
+    res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
+  }
+});
+
+app.get('/api/settings', noCache, withDb(async (req, res) => { const db = await readDB(); res.json(db.settings || {}); }));
+app.put('/api/settings', auth, requireAdmin, withDb(async (req, res) => { const db = await readDB(); db.settings = { ...db.settings, ...(req.body || {}) }; await writeDB(db); res.json(db.settings); }));
+
+function computeSalesCounts(orders) {
+  const counts = {};
+  (orders || []).forEach((order) => {
+    if (order.status !== 'paid') return;
+    (order.items || []).forEach((item) => { if (!item || !item.id) return; counts[item.id] = (counts[item.id] || 0) + (Number(item.qty) || 0); });
+  });
+  return counts;
+}
+
+app.get('/api/products', noCache, withDb(async (req, res) => {
+  const db = await readDB();
+  const salesCounts = computeSalesCounts(db.orders);
+  res.json((db.products || []).map((p) => ({ ...p, salesCount: salesCounts[p.id] || 0 })));
+}));
+
+app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
+  const p = req.body || {};
+  if (!p.name || !p.price) return res.status(400).json({ error: 'قیمت و نام محصول الزامی است' });
+  const db = await readDB();
+  const id = 'p' + db.nextProductId++;
+  const product = {
+    id, name: p.name, nameEn: p.nameEn || '', brand: p.brand || '', category: p.category || 'perfume', subcategory: p.subcategory || '', type: p.type || '',
+    facets: (p.facets && typeof p.facets === 'object') ? p.facets : {}, price: Number(p.price), description: p.description || '', properties: p.properties || '', ingredients: p.ingredients || '',
+    topNotes: p.topNotes || '', middleNotes: p.middleNotes || '', baseNotes: p.baseNotes || '', mainAccords: p.mainAccords || '',
+    scentScore: Number.isFinite(Number(p.scentScore)) ? Number(p.scentScore) : 0, scentRatings: Number.isFinite(Number(p.scentRatings)) ? Number(p.scentRatings) : 0,
+    longevityScore: Number.isFinite(Number(p.longevityScore)) ? Number(p.longevityScore) : 0, longevityRatings: Number.isFinite(Number(p.longevityRatings)) ? Number(p.longevityRatings) : 0,
+    sillageScore: Number.isFinite(Number(p.sillageScore)) ? Number(p.sillageScore) : 0, sillageRatings: Number.isFinite(Number(p.sillageRatings)) ? Number(p.sillageRatings) : 0,
+    perfumer: p.perfumer || '', countryOfOrigin: p.countryOfOrigin || '', yearMade: p.yearMade || '', fragranticaRating: p.fragranticaRating || '', volume: p.volume || '', barcode: p.barcode || '', discountPercent: Number(p.discountPercent) || 0,
+    image: p.image || '', imageFit: p.imageFit === 'cover' ? 'cover' : 'contain', imagePosX: Number.isFinite(Number(p.imagePosX)) ? Number(p.imagePosX) : 50, imagePosY: Number.isFinite(Number(p.imagePosY)) ? Number(p.imagePosY) : 50,
+    imageZoom: Number.isFinite(Number(p.imageZoom)) && Number(p.imageZoom) > 0 ? Number(p.imageZoom) : 1,
+    ...(Array.isArray(p.variants) && p.variants.length > 0 ? { variants: p.variants } : {}),
+  };
+  db.products.push(product); await writeDB(db); res.json(product);
+}));
+
+app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
+  const db = await readDB();
+  const idx = db.products.findIndex((x) => x.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'محصول یافت نشد' });
+  const p = req.body || {}; const old = db.products[idx];
+  const updated = {
+    ...old, name: p.name ?? old.name, nameEn: p.nameEn !== undefined ? p.nameEn : (old.nameEn || ''), brand: p.brand ?? old.brand, category: p.category ?? old.category,
+    subcategory: p.subcategory !== undefined ? p.subcategory : old.subcategory, type: p.type !== undefined ? p.type : old.type, facets: p.facets !== undefined ? p.facets : old.facets,
+    price: p.price !== undefined ? Number(p.price) : old.price, description: p.description ?? old.description, properties: p.properties !== undefined ? p.properties : old.properties,
+    ingredients: p.ingredients !== undefined ? p.ingredients : old.ingredients, topNotes: p.topNotes !== undefined ? p.topNotes : (old.topNotes || ''), middleNotes: p.middleNotes !== undefined ? p.middleNotes : (old.middleNotes || ''), baseNotes: p.baseNotes !== undefined ? p.baseNotes : (old.baseNotes || ''),
+    mainAccords: p.mainAccords !== undefined ? p.mainAccords : (old.mainAccords || ''),
+    scentScore: p.scentScore !== undefined ? (Number(p.scentScore) || 0) : (old.scentScore || 0), scentRatings: p.scentRatings !== undefined ? (Number(p.scentRatings) || 0) : (old.scentRatings || 0),
+    longevityScore: p.longevityScore !== undefined ? (Number(p.longevityScore) || 0) : (old.longevityScore || 0), longevityRatings: p.longevityRatings !== undefined ? (Number(p.longevityRatings) || 0) : (old.longevityRatings || 0),
+    sillageScore: p.sillageScore !== undefined ? (Number(p.sillageScore) || 0) : (old.sillageScore || 0), sillageRatings: p.sillageRatings !== undefined ? (Number(p.sillageRatings) || 0) : (old.sillageRatings || 0),
+    perfumer: p.perfumer !== undefined ? p.perfumer : (old.perfumer || ''), countryOfOrigin: p.countryOfOrigin !== undefined ? p.countryOfOrigin : (old.countryOfOrigin || ''), yearMade: p.yearMade !== undefined ? p.yearMade : (old.yearMade || ''), fragranticaRating: p.fragranticaRating !== undefined ? p.fragranticaRating : (old.fragranticaRating || ''), volume: p.volume !== undefined ? p.volume : (old.volume || ''), barcode: p.barcode !== undefined ? p.barcode : (old.barcode || ''),
+    discountPercent: p.discountPercent !== undefined ? (Number(p.discountPercent) || 0) : old.discountPercent, image: p.image ?? old.image, imageFit: p.imageFit !== undefined ? (p.imageFit === 'cover' ? 'cover' : 'contain') : (old.imageFit || 'contain'), imagePosX: p.imagePosX !== undefined ? (Number(p.imagePosX) || 50) : (old.imagePosX ?? 50), imagePosY: p.imagePosY !== undefined ? (Number(p.imagePosY) || 50) : (old.imagePosY ?? 50), imageZoom: p.imageZoom !== undefined ? (Number(p.imageZoom) || 1) : (old.imageZoom ?? 1),
+  };
+  if (Array.isArray(p.variants) && p.variants.length > 0) updated.variants = p.variants;
+  else if (p.variants !== undefined) delete updated.variants;
+  db.products[idx] = updated; await writeDB(db); res.json(updated);
+}));
+
+app.delete('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
+  const db = await readDB(); const before = db.products.length; db.products = db.products.filter((x) => x.id !== req.params.id);
+  if (db.products.length === before) return res.status(404).json({ error: 'محصول یافت نشد' });
+  await writeDB(db); res.json({ ok: true });
+}));
+
+app.get('/api/orders', auth, noCache, withDb(async (req, res) => {
+  const db = await readDB();
+  res.json(db.orders.filter((o) => o.user_id === req.user.id).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
+}));
+
+app.post('/api/payment/request', auth, withDb(async (req, res) => {
+  const { items, amount, description } = req.body || {};
+  if (!amount || amount < 1000) return res.status(400).json({ error: 'مبلغ نامعتبر است' });
+  if (!ZARINPAL_MERCHANT_ID) return res.status(500).json({ error: 'ZARINPAL_MERCHANT_ID تنظیم نشده است' });
+  try {
+    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/request.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount, callback_url: CALLBACK_URL, description: description || 'خرید از فروشگاه' }) });
+    const data = await zRes.json();
+    if (data.data && data.data.code === 100) {
+      const authority = data.data.authority; const db = await readDB();
+      db.orders.push({ id: db.nextOrderId++, user_id: req.user.id, items: items || [], amount, authority, ref_id: null, status: 'pending', created_at: new Date().toISOString() });
+      await writeDB(db); return res.json({ paymentUrl: `https://www.zarinpal.com/pg/StartPay/${authority}` });
+    }
+    res.status(400).json({ error: 'خطا در اتصال به درگاه پرداخت', detail: data });
+  } catch (e) { res.status(500).json({ error: 'خطای سرور در ارتباط با درگاه' }); }
+}));
+
+app.get('/payment/callback', async (req, res) => {
+  const { Authority, Status } = req.query; let db;
+  try { db = await readDB(); } catch { return res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
+  const order = db.orders.find((o) => o.authority === Authority);
+  if (!order) return res.redirect(`${FRONTEND_URL}/payment/result?status=notfound`);
+  if (Status !== 'OK') { order.status = 'canceled'; await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=canceled`); }
+  try {
+    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/verify.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount: order.amount, authority: Authority }) });
+    const data = await zRes.json();
+    if (data.data && (data.data.code === 100 || data.data.code === 101)) { order.status = 'paid'; order.ref_id = String(data.data.ref_id); await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=success&ref=${data.data.ref_id}`); }
+    order.status = 'failed'; await writeDB(db); res.redirect(`${FRONTEND_URL}/payment/result?status=failed`);
+  } catch { res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
+});
+
+app.get('/', (req, res) => res.send('Store API is running'));
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
 // ============================================================
 // NEW CAPABILITY #2: Product image -> Gemini Vision
