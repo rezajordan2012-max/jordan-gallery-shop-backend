@@ -208,3 +208,162 @@ async function uploadDataUriToCloudinary(dataUri) {
   if (!cloudRes.ok || !data.secure_url) throw new Error((data && data.error && data.error.message) || 'آپلود Cloudinary ناموفق بود');
   return { url: data.secure_url, type: isVideo ? 'video' : 'image' };
 }
+async function mirrorRemoteImageToCloudinary(remoteUrl) {
+  try {
+    if (!remoteUrl || typeof remoteUrl !== 'string' || !/^https?:\/\//i.test(remoteUrl)) return null;
+    const imgRes = await fetch(remoteUrl);
+    if (!imgRes.ok) return null;
+    const contentType = imgRes.headers.get('content-type') || '';
+    if (!contentType.startsWith('image/')) return null;
+    const buffer = Buffer.from(await imgRes.arrayBuffer());
+    if (buffer.length > 10 * 1024 * 1024) return null;
+    const mimeForDataUri = contentType.split(';')[0].replace('image/jpg', 'image/jpeg');
+    const supported = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+    if (!supported.includes(mimeForDataUri)) return null;
+    const dataUri = `data:${mimeForDataUri};base64,${buffer.toString('base64')}`;
+    const cleaned = await removeBackgroundFromDataUri(dataUri);
+    const uploaded = await uploadDataUriToCloudinary(cleaned);
+    return uploaded.url;
+  } catch (e) { console.error('mirrorRemoteImageToCloudinary failed:', e.message); return null; }
+}
+
+app.post('/api/upload', auth, requireAdmin, async (req, res) => {
+  const { imageBase64, removeBackground } = req.body || {};
+  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'فایل معتبر نیست' });
+  try {
+    const isVideo = imageBase64.startsWith('data:video/');
+    const dataToUpload = removeBackground && !isVideo ? await removeBackgroundFromDataUri(imageBase64) : imageBase64;
+    res.json(await uploadDataUriToCloudinary(dataToUpload));
+  } catch (e) {
+    const statusMap = { 'تنظیمات Cloudinary روی سرور کامل نشده است': 500, 'فرمت فایل پشتیبانی نمی‌شود': 400 };
+    res.status(statusMap[e.message] || (e.message && e.message.includes('حجم') ? 413 : 502)).json({ error: e.message || 'آپلود ناموفق بود' });
+  }
+});
+
+// Existing image extraction endpoint — Gemini free-tier model
+app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
+  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
+  const { imageBase64 } = req.body || {};
+  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
+  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
+  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، webp)' });
+  const approxBytes = Math.ceil((match[2].length * 3) / 4);
+  if (approxBytes > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  try {
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+    const aiRes = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [
+          { inline_data: { mime_type: match[1], data: match[2] } },
+          { text: buildProductExtractionPrompt() },
+        ] }],
+        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+      }),
+    });
+    const aiData = await aiRes.json().catch(() => ({}));
+    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || `خطا در ارتباط با Gemini (${aiRes.status})` });
+    const textBlock = (aiData.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((c) => c.text || '').join('').trim();
+    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    res.json(parseJsonObject(textBlock));
+  } catch (e) {
+    console.error('Gemini image extraction error:', e);
+    res.status(502).json({ error: e.message || 'خطای سرور هنگام تحلیل تصویر با Gemini' });
+  }
+});
+
+function buildProductExtractionPrompt() {
+  return `عکسی از محصول/جعبه/برچسب/صفحه مرجع محصول دریافت کرده‌ای. هدف: پر کردن فیلدهای فرم محصول در پنل مدیریت.
+اگر چیزی مطمئن نیستی یا در تصویر دیده نمی‌شود، همان فیلد را خالی یا آرایه خالی بگذار؛ هرگز حدس نزن.
+تمام فیلدهای متنی فارسی باشند، به‌جز nameEn که دقیقاً به زبان اصلی بماند، concentration که یکی از مقادیر استاندارد انگلیسی باشد، و mainAccords که همان کلماتِ انگلیسیِ اصلیِ «Main accords» (در صورت وجود روی تصویر) با ویرگول جدا از هم باشد.
+priceToman فقط وقتی عدد خام قیمت تومان/ریال روی تصویر واضح است. ارز خارجی را تبدیل نکن و در referencePriceNote نگه دار.
+categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, electronics یا خالی.
+فقط JSON معتبر و بدون Markdown برگردان:
+{
+"name":"","nameEn":"","brand":"","categoryGuess":"","subcategoryHint":"","priceToman":"","referencePriceNote":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":"","variants":[]
+}
+variants آرایه‌ای از {"label":"","hex":""} باشد.`;
+}
+
+function parseJsonObject(text) {
+  const cleaned = String(text || '').replace(/```json/gi, '').replace(/```/g, '').trim();
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  return JSON.parse(start >= 0 && end >= start ? cleaned.slice(start, end + 1) : cleaned);
+}
+
+// Existing Fraganty endpoints.
+const FRAGANTY_QUOTA_MESSAGE = 'سهمیه ماهانه رایگان ai.fraganty تمام شده — تا ماه بعد صبر کن یا از پلن پولی بگیر';
+app.get('/api/ai/search-perfume', auth, requireAdmin, async (req, res) => {
+  if (!FRAGANTY_API_KEY) return res.status(500).json({ error: 'کلید FRAGANTY_API_KEY روی سرور تنظیم نشده است' });
+  const q = (req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'نام محصول را وارد کن' });
+  try {
+    const fRes = await fetch(`${FRAGANTY_BASE_URL}/api/perfumes?q=${encodeURIComponent(q)}&limit=8`, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
+    const fData = await fRes.json();
+    if (!fRes.ok) return res.status(fRes.status === 429 ? 429 : 502).json({ error: fRes.status === 429 ? FRAGANTY_QUOTA_MESSAGE : (fData && fData.error) || 'خطا در ارتباط با ai.fraganty' });
+    const results = (Array.isArray(fData.data) ? fData.data : []).filter((p) => p && p.id).map((p) => ({ id: p.id, name: p.name, brand: p.brand, year: p.year, image: p.image }));
+    res.json({ data: results });
+  } catch (e) { console.error('Fraganty search error:', e); res.status(500).json({ error: 'خطای سرور هنگام جستجو در ai.fraganty' }); }
+});
+
+app.get('/api/ai/perfume-details', auth, requireAdmin, async (req, res) => {
+  if (!FRAGANTY_API_KEY) return res.status(500).json({ error: 'کلید FRAGANTY_API_KEY روی سرور تنظیم نشده است' });
+  const slug = (req.query.slug || '').trim();
+  if (!slug) return res.status(400).json({ error: 'شناسه محصول نامعتبر است' });
+  try {
+    const fRes = await fetch(`${FRAGANTY_BASE_URL}/api/perfumes/${encodeURIComponent(slug)}`, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
+    const fData = await fRes.json();
+    if (!fRes.ok) return res.status(fRes.status === 429 ? 429 : fRes.status === 404 ? 404 : 502).json({ error: fRes.status === 429 ? FRAGANTY_QUOTA_MESSAGE : fRes.status === 404 ? 'این محصول در ai.fraganty پیدا نشد — یک نتیجه دیگر را امتحان کن' : (fData && fData.error) || 'خطا در دریافت جزئیات از ai.fraganty' });
+    if (!fData || !fData.name) return res.status(502).json({ error: 'این محصول در ai.fraganty اطلاعات کاملی ندارد — یک نتیجه دیگر را امتحان کن یا فیلدها را دستی پر کن' });
+    res.json(fData);
+  } catch (e) { console.error('Fraganty details error:', e); res.status(500).json({ error: 'خطای سرور هنگام دریافت جزئیات از ai.fraganty' }); }
+});
+
+app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) => {
+  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'کلید ANTHROPIC_API_KEY روی سرور تنظیم نشده است' });
+  const { name, brand, description, accords, seasons, dayNight, gender, rating } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'نام محصول الزم است' });
+  const instruction = `اطلاعات زیر درباره یک عطر است. یک JSON معتبر بدون Markdown برگردان.
+نام: ${name}
+برند: ${brand || ''}
+جنسیت: ${gender || ''}
+امتیاز کاربران: ${rating || ''}
+توضیح اصلی: ${description || ''}
+آکوردها: ${Array.isArray(accords) ? accords.map((a) => typeof a === 'string' ? a : a.name).filter(Boolean).join('، ') : ''}
+فصل‌ها: ${JSON.stringify(seasons || '')}
+زمان استفاده روز/شب: ${JSON.stringify(dayNight || '')}
+ساختار دقیق: {"description":"توضیح کوتاه دو تا سه جمله‌ای کاملاً فارسی","properties":"چند ویژگی کوتاه فارسی، هرکدام در خط جدا، حداکثر ۵ خط"}`;
+  try {
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 700, messages: [{ role: 'user', content: instruction }] }) });
+    const aiData = await aiRes.json();
+    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی' });
+    const textBlock = (aiData.content || []).find((c) => c.type === 'text');
+    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
+    const parsed = parseJsonObject(textBlock.text);
+    res.json({ description: parsed.description || '', properties: parsed.properties || '' });
+  } catch (e) { console.error('AI translate-perfume-text error:', e); res.status(500).json({ error: 'خطای سرور هنگام ترجمه توضیحات' }); }
+});
+
+async function lookupOpenFacts(code) {
+  const bases = ['https://world.openbeautyfacts.org/api/v2/product', 'https://world.openfoodfacts.org/api/v2/product'];
+  for (const base of bases) {
+    try {
+      const r = await fetch(`${base}/${encodeURIComponent(code)}.json`);
+      if (!r.ok) continue;
+      const data = await r.json();
+      if (!data || data.status !== 1 || !data.product) continue;
+      const p = data.product;
+      const title = (p.product_name || p.product_name_en || p.generic_name || '').trim();
+      if (!title) continue;
+      const brand = (p.brands || '').split(',')[0].trim();
+      const image = p.image_front_url || p.image_url || '';
+      const ingredients = (p.ingredients_text || p.ingredients_text_en || '').trim();
+      const volMatch = (p.quantity || p.product_quantity || '').toString().match(/([\d.,]+)\s*m?l\b/i);
+      const volume = volMatch ? volMatch[1].replace(',', '.') : '';
+      return { title, brand, image, ingredients, volume };
+    } catch (e) { console.error('Open Facts lookup failed:', base, e.message); }
+  }
+  return null;
+}
