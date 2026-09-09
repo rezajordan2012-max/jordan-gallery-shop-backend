@@ -367,3 +367,185 @@ async function lookupOpenFacts(code) {
   }
   return null;
 }
+
+async function identifyBarcodeWithAI(code) {
+  if (!ANTHROPIC_API_KEY) return null;
+  const instruction = `کد بارکد زیر متعلق به یک محصول است: ${code}
+با جستجوی وب، محصول واقعی متناظر را با اطمینان شناسایی کن. اگر مطمئن نیستی حدس نزن.
+فقط JSON معتبر: {"found":true,"isPerfume":false,"name":"","nameEn":"","brand":"","imageUrl":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":""}`;
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 2000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: instruction }] }) });
+  const aiData = await aiRes.json();
+  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
+  const textCombined = (aiData.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
+  if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
+  const parsed = parseJsonObject(textCombined);
+  if (!parsed || !parsed.found || !parsed.name) return null;
+  return parsed;
+}
+
+app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
+  const code = (req.query.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
+  const db = await readDB();
+  const ownMatch = db.products.find((p) => p.barcode && p.barcode === code);
+  if (ownMatch) return res.json({ foundInOwnDb: true, product: { id: ownMatch.id, name: ownMatch.name, category: ownMatch.category, subcategory: ownMatch.subcategory } });
+  let free = null;
+  try { free = await lookupOpenFacts(code); } catch (e) { console.error('lookupOpenFacts error:', e.message); }
+  let ai = null; let aiError = null;
+  if (ANTHROPIC_API_KEY) {
+    try { ai = await identifyBarcodeWithAI(code); if (!ai) aiError = 'محصول با جستجوی هوش مصنوعی هم شناسایی نشد'; }
+    catch (e) { aiError = e.message; console.error('identifyBarcodeWithAI failed (non-fatal):', aiError); }
+  }
+  let note = null;
+  if (!ai) note = !ANTHROPIC_API_KEY ? 'کلید هوش مصنوعی روی سرور تنظیم نشده — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی' : `غنی‌سازی با هوش مصنوعی ناموفق بود — ${aiError || ''}`;
+  if (!free && !ai) return res.json({ foundInOwnDb: false, external: null, note });
+  const rawImage = (ai && ai.imageUrl) || (free && free.image) || '';
+  const mirroredImage = rawImage ? await mirrorRemoteImageToCloudinary(rawImage) : null;
+  res.json({ foundInOwnDb: false, note, external: { found: true, source: ai ? (free ? 'ai+free' : 'ai') : 'free', isPerfume: ai ? !!ai.isPerfume : null, name: (ai && ai.name) || '', title: (ai && ai.nameEn) || (free && free.title) || '', brand: (ai && ai.brand) || (free && free.brand) || '', image: mirroredImage || rawImage || '', description: (ai && ai.description) || '', properties: (ai && ai.properties) || '', ingredients: (ai && ai.ingredients) || (free && free.ingredients) || '', volume: (ai && ai.volume) || (free && free.volume) || '', concentration: (ai && ai.concentration) || '', topNotes: (ai && ai.topNotes) || '', middleNotes: (ai && ai.middleNotes) || '', baseNotes: (ai && ai.baseNotes) || '', mainAccords: (ai && ai.mainAccords) || '', perfumer: (ai && ai.perfumer) || '', countryOfOrigin: (ai && ai.countryOfOrigin) || '', yearMade: ai && ai.yearMade ? String(ai.yearMade) : '' } });
+}));
+
+// ============================================================
+// NEW CAPABILITY #1: Product page URL -> Gemini
+// ============================================================
+function validateProductUrl(value) {
+  try {
+    const u = new URL(String(value));
+    if (!['http:', 'https:'].includes(u.protocol)) return null;
+    return u;
+  } catch { return null; }
+}
+
+function stripHtmlForGemini(html) {
+  return String(html || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120000);
+}
+
+// از روی HTML خام صفحه (پیش از حذف تگ‌ها)، محتمل‌ترین عکسِ اصلیِ محصول را با گشتن در متاتگ‌های
+// استاندارد og:image / twitter:image پیدا می‌کند — همان تگ‌هایی که تقریباً همه‌ی فروشگاه‌های
+// آنلاین برای پیش‌نمایشِ لینک (مثلاً هنگام اشتراک‌گذاری در تلگرام/واتساپ) پر می‌کنند، پس معمولاً
+// دقیق‌ترین و باکیفیت‌ترین عکسِ محصول همین است. آدرسِ نسبی را هم نسبت به baseUrl کامل می‌کند.
+function extractPrimaryImageFromHtml(html, baseUrl) {
+  if (!html) return null;
+  const patterns = [
+    /<meta[^>]+property=["']og:image:secure_url["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m && m[1]) {
+      try { return new URL(m[1], baseUrl).toString(); } catch { /* skip invalid */ }
+    }
+  }
+  return null;
+}
+
+async function fetchProductPage(url) {
+  const r = await fetch(url.toString(), {
+    method: 'GET',
+    redirect: 'follow',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)',
+      'Accept': 'text/html,application/xhtml+xml',
+    },
+  });
+  if (!r.ok) throw new Error(`صفحه محصول قابل دریافت نیست (${r.status})`);
+  const contentType = r.headers.get('content-type') || '';
+  if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) throw new Error('لینک واردشده صفحه HTML محصول نیست');
+  const html = await r.text();
+  return { html, finalUrl: r.url || url.toString() };
+}
+
+async function callGeminiText(prompt) {
+  if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
+  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+    }),
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error((data && data.error && data.error.message) || 'خطا در ارتباط با Gemini');
+  const text = (data.candidates || []).flatMap((c) => c.content && c.content.parts || []).map((p) => p.text || '').join('').trim();
+  if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
+  return parseJsonObject(text);
+}
+
+function buildGeminiProductPrompt(sourceText, sourceUrl) {
+  return `تو مسئول استخراج اطلاعات دقیق محصول برای پنل مدیریت فروشگاه هستی.
+منبع: ${sourceUrl}
+متن صفحه محصول در ادامه آمده است.
+فقط اطلاعاتی را وارد کن که از منبع قابل تشخیص است؛ هرگز حدس نزن و اطلاعات جعلی نساز.
+تمام فیلدهای متنی فارسی روان باشند، به‌جز nameEn که باید نام دقیق اصلی محصول باشد، concentration که باید مقدار استاندارد انگلیسی باشد، و mainAccords که باید همان کلمات انگلیسیِ اصلیِ «Main accords» (مثل Resinous, Smoky, Spicy, Woody) با ویرگول جدا از هم باشد.
+قیمت خارجی را به تومان تبدیل نکن. اگر قیمت صفحه تومان/ریال است، priceToman را فقط به رقم خام بده؛ در غیر این صورت خالی و مقدار و ارز اصلی را در referencePriceNote بیاور.
+categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, electronics یا خالی.
+برای عطر، نت‌ها، آکوردهای اصلی، عطار و غلظت را فقط در صورت وجود منبع بده.
+scentScore/longevityScore/sillageScore فقط اعداد بین ۰ تا ۱۰ هستند (مثلاً همان امتیازهای Scent/Longevity/Sillage در Fragrantica)؛ scentRatings/longevityRatings/sillageRatings تعداد رأی‌دهندگان همان امتیاز است. اگر هیچ‌کدام در منبع نبود، همه را خالی بگذار.
+JSON دقیقاً با این ساختار برگردان:
+{
+"name":"","nameEn":"","brand":"","categoryGuess":"","subcategoryHint":"","priceToman":"","referencePriceNote":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":"","scentScore":"","scentRatings":"","longevityScore":"","longevityRatings":"","sillageScore":"","sillageRatings":"","variants":[]
+}
+variants آرایه‌ای از {"label":"","hex":""} باشد.
+
+متن صفحه:
+${sourceText}`;
+}
+
+app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res) => {
+  const url = validateProductUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'لینک محصول معتبر نیست' });
+  try {
+    const page = await fetchProductPage(url);
+    const text = stripHtmlForGemini(page.html);
+    if (!text) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
+    const product = await callGeminiText(buildGeminiProductPrompt(text, page.finalUrl));
+    // اگر صفحه‌ی محصول یک عکسِ اصلی (og:image/twitter:image) داشته باشد، همان عکس را دانلود و
+    // مستقیماً روی Cloudinary خودمان آپلود می‌کنیم (نه یک لینکِ خارجیِ خام) تا در «تصویر واقعی
+    // محصول» فرم مدیریت جایگزین شود؛ اگر مرورش با شکست مواجه شد (non-fatal)، بدون عکس ادامه می‌دهیم.
+    const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
+    const mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
+    res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
+  } catch (e) {
+    console.error('Gemini URL extraction error:', e);
+    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
+  }
+});
+
+// ============================================================
+// NEW CAPABILITY #2: Product image -> Gemini Vision
+// ============================================================
+app.post('/api/ai/extract-product-from-image', auth, requireAdmin, async (req, res) => {
+  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
+  const imageBase64 = req.body && req.body.imageBase64;
+  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
+  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
+  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، jpeg، webp)' });
+  const approxBytes = Math.ceil((match[2].length * 3) / 4);
+  if (approxBytes > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  try {
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+    const prompt = buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار.', 'image');
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ inline_data: { mime_type: match[1], data: match[2] } }, { text: prompt }] }],
+        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+      }),
+    });
