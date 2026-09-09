@@ -95,3 +95,116 @@ async function readDB() {
   if (!doc.nextOrderId) doc.nextOrderId = 1;
   return doc;
 }
+async function writeDB(data) {
+  if (!MONGODB_URI) { inMemoryFallback = data; return; }
+  const col = await getCollection();
+  const { _id, ...rest } = data;
+  await col.replaceOne({ _id: 'main' }, { _id: 'main', ...rest }, { upsert: true });
+}
+
+const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret';
+const ZARINPAL_MERCHANT_ID = process.env.ZARINPAL_MERCHANT_ID;
+const CALLBACK_URL = process.env.CALLBACK_URL || 'http://localhost:4000/payment/callback';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+function auth(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json({ error: 'ورود الزامی است' });
+  const token = header.replace('Bearer ', '');
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { res.status(401).json({ error: 'نشست نامعتبر است، دوباره وارد شوید' }); }
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.user || String(req.user.email || '').toLowerCase() !== ADMIN_EMAIL) {
+    return res.status(403).json({ error: 'اجازه دسترسی به این بخش را نداری' });
+  }
+  next();
+}
+
+function withDb(handler) {
+  return async (req, res) => {
+    try { await handler(req, res); }
+    catch (e) {
+      console.error('DB error:', e);
+      if (!res.headersSent) res.status(500).json({ error: 'مشکل اتصال به پایگاه‌داده — لطفًا چند لحظه بعد دوباره امتحان کن' });
+    }
+  };
+}
+
+function noCache(req, res, next) {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+  next();
+}
+
+app.post('/api/auth/register', withDb(async (req, res) => {
+  const { email, password, fullName } = req.body || {};
+  if (!email || !password || password.length < 6) return res.status(400).json({ error: 'ایمیل و رمز عبور (حداقل ۶ کاراکتر) الزامی است' });
+  const db = await readDB();
+  const exists = db.users.find((u) => u.email === email);
+  if (exists) return res.status(409).json({ error: 'این ایمیل قبلاً ثبت شده است' });
+  const hash = await bcrypt.hash(password, 10);
+  const user = { id: db.nextUserId++, email, password_hash: hash, full_name: fullName || '', created_at: new Date().toISOString() };
+  db.users.push(user);
+  await writeDB(db);
+  const token = jwt.sign({ id: user.id, email }, JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token, user: { id: user.id, email, fullName: user.full_name, createdAt: user.created_at } });
+}));
+
+app.post('/api/auth/login', withDb(async (req, res) => {
+  const { email, password } = req.body || {};
+  const db = await readDB();
+  const user = db.users.find((u) => u.email === email);
+  if (!user) return res.status(401).json({ error: 'ایمیل یا رمز عبور اشتباه است' });
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if (!ok) return res.status(401).json({ error: 'ایمیل یا رمز عبور اشتباه است' });
+  const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token, user: { id: user.id, email: user.email, fullName: user.full_name, createdAt: user.created_at || null } });
+}));
+
+app.get('/api/auth/me', auth, withDb(async (req, res) => {
+  const db = await readDB();
+  const user = db.users.find((u) => u.id === req.user.id);
+  if (!user) return res.status(404).json({ error: 'کاربر یافت نشد' });
+  res.json({ user: { id: user.id, email: user.email, fullName: user.full_name, createdAt: user.created_at || null } });
+}));
+
+async function removeBackgroundFromDataUri(dataUri) {
+  if (!REMOVEBG_API_KEY) return dataUri;
+  const match = dataUri.match(/^data:image\/(png|jpe?g|webp);base64,(.+)$/);
+  if (!match) return dataUri;
+  try {
+    const r = await fetch('https://api.remove.bg/v1.0/removebg', {
+      method: 'POST',
+      headers: { 'X-Api-Key': REMOVEBG_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_file_b64: match[2], size: 'auto', format: 'png', bg_color: 'white' }),
+    });
+    if (!r.ok) return dataUri;
+    const buffer = Buffer.from(await r.arrayBuffer());
+    return `data:image/png;base64,${buffer.toString('base64')}`;
+  } catch (e) { console.error('remove.bg request failed (non-fatal):', e.message); return dataUri; }
+}
+
+async function uploadDataUriToCloudinary(dataUri) {
+  if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) throw new Error('تنظیمات Cloudinary روی سرور کامل نشده است');
+  const imageMatch = dataUri.match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/);
+  const videoMatch = dataUri.match(/^data:video\/(mp4|webm|quicktime|ogg|mov);base64,(.+)$/);
+  if (!imageMatch && !videoMatch) throw new Error('فرمت فایل پشتیبانی نمی‌شود');
+  const isVideo = !!videoMatch;
+  const dataPart = isVideo ? videoMatch[2] : imageMatch[2];
+  const approxBytes = Math.ceil((dataPart.length * 3) / 4);
+  const maxBytes = isVideo ? 30 * 1024 * 1024 : 10 * 1024 * 1024;
+  if (approxBytes > maxBytes) throw new Error(isVideo ? 'حجم ویدیو بیش از حد مجاز است (حداکثر ۳۰ مگابایت)' : 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)');
+  const timestamp = Math.floor(Date.now() / 1000);
+  const folder = 'maison-store';
+  const signature = crypto.createHash('sha1').update(`folder=${folder}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`).digest('hex');
+  const body = new URLSearchParams({ file: dataUri, api_key: CLOUDINARY_API_KEY, timestamp: String(timestamp), folder, signature });
+  const resourceType = isVideo ? 'video' : 'image';
+  const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  const data = await cloudRes.json();
+  if (!cloudRes.ok || !data.secure_url) throw new Error((data && data.error && data.error.message) || 'آپلود Cloudinary ناموفق بود');
+  return { url: data.secure_url, type: isVideo ? 'video' : 'image' };
+}
