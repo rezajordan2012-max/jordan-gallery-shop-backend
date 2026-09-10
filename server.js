@@ -1,4 +1,4 @@
-require('dotenv').config();
+۰require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -61,6 +61,78 @@ const SEED_PRODUCTS = [
   { id: 'p6', name: 'اپیلاتور بی‌سیم', brand: 'ولوره', category: 'electronics', subcategory: 'body', price: 2100000, description: 'طراحی مینیمال، شارژ سریع و کاربرد ملایم روی پوست.', image: '' },
   { id: 'p11', name: 'دستگاه پاکسازی صورت', brand: 'ولوره', category: 'electronics', subcategory: 'face', price: 1650000, description: 'برس سونیک برای پاکسازی عمیق منافذ پوست صورت.', image: '' },
 ];
+  }
+  const client = await mongoClientPromise;
+  return client.db('jordan_gallery').collection('store_state');
+}
+
+async function readDB() {
+  if (!MONGODB_URI) {
+    if (!inMemoryFallback) inMemoryFallback = defaultState();
+    return inMemoryFallback;
+  }
+  const col = await getCollection();
+  let doc = await col.findOne({ _id: 'main' });
+  if (!doc) {
+    doc = { _id: 'main', ...defaultState() };
+    await col.insertOne(doc);
+  }
+  if (!Array.isArray(doc.products) || doc.products.length === 0) doc.products = SEED_PRODUCTS;
+  if (!doc.nextProductId) doc.nextProductId = 8;
+  if (!doc.settings || typeof doc.settings !== 'object') doc.settings = {};
+  if (!Array.isArray(doc.users)) doc.users = [];
+  if (!Array.isArray(doc.orders)) doc.orders = [];
+  if (!doc.nextUserId) doc.nextUserId = 1;
+  if (!doc.nextOrderId) doc.nextOrderId = 1;
+  return doc;
+}
+
+async function writeDB(data) {
+  if (!MONGODB_URI) { inMemoryFallback = data; return; }
+  const col = await getCollection();
+  const { _id, ...rest } = data;
+  await col.replaceOne({ _id: 'main' }, { _id: 'main', ...rest }, { upsert: true });
+}
+
+const JWT_SECRET = process.env.JWT_SECRET || 'change-this-secret';
+const ZARINPAL_MERCHANT_ID = process.env.ZARINPAL_MERCHANT_ID;
+const CALLBACK_URL = process.env.CALLBACK_URL || 'http://localhost:4000/payment/callback';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
+
+function auth(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header) return res.status(401).json({ error: 'ورود الزامی است' });
+  const token = header.replace('Bearer ', '');
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { res.status(401).json({ error: 'نشست نامعتبر است، دوباره وارد شوید' }); }
+}
+
+function requireAdmin(req, res, next) {
+  if (!req.user || String(req.user.email || '').toLowerCase() !== ADMIN_EMAIL) {
+    return res.status(403).json({ error: 'اجازه دسترسی به این بخش را نداری' });
+  }
+  next();
+}
+
+function withDb(handler) {
+  return async (req, res) => {
+    try { await handler(req, res); }
+    catch (e) {
+      console.error('DB error:', e);
+      if (!res.headersSent) res.status(500).json({ error: 'مشکل اتصال به پایگاه‌داده — لطفًا چند لحظه بعد دوباره امتحان کن' });
+    }
+  };
+}
+
+function noCache(req, res, next) {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+  next();
+}
+
+app.post('/api/auth/register', withDb(async (req, res) => {
 
 function defaultState() {
   return { users: [], orders: [], products: SEED_PRODUCTS, settings: {}, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
