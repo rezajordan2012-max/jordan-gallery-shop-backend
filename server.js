@@ -721,3 +721,74 @@ app.post('/api/ai/import-product-url', auth, requireAdmin, async (req, res) => {
     const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
     const mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
     res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
+  } catch (e) {
+    console.error('Gemini URL extraction error:', e);
+    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
+  }
+});
+
+app.post('/api/ai/analyze-perfume-image', auth, requireAdmin, async (req, res) => {
+  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
+  const imageBase64 = req.body && req.body.imageBase64;
+  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
+  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
+  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، jpeg، webp)' });
+  if (Math.ceil((match[2].length * 3) / 4) > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  try {
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [
+          { inline_data: { mime_type: match[1], data: match[2] } },
+          { text: buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار و هرگز حدس نزن.', 'image') },
+        ] }],
+        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || `خطا در ارتباط با Gemini (${r.status})` });
+    const resultText = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
+    if (!resultText) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    res.json(parseJsonObject(resultText));
+  } catch (e) {
+    console.error('Gemini perfume image error:', e);
+    res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
+  }
+});
+
+app.get('/api/settings', noCache, withDb(async (req, res) => { const db = await readDB(); res.json(db.settings || {}); }));
+app.put('/api/settings', auth, requireAdmin, withDb(async (req, res) => { const db = await readDB(); db.settings = { ...db.settings, ...(req.body || {}) }; await writeDB(db); res.json(db.settings); }));
+
+function computeSalesCounts(orders) {
+  const counts = {};
+  (orders || []).forEach((order) => {
+    if (order.status !== 'paid') return;
+    (order.items || []).forEach((item) => { if (!item || !item.id) return; counts[item.id] = (counts[item.id] || 0) + (Number(item.qty) || 0); });
+  });
+  return counts;
+}
+
+app.get('/api/products', noCache, withDb(async (req, res) => {
+  const db = await readDB();
+  const salesCounts = computeSalesCounts(db.orders);
+  res.json((db.products || []).map((p) => ({ ...p, salesCount: salesCounts[p.id] || 0 })));
+}));
+
+app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
+  const p = req.body || {};
+  if (!p.name || !p.price) return res.status(400).json({ error: 'قیمت و نام محصول الزامی است' });
+  const db = await readDB();
+  const id = 'p' + db.nextProductId++;
+  const product = {
+    id, name: p.name, nameEn: p.nameEn || '', brand: p.brand || '', category: p.category || 'perfume', subcategory: p.subcategory || '', type: p.type || '',
+    facets: (p.facets && typeof p.facets === 'object') ? p.facets : {}, price: Number(p.price), description: p.description || '', properties: p.properties || '', ingredients: p.ingredients || '',
+    topNotes: p.topNotes || '', middleNotes: p.middleNotes || '', baseNotes: p.baseNotes || '', mainAccords: p.mainAccords || '',
+    scentScore: Number.isFinite(Number(p.scentScore)) ? Number(p.scentScore) : 0, scentRatings: Number.isFinite(Number(p.scentRatings)) ? Number(p.scentRatings) : 0,
+    longevityScore: Number.isFinite(Number(p.longevityScore)) ? Number(p.longevityScore) : 0, longevityRatings: Number.isFinite(Number(p.longevityRatings)) ? Number(p.longevityRatings) : 0,
+    sillageScore: Number.isFinite(Number(p.sillageScore)) ? Number(p.sillageScore) : 0, sillageRatings: Number.isFinite(Number(p.sillageRatings)) ? Number(p.sillageRatings) : 0,
+    perfumer: p.perfumer || '', countryOfOrigin: p.countryOfOrigin || '', yearMade: p.yearMade || '', fragranticaRating: p.fragranticaRating || '', volume: p.volume || '', barcode: p.barcode || '', discountPercent: Number(p.discountPercent) || 0,
+    image: p.image || '', imageFit: p.imageFit === 'cover' ? 'cover' : 'contain', imagePosX: Number.isFinite(Number(p.imagePosX)) ? Number(p.imagePosX) : 50, imagePosY: Number.isFinite(Number(p.imagePosY)) ? Number(p.imagePosY) : 50,
+    imageZoom: Number.isFinite(Number(p.imageZoom)) && Number(p.imageZoom) > 0 ? Number(p.imageZoom) : 1,
+    ...(Array.isArray(p.variants) && p.variants.length > 0 ? { variants: p.variants } : {}),
