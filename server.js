@@ -636,6 +636,7 @@ JSON دقیقاً با این ساختار برگردان:
 variants آرایه‌ای از {"label":"","hex":"","imageUrl":""} باشد.
 
 متن صفحه:
+
 ${sourceText}`;
 }
 
@@ -648,3 +649,75 @@ app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res
     if (!text) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
     const product = await callGeminiText(buildGeminiProductPrompt(text, page.finalUrl));
     // نمودارِ Ratings (رایحه/ماندگاری/پخش بو) و بخشِ «Main accords» را — اگر همان صفحه یا یکی از
+    // iframeهایش (مثلاً ویجتِ Smell & Feel) داشته باشد — مستقیماً و دقیق از خودِ متن استخراج
+    // می‌کنیم؛ این مقادیر جایگزینِ حدسِ Gemini می‌شوند.
+    const widgetText = await findFragranceWidgetText(page.html, text, page.finalUrl);
+    applyRatingBarsToProduct(product, widgetText ? extractPerfumeRatingBars(widgetText) : null);
+    const mainAccordsFound = widgetText ? extractMainAccordsFromText(widgetText) : null;
+    if (mainAccordsFound) product.mainAccords = mainAccordsFound;
+    // اگر صفحه‌ی محصول یک عکسِ اصلی (og:image/twitter:image) داشته باشد، همان عکس را دانلود و
+    // مستقیماً روی Cloudinary خودمان آپلود می‌کنیم (نه یک لینکِ خارجیِ خام) تا در «تصویر واقعی
+    // محصول» فرم مدیریت جایگزین شود؛ اگر مرورش با شکست مواجه شد (non-fatal)، بدون عکس ادامه می‌دهیم.
+    const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
+    const mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
+    res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
+  } catch (e) {
+    console.error('Gemini URL extraction error:', e);
+    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
+  }
+});
+
+// ============================================================
+// NEW CAPABILITY #2: Product image -> Gemini Vision
+// ============================================================
+app.post('/api/ai/extract-product-from-image', auth, requireAdmin, async (req, res) => {
+  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
+  const imageBase64 = req.body && req.body.imageBase64;
+  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
+  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
+  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، jpeg، webp)' });
+  const approxBytes = Math.ceil((match[2].length * 3) / 4);
+  if (approxBytes > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  try {
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+    const prompt = buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار.', 'image');
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ inline_data: { mime_type: match[1], data: match[2] } }, { text: prompt }] }],
+        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+      }),
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini' });
+    const text = (data.candidates || []).flatMap((c) => c.content && c.content.parts || []).map((p) => p.text || '').join('').trim();
+    if (!text) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    res.json(parseJsonObject(text));
+  } catch (e) {
+    console.error('Gemini image extraction error:', e);
+    res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
+  }
+});
+
+// Current App endpoint aliases — no frontend change required.
+app.post('/api/ai/import-product-url', auth, requireAdmin, async (req, res) => {
+  const url = validateProductUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'لینک محصول معتبر نیست' });
+  try {
+    const page = await fetchProductPage(url);
+    const sourceText = stripHtmlForGemini(page.html);
+    if (!sourceText) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
+    const product = await callGeminiText(buildGeminiProductPrompt(sourceText, page.finalUrl));
+    // نمودارِ Ratings (رایحه/ماندگاری/پخش بو) و بخشِ «Main accords» را — اگر همان صفحه یا یکی از
+    // iframeهایش (مثلاً ویجتِ Smell & Feel) داشته باشد — مستقیماً و دقیق از خودِ متن استخراج
+    // می‌کنیم؛ این مقادیر جایگزینِ حدسِ Gemini می‌شوند.
+    const widgetText = await findFragranceWidgetText(page.html, sourceText, page.finalUrl);
+    applyRatingBarsToProduct(product, widgetText ? extractPerfumeRatingBars(widgetText) : null);
+    const mainAccordsFound = widgetText ? extractMainAccordsFromText(widgetText) : null;
+    if (mainAccordsFound) product.mainAccords = mainAccordsFound;
+    // همان منطقِ mirror کردنِ عکسِ اصلیِ صفحه (og:image/twitter:image) روی Cloudinary — این
+    // endpoint همان چیزی است که فرانت‌اند برای «ورود محصول با لینک» واقعاً صدا می‌زند.
+    const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
+    const mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
+    res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
