@@ -337,6 +337,78 @@ app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) 
     if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
     const parsed = parseJsonObject(textBlock.text);
     res.json({ description: parsed.description || '', properties: parsed.properties || '' });
+          if (!title) continue;
+      const brand = (p.brands || '').split(',')[0].trim();
+      const image = p.image_front_url || p.image_url || '';
+      const ingredients = (p.ingredients_text || p.ingredients_text_en || '').trim();
+      const volMatch = (p.quantity || p.product_quantity || '').toString().match(/([\d.,]+)\s*m?l\b/i);
+      const volume = volMatch ? volMatch[1].replace(',', '.') : '';
+      return { title, brand, image, ingredients, volume };
+    } catch (e) { console.error('Open Facts lookup failed:', base, e.message); }
+  }
+  return null;
+}
+
+async function identifyBarcodeWithAI(code) {
+  if (!ANTHROPIC_API_KEY) return null;
+  const instruction = `کد بارکد زیر متعلق به یک محصول است: ${code}
+با جستجوی وب، محصول واقعی متناظر را با اطمینان شناسایی کن. اگر مطمئن نیستی حدس نزن.
+فقط JSON معتبر: {"found":true,"isPerfume":false,"name":"","nameEn":"","brand":"","imageUrl":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":""}`;
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 2000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: instruction }] }) });
+  const aiData = await aiRes.json();
+  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
+  const textCombined = (aiData.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
+  if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
+  const parsed = parseJsonObject(textCombined);
+  if (!parsed || !parsed.found || !parsed.name) return null;
+  return parsed;
+}
+
+app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
+  const code = (req.query.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
+  const db = await readDB();
+  const ownMatch = db.products.find((p) => p.barcode && p.barcode === code);
+  if (ownMatch) return res.json({ foundInOwnDb: true, product: { id: ownMatch.id, name: ownMatch.name, category: ownMatch.category, subcategory: ownMatch.subcategory } });
+  let free = null;
+  try { free = await lookupOpenFacts(code); } catch (e) { console.error('lookupOpenFacts error:', e.message); }
+  let ai = null; let aiError = null;
+  if (ANTHROPIC_API_KEY) {
+    try { ai = await identifyBarcodeWithAI(code); if (!ai) aiError = 'محصول با جستجوی هوش مصنوعی هم شناسایی نشد'; }
+    catch (e) { aiError = e.message; console.error('identifyBarcodeWithAI failed (non-fatal):', aiError); }
+  }
+  let note = null;
+  if (!ai) note = !ANTHROPIC_API_KEY ? 'کلید هوش مصنوعی روی سرور تنظیم نشده — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی' : `غنی‌سازی با هوش مصنوعی ناموفق بود — ${aiError || ''}`;
+  if (!free && !ai) return res.json({ foundInOwnDb: false, external: null, note });
+  const rawImage = (ai && ai.imageUrl) || (free && free.image) || '';
+  const mirroredImage = rawImage ? await mirrorRemoteImageToCloudinary(rawImage) : null;
+  res.json({ foundInOwnDb: false, note, external: { found: true, source: ai ? (free ? 'ai+free' : 'ai') : 'free', isPerfume: ai ? !!ai.isPerfume : null, name: (ai && ai.name) || '', title: (ai && ai.nameEn) || (free && free.title) || '', brand: (ai && ai.brand) || (free && free.brand) || '', image: mirroredImage || rawImage || '', description: (ai && ai.description) || '', properties: (ai && ai.properties) || '', ingredients: (ai && ai.ingredients) || (free && free.ingredients) || '', volume: (ai && ai.volume) || (free && free.volume) || '', concentration: (ai && ai.concentration) || '', topNotes: (ai && ai.topNotes) || '', middleNotes: (ai && ai.middleNotes) || '', baseNotes: (ai && ai.baseNotes) || '', mainAccords: (ai && ai.mainAccords) || '', perfumer: (ai && ai.perfumer) || '', countryOfOrigin: (ai && ai.countryOfOrigin) || '', yearMade: ai && ai.yearMade ? String(ai.yearMade) : '' } });
+}));
+
+// ============================================================
+// NEW CAPABILITY #1: Product page URL -> Gemini
+// ============================================================
+function validateProductUrl(value) {
+  try {
+    const u = new URL(String(value));
+    if (!['http:', 'https:'].includes(u.protocol)) return null;
+    return u;
+  } catch { return null; }
+}
+
+function stripHtmlForGemini(html) {
+  let imgCount = 0;
+  return String(html || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
+    // پیش از حذفِ کلیِ تگ‌ها، تگ‌های <img> را به یک نشانه‌ی متنیِ فشرده تبدیل می‌کند که هم آدرسِ
+    // عکس (src) و هم متنِ جایگزینش (alt — معمولاً همان نامِ رنگ/طیف در صفحاتِ محصولاتِ آرایشی)
+    // را نگه می‌دارد؛ همین یعنی Gemini می‌تواند تشخیص دهد کدام عکس مالِ کدام طیفِ رنگ است. برای
+    // جلوگیری از حجیم شدنِ متن، فقط ۴۰ عکسِ اول نگه داشته می‌شود.
+    .replace(/<img[^>]*>/gi, (tag) => {
+      imgCount += 1;
   } catch (e) { console.error('AI translate-perfume-text error:', e); res.status(500).json({ error: 'خطای سرور هنگام ترجمه توضیحات' }); }
 });
 
