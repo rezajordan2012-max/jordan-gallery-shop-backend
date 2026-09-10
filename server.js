@@ -431,3 +431,75 @@ categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, elect
 "name":"","nameEn":"","brand":"","categoryGuess":"","subcategoryHint":"","priceToman":"","referencePriceNote":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":"","variants":[]
 }
 variants آرایه‌ای از {"label":"","hex":""} باشد.`;
+      if (imgCount > 40) return ' ';
+      const srcMatch = tag.match(/\s(?:src|data-src)=["']([^"']+)["']/i);
+      const altMatch = tag.match(/\salt=["']([^"']*)["']/i);
+      const src = srcMatch ? srcMatch[1] : '';
+      if (!src) return ' ';
+      const alt = altMatch ? altMatch[1].replace(/["\[\]]/g, '') : '';
+      return ` [IMG src="${src}" alt="${alt}"] `;
+    })
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120000);
+}
+
+// از روی HTML خام صفحه (پیش از حذف تگ‌ها)، محتمل‌ترین عکسِ اصلیِ محصول را با گشتن در متاتگ‌های
+// استاندارد og:image / twitter:image پیدا می‌کند — همان تگ‌هایی که تقریباً همه‌ی فروشگاه‌های
+// آنلاین برای پیش‌نمایشِ لینک (مثلاً هنگام اشتراک‌گذاری در تلگرام/واتساپ) پر می‌کنند، پس معمولاً
+// دقیق‌ترین و باکیفیت‌ترین عکسِ محصول همین است. آدرسِ نسبی را هم نسبت به baseUrl کامل می‌کند.
+function extractPrimaryImageFromHtml(html, baseUrl) {
+  if (!html) return null;
+  const patterns = [
+    /<meta[^>]+property=["']og:image:secure_url["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (m && m[1]) {
+      try { return new URL(m[1], baseUrl).toString(); } catch { /* skip invalid */ }
+    }
+  }
+  return null;
+}
+
+// نمودارهای «Ratings» (Scent/Longevity/Sillage) که در بسیاری از سایت‌های عطر (یا ویجت‌های شخص
+// ثالثِ تعبیه‌شده مثل «Smell & Feel») نمایش داده می‌شوند، معمولاً به‌صورت متنِ ساده‌ی «SCENT 7.9
+// 4608 RATINGS» کنار هم قرار دارند. چون خواندنِ این اعداد توسط مدلِ زبانی گاهی دقیق نیست (ممکن
+// است رند یا اشتباه کپی شود)، این‌جا مستقیماً با یک الگوی متنی، عددِ امتیاز (۰ تا ۱۰) و تعدادِ
+// رأی‌های هرکدام را از خودِ متن استخراج می‌کنیم — نتیجه‌اش همیشه دقیقاً همان عددی است که روی
+// سایتِ مبدأ نوشته شده، نه یک برآوردِ هوش مصنوعی.
+function extractPerfumeRatingBars(text) {
+  function grab(label) {
+    const re = new RegExp(label + "[^0-9]{0,60}(\\d{1,2}(?:\\.\\d)?)[^0-9]{0,60}([\\d,]{1,7})\\s*RATING", "i");
+    const m = String(text || "").match(re);
+    if (!m) return null;
+    const score = parseFloat(m[1]);
+    const ratings = parseInt(m[2].replace(/,/g, ""), 10);
+    if (!Number.isFinite(score) || score < 0 || score > 10) return null;
+    return { score, ratings: Number.isFinite(ratings) ? ratings : 0 };
+  }
+  const scent = grab("SCENT");
+  const longevity = grab("LONGEVITY");
+  const sillage = grab("SILLAGE");
+  if (!scent && !longevity && !sillage) return null;
+  return { scent, longevity, sillage };
+}
+
+// آدرس‌های همه‌ی iframeهای داخلِ یک صفحه را (نسبت به baseUrl کامل‌شده) برمی‌گرداند — برای وقتی که
+// نمودارِ Ratings یا بخشِ «Main accords» نه در خودِ HTML صفحه، بلکه داخلِ یک ویجتِ شخص‌ثالثِ
+// تعبیه‌شده (iframe، مثلاً ویجتِ «Smell & Feel») بارگذاری می‌شود و باید جداگانه واکشی شود.
+function extractIframeSrcs(html, baseUrl) {
+  const out = [];
+  const re = /<iframe[^>]+src=["']([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(String(html || ""))) && out.length < 5) {
+    try { out.push(new URL(m[1], baseUrl).toString()); } catch { /* skip invalid */ }
