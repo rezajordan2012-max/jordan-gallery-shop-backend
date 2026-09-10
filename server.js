@@ -1,4 +1,4 @@
-۰require('dotenv').config();
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -61,6 +61,15 @@ const SEED_PRODUCTS = [
   { id: 'p6', name: 'اپیلاتور بی‌سیم', brand: 'ولوره', category: 'electronics', subcategory: 'body', price: 2100000, description: 'طراحی مینیمال، شارژ سریع و کاربرد ملایم روی پوست.', image: '' },
   { id: 'p11', name: 'دستگاه پاکسازی صورت', brand: 'ولوره', category: 'electronics', subcategory: 'face', price: 1650000, description: 'برس سونیک برای پاکسازی عمیق منافذ پوست صورت.', image: '' },
 ];
+
+function defaultState() {
+  return { users: [], orders: [], products: SEED_PRODUCTS, settings: {}, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
+}
+
+async function getCollection() {
+  if (!mongoClientPromise) {
+    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
+    mongoClientPromise = client.connect().then(() => client);
   }
   const client = await mongoClientPromise;
   return client.db('jordan_gallery').collection('store_state');
@@ -133,17 +142,7 @@ function noCache(req, res, next) {
 }
 
 app.post('/api/auth/register', withDb(async (req, res) => {
-
-function defaultState() {
-  return { users: [], orders: [], products: SEED_PRODUCTS, settings: {}, nextUserId: 1, nextOrderId: 1, nextProductId: 8 };
-}
-
-async function getCollection() {
-  if (!mongoClientPromise) {
-    const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
-    mongoClientPromise = client.connect().then(() => client);
-
-    const { email, password, fullName } = req.body || {};
+  const { email, password, fullName } = req.body || {};
   if (!email || !password || password.length < 6) return res.status(400).json({ error: 'ایمیل و رمز عبور (حداقل ۶ کاراکتر) الزامی است' });
   const db = await readDB();
   const exists = db.users.find((u) => u.email === email);
@@ -278,7 +277,16 @@ app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
 
 function buildProductExtractionPrompt() {
   return `عکسی از محصول/جعبه/برچسب/صفحه مرجع محصول دریافت کرده‌ای. هدف: پر کردن فیلدهای فرم محصول در پنل مدیریت.
-  }
+اگر چیزی مطمئن نیستی یا در تصویر دیده نمی‌شود، همان فیلد را خالی یا آرایه خالی بگذار؛ هرگز حدس نزن.
+تمام فیلدهای متنی فارسی باشند، به‌جز nameEn که دقیقاً به زبان اصلی بماند، concentration که یکی از مقادیر استاندارد انگلیسی باشد، و mainAccords که همان کلماتِ انگلیسیِ اصلیِ «Main accords» (در صورت وجود روی تصویر) با ویرگول جدا از هم باشد.
+priceToman فقط وقتی عدد خام قیمت تومان/ریال روی تصویر واضح است. ارز خارجی را تبدیل نکن و در referencePriceNote نگه دار.
+categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, electronics یا خالی.
+فقط JSON معتبر و بدون Markdown برگردان:
+{
+"name":"","nameEn":"","brand":"","categoryGuess":"","subcategoryHint":"","priceToman":"","referencePriceNote":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":"","variants":[]
+}
+variants آرایه‌ای از {"label":"","hex":""} باشد.`;
+}
 
 function parseJsonObject(text) {
   const cleaned = String(text || '').replace(/```json/gi, '').replace(/```/g, '').trim();
@@ -337,7 +345,20 @@ app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) 
     if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
     const parsed = parseJsonObject(textBlock.text);
     res.json({ description: parsed.description || '', properties: parsed.properties || '' });
-          if (!title) continue;
+  } catch (e) { console.error('AI translate-perfume-text error:', e); res.status(500).json({ error: 'خطای سرور هنگام ترجمه توضیحات' }); }
+});
+
+async function lookupOpenFacts(code) {
+  const bases = ['https://world.openbeautyfacts.org/api/v2/product', 'https://world.openfoodfacts.org/api/v2/product'];
+  for (const base of bases) {
+    try {
+      const r = await fetch(`${base}/${encodeURIComponent(code)}.json`);
+      if (!r.ok) continue;
+      const data = await r.json();
+      if (!data || data.status !== 1 || !data.product) continue;
+      const p = data.product;
+      const title = (p.product_name || p.product_name_en || p.generic_name || '').trim();
+      if (!title) continue;
       const brand = (p.brands || '').split(',')[0].trim();
       const image = p.image_front_url || p.image_url || '';
       const ingredients = (p.ingredients_text || p.ingredients_text_en || '').trim();
@@ -409,28 +430,6 @@ function stripHtmlForGemini(html) {
     // جلوگیری از حجیم شدنِ متن، فقط ۴۰ عکسِ اول نگه داشته می‌شود.
     .replace(/<img[^>]*>/gi, (tag) => {
       imgCount += 1;
-  } catch (e) { console.error('AI translate-perfume-text error:', e); res.status(500).json({ error: 'خطای سرور هنگام ترجمه توضیحات' }); }
-});
-
-async function lookupOpenFacts(code) {
-  const bases = ['https://world.openbeautyfacts.org/api/v2/product', 'https://world.openfoodfacts.org/api/v2/product'];
-  for (const base of bases) {
-    try {
-      const r = await fetch(`${base}/${encodeURIComponent(code)}.json`);
-      if (!r.ok) continue;
-      const data = await r.json();
-      if (!data || data.status !== 1 || !data.product) continue;
-      const p = data.product;
-      const title = (p.product_name || p.product_name_en || p.generic_name || '').trim();
-اگر چیزی مطمئن نیستی یا در تصویر دیده نمی‌شود، همان فیلد را خالی یا آرایه خالی بگذار؛ هرگز حدس نزن.
-تمام فیلدهای متنی فارسی باشند، به‌جز nameEn که دقیقاً به زبان اصلی بماند، concentration که یکی از مقادیر استاندارد انگلیسی باشد، و mainAccords که همان کلماتِ انگلیسیِ اصلیِ «Main accords» (در صورت وجود روی تصویر) با ویرگول جدا از هم باشد.
-priceToman فقط وقتی عدد خام قیمت تومان/ریال روی تصویر واضح است. ارز خارجی را تبدیل نکن و در referencePriceNote نگه دار.
-categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, electronics یا خالی.
-فقط JSON معتبر و بدون Markdown برگردان:
-{
-"name":"","nameEn":"","brand":"","categoryGuess":"","subcategoryHint":"","priceToman":"","referencePriceNote":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":"","variants":[]
-}
-variants آرایه‌ای از {"label":"","hex":""} باشد.`;
       if (imgCount > 40) return ' ';
       const srcMatch = tag.match(/\s(?:src|data-src)=["']([^"']+)["']/i);
       const altMatch = tag.match(/\salt=["']([^"']*)["']/i);
@@ -491,7 +490,6 @@ function extractPerfumeRatingBars(text) {
   const longevity = grab("LONGEVITY");
   const sillage = grab("SILLAGE");
   if (!scent && !longevity && !sillage) return null;
-  
   return { scent, longevity, sillage };
 }
 
@@ -525,24 +523,129 @@ function extractMainAccordsFromText(text) {
   return cleaned.length ? cleaned.join(", ") : null;
 }
 
-// اول متنِ خودِ صفحه را برای نمودارِ Ratings یا بخشِ Main accords می‌گردد؛ اگر هیچ‌کدام پیدا
-// نشد (چون داخل یک iframe جداگانه — مثل ویجتِ Smell & Feel — بارگذاری شده)، به‌ترتیب سراغ
-// iframeهای همان صفحه می‌رود و متنِ هرکدام را جداگانه واکشی می‌کند؛ اولین متنی که یکی از این دو
-// نشانه را داشته باشد برگردانده می‌شود — از همان یک متن، هم امتیازها و هم آکوردهای اصلی استخراج
-// می‌شوند، پس نیازی به واکشیِ دوباره‌ی iframe نیست.
-async function findFragranceWidgetText(mainHtml, mainText, baseUrl) {
-  if (/main accords/i.test(mainText) || /\bRATING/i.test(mainText)) return mainText;
+// خیلی از این ویجت‌های شخص‌ثالث (مثل Smell & Feel) داده‌شان را با جاوااسکریپت رندر می‌کنند، اما
+// معمولاً همان داده‌ی خام (JSON) از قبل، داخل یک تگِ <script> در همان HTML اولیه هم قرار دارد —
+// این تابع تمام بلوک‌های <script>ی که کلمه‌ی scent/longevity/sillage/accord در آن‌ها هست را
+// برمی‌گرداند تا جدا از متنِ قابل‌مشاهده، همان‌جا هم دنبالِ اعداد/آکوردها بگردیم.
+function extractScriptBlobs(html) {
+  const out = [];
+  const re = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(String(html || "")))) {
+    const body = m[1];
+    if (body && body.trim().length > 10 && /scent|longevity|sillage|accord/i.test(body)) {
+      out.push(body.length > 300000 ? body.slice(0, 300000) : body);
+    }
+  }
+  return out;
+}
+
+function grabScoreNear(text, keys) {
+  for (const key of keys) {
+    const re = new RegExp("[\"']?" + key + "[\"']?\\s*[:=]\\s*\\{?\\s*[\"']?(?:value[\"']?\\s*[:=]\\s*)?[\"']?(\\d{1,2}(?:\\.\\d)?)", "i");
+    const m = String(text || "").match(re);
+    if (m) {
+      const score = parseFloat(m[1]);
+      if (Number.isFinite(score) && score >= 0 && score <= 10) return score;
+    }
+  }
+  return null;
+}
+
+function grabCountNear(text, keys) {
+  for (const key of keys) {
+    const re = new RegExp("[\"']?" + key + "[\"']?\\s*[:=]\\s*[\"']?(\\d{2,7})", "i");
+    const m = String(text || "").match(re);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
+// همان سه امتیازِ Scent/Longevity/Sillage را این‌بار از داخلِ بلوک‌های JSON/جاوااسکریپتِ تعبیه‌شده
+// (نه متنِ قابل‌مشاهده) پیدا می‌کند — برای سایت‌هایی که این عدد‌ها را با جاوااسکریپت رسم می‌کنند
+// ولی خودِ داده‌ی خام در HTML اولیه هم هست.
+function extractRatingsFromScripts(scripts) {
+  for (const s of scripts) {
+    const scentScore = grabScoreNear(s, ["scentScore", "scent_score", "scent"]);
+    const longevityScore = grabScoreNear(s, ["longevityScore", "longevity_score", "longevity"]);
+    const sillageScore = grabScoreNear(s, ["sillageScore", "sillage_score", "sillage"]);
+    if (scentScore == null && longevityScore == null && sillageScore == null) continue;
+    const scentRatings = grabCountNear(s, ["scentRatings", "scentCount", "scent_count", "scentVotes"]);
+    const longevityRatings = grabCountNear(s, ["longevityRatings", "longevityCount", "longevity_count", "longevityVotes"]);
+    const sillageRatings = grabCountNear(s, ["sillageRatings", "sillageCount", "sillage_count", "sillageVotes"]);
+    return {
+      scent: scentScore != null ? { score: scentScore, ratings: scentRatings || 0 } : null,
+      longevity: longevityScore != null ? { score: longevityScore, ratings: longevityRatings || 0 } : null,
+      sillage: sillageScore != null ? { score: sillageScore, ratings: sillageRatings || 0 } : null,
+    };
+  }
+  return null;
+}
+
+// همان «Main accords» را این‌بار از یک آرایه‌ی JSON تعبیه‌شده (مثل "accords":["Sweet","Gourmand",...])
+// پیدا می‌کند — چه رشته‌های ساده باشند، چه اشیائی با یک فیلدِ name/label/title.
+function extractAccordsFromScripts(scripts) {
+  for (const s of scripts) {
+    if (!/accord/i.test(s)) continue;
+    const m = s.match(/accords?["']?\s*[:=]\s*(\[[^\]]{0,600}\])/i);
+    if (!m) continue;
+    try {
+      const arr = JSON.parse(m[1].replace(/'/g, '"'));
+      const words = arr.map((item) => (typeof item === "string" ? item : item && (item.name || item.label || item.title))).filter(Boolean);
+      if (words.length) return words.slice(0, 10).join(", ");
+    } catch (e) {
+      const strs = m[1].match(/["']([A-Za-z][A-Za-z\s]{2,20})["']/g);
+      if (strs && strs.length) {
+        const words = strs.map((x) => x.replace(/["']/g, "").trim()).filter(Boolean);
+        if (words.length) return words.slice(0, 10).join(", ");
+      }
+    }
+  }
+  return null;
+}
+
+// موتورِ اصلیِ پیدا کردنِ نمودارِ Ratings و بخشِ Main accords — چهار لایه، از دقیق‌ترین به کلی‌ترین:
+// ۱) متنِ قابل‌مشاهده‌ی خودِ صفحه   ۲) بلوک‌های JSON تعبیه‌شده در خودِ صفحه
+// ۳) متنِ قابل‌مشاهده‌ی iframeهای صفحه (با هدرِ Referer درست، چون بعضی ویجت‌ها بدونش جواب نمی‌دهند)
+// ۴) بلوک‌های JSON تعبیه‌شده داخل همان iframeها
+// به‌محض این‌که هم امتیازها و هم آکوردها پیدا شوند، جست‌وجو متوقف می‌شود؛ در غیر این صورت تا آخرین
+// iframe ادامه می‌دهد و هرکدام را که پیدا کرد برمی‌گرداند (حتی اگر فقط یکی از دو مورد باشد).
+async function analyzeFragranceWidget(mainHtml, mainText, baseUrl) {
+  let bars = extractPerfumeRatingBars(mainText);
+  let accords = extractMainAccordsFromText(mainText);
+  if (bars && accords) return { bars, mainAccords: accords };
+
+  const mainScripts = extractScriptBlobs(mainHtml);
+  if (!bars) bars = extractRatingsFromScripts(mainScripts);
+  if (!accords) accords = extractAccordsFromScripts(mainScripts);
+  if (bars && accords) return { bars, mainAccords: accords };
+
   const iframeSrcs = extractIframeSrcs(mainHtml, baseUrl);
   for (const src of iframeSrcs) {
     try {
-      const r = await fetch(src, { headers: { "User-Agent": "Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)" } });
+      const r = await fetch(src, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)",
+          "Referer": baseUrl,
+          "Accept": "text/html,application/xhtml+xml",
+        },
+      });
       if (!r.ok) continue;
       const html = await r.text();
-      const text = stripHtmlForGemini(html);
-      if (/main accords/i.test(text) || /\bRATING/i.test(text)) return text;
+      if (!bars) bars = extractPerfumeRatingBars(stripHtmlForGemini(html));
+      if (!accords) accords = extractMainAccordsFromText(stripHtmlForGemini(html));
+      if (!bars || !accords) {
+        const scripts = extractScriptBlobs(html);
+        if (!bars) bars = extractRatingsFromScripts(scripts);
+        if (!accords) accords = extractAccordsFromScripts(scripts);
+      }
+      if (bars && accords) break;
     } catch (e) { /* این iframe جواب نداد — سراغ بعدی */ }
   }
-  return null;
+  return { bars, mainAccords: accords };
 }
 
 // نتیجه‌ی extractPerfumeRatingBars را (در صورت پیدا شدن هرکدام) روی شیء محصولِ برگشتی از Gemini
@@ -636,7 +739,6 @@ JSON دقیقاً با این ساختار برگردان:
 variants آرایه‌ای از {"label":"","hex":"","imageUrl":""} باشد.
 
 متن صفحه:
-
 ${sourceText}`;
 }
 
@@ -648,18 +750,29 @@ app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res
     const text = stripHtmlForGemini(page.html);
     if (!text) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
     const product = await callGeminiText(buildGeminiProductPrompt(text, page.finalUrl));
-    // نمودارِ Ratings (رایحه/ماندگاری/پخش بو) و بخشِ «Main accords» را — اگر همان صفحه یا یکی از
-    // iframeهایش (مثلاً ویجتِ Smell & Feel) داشته باشد — مستقیماً و دقیق از خودِ متن استخراج
-    // می‌کنیم؛ این مقادیر جایگزینِ حدسِ Gemini می‌شوند.
-    const widgetText = await findFragranceWidgetText(page.html, text, page.finalUrl);
-    applyRatingBarsToProduct(product, widgetText ? extractPerfumeRatingBars(widgetText) : null);
-    const mainAccordsFound = widgetText ? extractMainAccordsFromText(widgetText) : null;
+    // نمودارِ Ratings (رایحه/ماندگاری/پخش بو) و بخشِ «Main accords» را با چهار لایه‌ی جست‌وجو
+    // (متنِ صفحه، JSONِ تعبیه‌شده در صفحه، متنِ iframeها، JSONِ تعبیه‌شده در iframeها) پیدا
+    // می‌کنیم؛ این مقادیر — چون مستقیماً از خودِ منبع خوانده شده‌اند — جایگزینِ حدسِ Gemini می‌شوند.
+    const { bars, mainAccords: mainAccordsFound } = await analyzeFragranceWidget(page.html, text, page.finalUrl);
+    applyRatingBarsToProduct(product, bars);
     if (mainAccordsFound) product.mainAccords = mainAccordsFound;
+    // طیف‌های رنگ (variants) که Gemini از روی نشانه‌های [IMG] صفحه تشخیص داده را — اگر عکسِ
+    // مجزایی برایشان پیدا شده — دانلود و روی Cloudinary آپلود می‌کنیم.
+    product.variants = await mirrorVariantImages(product.variants, page.finalUrl);
     // اگر صفحه‌ی محصول یک عکسِ اصلی (og:image/twitter:image) داشته باشد، همان عکس را دانلود و
     // مستقیماً روی Cloudinary خودمان آپلود می‌کنیم (نه یک لینکِ خارجیِ خام) تا در «تصویر واقعی
     // محصول» فرم مدیریت جایگزین شود؛ اگر مرورش با شکست مواجه شد (non-fatal)، بدون عکس ادامه می‌دهیم.
     const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
-    const mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
+    let mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
+    // اگر og:image پیدا نشد یا آپلودش شکست خورد، به‌عنوانِ راهِ دوم سراغِ mainImageUrl‌ای که خودِ
+    // Gemini از روی نشانه‌های [IMG] متنِ صفحه پیشنهاد داده می‌رویم.
+    if (!mirroredImageUrl && product.mainImageUrl) {
+      try {
+        const resolved = new URL(product.mainImageUrl, page.finalUrl).toString();
+        mirroredImageUrl = await mirrorRemoteImageToCloudinary(resolved);
+      } catch (e) { /* لینکِ پیشنهادیِ Gemini معتبر نبود — بدون عکس ادامه می‌دهیم */ }
+    }
+    delete product.mainImageUrl;
     res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
   } catch (e) {
     console.error('Gemini URL extraction error:', e);
@@ -709,17 +822,26 @@ app.post('/api/ai/import-product-url', auth, requireAdmin, async (req, res) => {
     const sourceText = stripHtmlForGemini(page.html);
     if (!sourceText) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
     const product = await callGeminiText(buildGeminiProductPrompt(sourceText, page.finalUrl));
-    // نمودارِ Ratings (رایحه/ماندگاری/پخش بو) و بخشِ «Main accords» را — اگر همان صفحه یا یکی از
-    // iframeهایش (مثلاً ویجتِ Smell & Feel) داشته باشد — مستقیماً و دقیق از خودِ متن استخراج
-    // می‌کنیم؛ این مقادیر جایگزینِ حدسِ Gemini می‌شوند.
-    const widgetText = await findFragranceWidgetText(page.html, sourceText, page.finalUrl);
-    applyRatingBarsToProduct(product, widgetText ? extractPerfumeRatingBars(widgetText) : null);
-    const mainAccordsFound = widgetText ? extractMainAccordsFromText(widgetText) : null;
+    // نمودارِ Ratings (رایحه/ماندگاری/پخش بو) و بخشِ «Main accords» را با چهار لایه‌ی جست‌وجو
+    // (متنِ صفحه، JSONِ تعبیه‌شده در صفحه، متنِ iframeها، JSONِ تعبیه‌شده در iframeها) پیدا
+    // می‌کنیم؛ این مقادیر — چون مستقیماً از خودِ منبع خوانده شده‌اند — جایگزینِ حدسِ Gemini می‌شوند.
+    const { bars, mainAccords: mainAccordsFound } = await analyzeFragranceWidget(page.html, sourceText, page.finalUrl);
+    applyRatingBarsToProduct(product, bars);
     if (mainAccordsFound) product.mainAccords = mainAccordsFound;
+    // طیف‌های رنگ (variants) که Gemini از روی نشانه‌های [IMG] صفحه تشخیص داده را — اگر عکسِ
+    // مجزایی برایشان پیدا شده — دانلود و روی Cloudinary آپلود می‌کنیم.
+    product.variants = await mirrorVariantImages(product.variants, page.finalUrl);
     // همان منطقِ mirror کردنِ عکسِ اصلیِ صفحه (og:image/twitter:image) روی Cloudinary — این
     // endpoint همان چیزی است که فرانت‌اند برای «ورود محصول با لینک» واقعاً صدا می‌زند.
     const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
-    const mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
+    let mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
+    if (!mirroredImageUrl && product.mainImageUrl) {
+      try {
+        const resolved = new URL(product.mainImageUrl, page.finalUrl).toString();
+        mirroredImageUrl = await mirrorRemoteImageToCloudinary(resolved);
+      } catch (e) { /* لینکِ پیشنهادیِ Gemini معتبر نبود — بدون عکس ادامه می‌دهیم */ }
+    }
+    delete product.mainImageUrl;
     res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
   } catch (e) {
     console.error('Gemini URL extraction error:', e);
