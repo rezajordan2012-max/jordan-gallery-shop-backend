@@ -491,6 +491,7 @@ function extractPerfumeRatingBars(text) {
   const longevity = grab("LONGEVITY");
   const sillage = grab("SILLAGE");
   if (!scent && !longevity && !sillage) return null;
+  
   return { scent, longevity, sillage };
 }
 
@@ -503,3 +504,75 @@ function extractIframeSrcs(html, baseUrl) {
   let m;
   while ((m = re.exec(String(html || ""))) && out.length < 5) {
     try { out.push(new URL(m[1], baseUrl).toString()); } catch { /* skip invalid */ }
+  }
+  return out;
+}
+
+// بخشِ «Main accords» (که روی سایت‌هایی مثل Fragrantica یا ویجت‌های مشابه، زیرِ یک عنوانِ کوچک با
+// چند برچسبِ رنگی — مثل Sweet, Gourmand, Oriental, Spicy, Creamy — نشان داده می‌شود) را مستقیماً
+// از متنِ خام استخراج می‌کند: عنوانِ «main accords» را پیدا می‌کند و کلماتِ سرمشقی (Capitalized)
+// بعدش را — تا رسیدن به عنوانِ بعدی مثل «Fragrance Pyramid» یا «Top Notes» — به‌عنوانِ آکورد
+// جمع می‌کند. نتیجه یک رشته‌ی انگلیسیِ ویرگول‌جدا (دقیقاً فرمتی که فیلدِ mainAccords انتظار دارد) است.
+function extractMainAccordsFromText(text) {
+  const t = String(text || "");
+  const m = t.match(/main accords[:\s]*(.*?)(?:fragrance pyramid|top notes|search by accords|user ratings|when to wear|$)/i);
+  if (!m || !m[1]) return null;
+  const chunk = m[1].trim();
+  if (!chunk) return null;
+  const words = chunk.match(/[A-Z][a-zA-Z]*(?:\s[A-Z][a-zA-Z]*)?/g);
+  if (!words || words.length === 0) return null;
+  const cleaned = words.filter((w) => w.trim().length > 2).slice(0, 10);
+  return cleaned.length ? cleaned.join(", ") : null;
+}
+
+// اول متنِ خودِ صفحه را برای نمودارِ Ratings یا بخشِ Main accords می‌گردد؛ اگر هیچ‌کدام پیدا
+// نشد (چون داخل یک iframe جداگانه — مثل ویجتِ Smell & Feel — بارگذاری شده)، به‌ترتیب سراغ
+// iframeهای همان صفحه می‌رود و متنِ هرکدام را جداگانه واکشی می‌کند؛ اولین متنی که یکی از این دو
+// نشانه را داشته باشد برگردانده می‌شود — از همان یک متن، هم امتیازها و هم آکوردهای اصلی استخراج
+// می‌شوند، پس نیازی به واکشیِ دوباره‌ی iframe نیست.
+async function findFragranceWidgetText(mainHtml, mainText, baseUrl) {
+  if (/main accords/i.test(mainText) || /\bRATING/i.test(mainText)) return mainText;
+  const iframeSrcs = extractIframeSrcs(mainHtml, baseUrl);
+  for (const src of iframeSrcs) {
+    try {
+      const r = await fetch(src, { headers: { "User-Agent": "Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)" } });
+      if (!r.ok) continue;
+      const html = await r.text();
+      const text = stripHtmlForGemini(html);
+      if (/main accords/i.test(text) || /\bRATING/i.test(text)) return text;
+    } catch (e) { /* این iframe جواب نداد — سراغ بعدی */ }
+  }
+  return null;
+}
+
+// نتیجه‌ی extractPerfumeRatingBars را (در صورت پیدا شدن هرکدام) روی شیء محصولِ برگشتی از Gemini
+// می‌نشاند — این اعداد چون مستقیماً از خودِ متنِ سایتِ مبدأ خوانده شده‌اند، همیشه به عددهایی که
+// هوش مصنوعی احتمالاً حدس زده یا کمی نادرست کپی کرده، اولویت دارند (جایگزینشان می‌شوند).
+function applyRatingBarsToProduct(product, bars) {
+  if (!bars) return product;
+  if (bars.scent) { product.scentScore = String(bars.scent.score); product.scentRatings = String(bars.scent.ratings); }
+  if (bars.longevity) { product.longevityScore = String(bars.longevity.score); product.longevityRatings = String(bars.longevity.ratings); }
+  if (bars.sillage) { product.sillageScore = String(bars.sillage.score); product.sillageRatings = String(bars.sillage.ratings); }
+  return product;
+}
+
+// عکسِ هرکدام از طیف‌های رنگ (variants) را — اگر Gemini از روی نشانه‌های [IMG] صفحه، آدرسِ عکسِ
+// همان رنگ را تشخیص داده باشد — دانلود و مستقیماً روی Cloudinary خودمان آپلود می‌کند (نه یک
+// لینکِ خارجیِ خام)، دقیقاً همان اتفاقی که برای عکسِ اصلیِ محصول می‌افتد. حداکثر ۱۲ رنگِ اول
+// پردازش می‌شود (برای جلوگیری از کندیِ بیش از حد در صفحاتی با طیفِ خیلی زیاد).
+async function mirrorVariantImages(variants, baseUrl) {
+  if (!Array.isArray(variants) || variants.length === 0) return [];
+  const LIMIT = 12;
+  const toProcess = variants.slice(0, LIMIT);
+  const rest = variants.slice(LIMIT);
+  const mirrored = await Promise.all(
+    toProcess.map(async (v) => {
+      const label = (v && v.label) || '';
+      const hex = (v && v.hex) || '';
+      const rawUrl = v && v.imageUrl;
+      if (!rawUrl) return { label, hex, image: '' };
+      try {
+        const resolved = new URL(rawUrl, baseUrl).toString();
+        const uploadedUrl = await mirrorRemoteImageToCloudinary(resolved);
+        return { label, hex, image: uploadedUrl || '' };
+      } catch (e) {
