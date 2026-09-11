@@ -25,7 +25,12 @@ const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 // ============================================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// مدل اختصاصی جستجوی تصویری Gemini با Google Image Search grounding.
+// این مدل فقط برای پیدا کردن عکس‌های واقعی وب استفاده می‌شود؛ کارهای دیگر Gemini
+// همچنان با GEMINI_MODEL قبلی انجام می‌شوند.
+const GEMINI_IMAGE_SEARCH_MODEL = process.env.GEMINI_IMAGE_SEARCH_MODEL || 'gemini-3.1-flash-image';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+const GEMINI_IMAGE_SEARCH_BASE_URL = 'https://generativelanguage.googleapis.com/v1/models';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 let mongoClientPromise = null;
@@ -385,26 +390,69 @@ async function identifyBarcodeWithAI(code) {
   return parsed;
 }
 
-// جستجوی عکسِ محصول (یا یک رنگِ خاص از محصول) در اینترنت — از همان قابلیتِ web_search کلودی که
-// برای تشخیصِ بارکد استفاده می‌شود کمک می‌گیرد؛ به‌جای یک عکسِ تک، چند نامزدِ مختلف برمی‌گرداند
-// تا مدیر خودش بهترین را از بین‌شان انتخاب کند (نه این‌که خودِ سیستم یکی را به‌صورتِ کور انتخاب کند).
+// جستجوی عکسِ محصول (یا یک رنگِ خاص از محصول) در اینترنت — اکنون خودِ Gemini
+// با Google Image Search grounding جستجو می‌کند. این مسیر دیگر به Anthropic وابسته نیست.
+// Gemini هم نام محصول/رنگ را تحلیل می‌کند و هم نامزدهای تصویری واقعی وب را برمی‌گرداند.
+// برای هر عکس، علاوه بر imageUri، صفحه‌ی مبدأ (sourceUri) را هم نگه می‌داریم تا
+// انتساب منبع تصویر حفظ شود.
 async function searchProductImageCandidates(query) {
-  if (!ANTHROPIC_API_KEY) throw new Error('کلید ANTHROPIC_API_KEY روی سرور تنظیم نشده است');
-  const instruction = `با جستجوی وب، ۵ تا ۶ عکسِ باکیفیت و مرتبط برای این محصول پیدا کن: "${query}"
-هر آدرس باید مستقیماً به خودِ فایلِ تصویر (jpg/jpeg/png/webp) ختم شود، نه به یک صفحه‌ی HTML. فقط عکس‌هایی را انتخاب کن که به‌وضوح همین محصول (یا همین رنگِ مشخص‌شده، اگر در عبارتِ جستجو نامِ رنگ آمده) را نشان می‌دهند — نه محصولِ مشابه از برندِ دیگر، نه بنر یا لوگو. اگر برای بخشی از درخواست (مثلاً یک رنگِ خاص) عکسِ مطمئنی پیدا نکردی، آن را خالی بگذار و فقط عکس‌های مطمئن را برگردان.
-فقط JSON معتبر: {"results":[{"url":"","source":""}]}`;
-  const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+  if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
+
+  const endpoint = `${GEMINI_IMAGE_SEARCH_BASE_URL}/${encodeURIComponent(GEMINI_IMAGE_SEARCH_MODEL)}:generateContent`;
+  const instruction = `تو مسئول جستجوی واقعیِ عکس در اینترنت برای پنل مدیریت فروشگاه Jordan Gallery هستی.
+عبارت جستجو: "${query}"
+
+با Google Image Search دقیقاً همین محصول را پیدا کن. اگر در عبارت، نام/شماره/کد یک رنگ یا shade وجود دارد، همان رنگ دقیق را اولویت بده.
+- محصول مشابه از برند دیگر، لوگو، بنر، عکس تبلیغاتی نامرتبط یا تصویر عمومی را انتخاب نکن.
+- برای تصویر اصلی محصول، عکس واضح از خودِ محصول/بسته‌بندی را ترجیح بده.
+- برای طیف رنگ، عکس سوآچ یا تصویر همان رنگ/شماره را ترجیح بده.
+- نتیجه باید از منبع واقعی وب باشد؛ عکس تولید نکن و چیزی را حدس نزن.
+- چند نامزد مختلف و باکیفیت پیدا کن تا مدیر بتواند یکی را انتخاب کند.
+فقط از جستجوی تصویری Google برای پیدا کردن منابع استفاده کن؛ خروجی تصویری تولیدشده برای ما لازم نیست.`;
+
+  const aiRes = await fetch(endpoint, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 1500, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: instruction }] }),
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: instruction }] }],
+      tools: [{ google_search: { searchTypes: { webSearch: {}, imageSearch: {} } } }],
+      // طبق API فعلی، imageSearch در Gemini 3.1 Flash Image به‌عنوان grounding
+      // برای پاسخ تصویری فعال می‌شود. تصویر تولیدی را استفاده نمی‌کنیم و فقط groundingChunks را می‌خوانیم.
+      generationConfig: { responseModalities: ['IMAGE'] },
+    }),
   });
-  const aiData = await aiRes.json();
-  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
-  const textCombined = (aiData.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
-  if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
-  const parsed = parseJsonObject(textCombined);
-  const results = Array.isArray(parsed && parsed.results) ? parsed.results : [];
-  return results.filter((r) => r && typeof r.url === 'string' && /^https?:\/\//i.test(r.url)).slice(0, 6);
+
+  const aiData = await aiRes.json().catch(() => ({}));
+  if (!aiRes.ok) {
+    throw new Error((aiData && aiData.error && aiData.error.message) || `خطا در ارتباط با Gemini Image Search (${aiRes.status})`);
+  }
+
+  const candidates = Array.isArray(aiData.candidates) ? aiData.candidates : [];
+  const chunks = candidates.flatMap((candidate) => {
+    const metadata = candidate && candidate.groundingMetadata;
+    return metadata && Array.isArray(metadata.groundingChunks) ? metadata.groundingChunks : [];
+  });
+
+  const seen = new Set();
+  const results = [];
+  for (const chunk of chunks) {
+    const image = chunk && chunk.image ? chunk.image : null;
+    if (!image) continue;
+
+    // REST responses may expose camelCase or snake_case depending on API surface/version.
+    const imageUrl = image.imageUri || image.image_uri || image.uri || '';
+    const sourceUrl = image.sourceUri || image.source_uri || '';
+    const title = image.title || '';
+    const domain = image.domain || '';
+    if (!/^https?:\/\//i.test(imageUrl)) continue;
+    if (!/^https?:\/\//i.test(sourceUrl)) continue;
+    if (seen.has(imageUrl)) continue;
+    seen.add(imageUrl);
+    results.push({ url: imageUrl, source: sourceUrl, title, domain });
+    if (results.length >= 8) break;
+  }
+
+  return results.slice(0, 6);
 }
 
 app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
