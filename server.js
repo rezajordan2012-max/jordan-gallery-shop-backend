@@ -419,25 +419,47 @@ function validateProductUrl(value) {
 
 function stripHtmlForGemini(html) {
   let imgCount = 0;
-  return String(html || '')
+  const IMG_LIMIT = 60;
+  let text = String(html || '')
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
-    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ')
-    // پیش از حذفِ کلیِ تگ‌ها، تگ‌های <img> را به یک نشانه‌ی متنیِ فشرده تبدیل می‌کند که هم آدرسِ
-    // عکس (src) و هم متنِ جایگزینش (alt — معمولاً همان نامِ رنگ/طیف در صفحاتِ محصولاتِ آرایشی)
-    // را نگه می‌دارد؛ همین یعنی Gemini می‌تواند تشخیص دهد کدام عکس مالِ کدام طیفِ رنگ است. برای
-    // جلوگیری از حجیم شدنِ متن، فقط ۴۰ عکسِ اول نگه داشته می‌شود.
-    .replace(/<img[^>]*>/gi, (tag) => {
-      imgCount += 1;
-      if (imgCount > 40) return ' ';
-      const srcMatch = tag.match(/\s(?:src|data-src)=["']([^"']+)["']/i);
-      const altMatch = tag.match(/\salt=["']([^"']*)["']/i);
-      const src = srcMatch ? srcMatch[1] : '';
-      if (!src) return ' ';
-      const alt = altMatch ? altMatch[1].replace(/["\[\]]/g, '') : '';
-      return ` [IMG src="${src}" alt="${alt}"] `;
-    })
+    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ');
+
+  // پیش از حذفِ کلیِ تگ‌ها، تگ‌های <img> را به یک نشانه‌ی متنیِ فشرده تبدیل می‌کند که هم آدرسِ
+  // عکس (src — یا معادل‌های تنبل‌بارگذاری مثل data-src/data-original/srcset) و هم متنِ
+  // جایگزینش (alt — معمولاً همان نامِ رنگ/طیف در صفحاتِ محصولاتِ آرایشی) را نگه می‌دارد؛ همین
+  // یعنی Gemini می‌تواند تشخیص دهد کدام عکس مالِ کدام طیفِ رنگ است.
+  text = text.replace(/<img[^>]*>/gi, (tag) => {
+    imgCount += 1;
+    if (imgCount > IMG_LIMIT) return ' ';
+    const srcMatch =
+      tag.match(/\ssrc=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-src=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-original=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-lazy(?:-src)?=["']([^"']+)["']/i) ||
+      tag.match(/\ssrcset=["']([^"',\s]+)/i);
+    const altMatch = tag.match(/\salt=["']([^"']*)["']/i) || tag.match(/\stitle=["']([^"']*)["']/i);
+    const src = srcMatch ? srcMatch[1] : '';
+    if (!src) return ' ';
+    const alt = altMatch ? altMatch[1].replace(/["\[\]]/g, '') : '';
+    return ` [IMG src="${src}" alt="${alt}"] `;
+  });
+
+  // خیلی از سوآچ‌های رنگِ محصولاتِ آرایشی (رژلب، سایه، کرم‌پودر) به‌جای <img>، یک عنصرِ ساده
+  // (div/span/a) با پس‌زمینه‌ی CSS تنظیم‌شده (background-image:url(...)) هستند — این عنصرها را
+  // هم به همان قالبِ نشانه‌ی [IMG] تبدیل می‌کند تا Gemini همان‌ها را هم به‌عنوانِ عکسِ طیف رنگ ببیند.
+  text = text.replace(/<[a-z][a-z0-9]*\b[^>]*\sstyle=["'][^"']*background(?:-image)?\s*:\s*url\(\s*['"]?([^'")]+)['"]?\s*\)[^"']*["'][^>]*>/gi, (tag, rawUrl) => {
+    imgCount += 1;
+    if (imgCount > IMG_LIMIT) return ' ';
+    const src = String(rawUrl || '').trim();
+    if (!src) return ' ';
+    const labelMatch = tag.match(/\s(?:title|aria-label|data-label|data-name|data-color)=["']([^"']*)["']/i);
+    const alt = labelMatch ? labelMatch[1].replace(/["\[\]]/g, '') : '';
+    return ` [IMG src="${src}" alt="${alt}"] `;
+  });
+
+  return text
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
@@ -460,12 +482,36 @@ function extractPrimaryImageFromHtml(html, baseUrl) {
     /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
     /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
     /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
+    // پشتیبانِ سایت‌هایی که og:image درست تنظیم نکرده‌اند (خیلی رایج در فروشگاه‌های آرایشی
+    // کوچک‌تر) — این سه الگو، منابعِ استانداردِ دیگری هستند که همچنان معمولاً به عکسِ واقعیِ
+    // محصول اشاره می‌کنند، نه لوگوی سایت.
+    /<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i,
+    /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']image_src["']/i,
+    /<meta[^>]+itemprop=["']image["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+itemprop=["']image["']/i,
   ];
   for (const re of patterns) {
     const m = html.match(re);
     if (m && m[1]) {
       try { return new URL(m[1], baseUrl).toString(); } catch { /* skip invalid */ }
     }
+  }
+  // راهِ آخر: خیلی از فروشگاه‌ها اطلاعاتِ ساختاریافته‌ی schema.org (JSON-LD) را برای موتورهای
+  // جست‌وجو در صفحه می‌گذارند که معمولاً شاملِ فیلدِ "image" همان محصول است — حتی اگر og:image
+  // خالی یا اشتباه (مثلاً لوگوی سایت) تنظیم شده باشد، این مقدار معمولاً درست است.
+  const ldBlocks = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi) || [];
+  for (const block of ldBlocks) {
+    const inner = block.replace(/^<script[^>]*>/i, '').replace(/<\/script>\s*$/i, '');
+    try {
+      const parsed = JSON.parse(inner);
+      const candidates = Array.isArray(parsed) ? parsed : (Array.isArray(parsed['@graph']) ? parsed['@graph'] : [parsed]);
+      for (const item of candidates) {
+        const img = item && item.image;
+        if (!img) continue;
+        const url = Array.isArray(img) ? img[0] : (img && typeof img === 'object' ? img.url : img);
+        if (url) { try { return new URL(url, baseUrl).toString(); } catch { /* skip invalid */ } }
+      }
+    } catch (e) { /* JSON-LD نامعتبر بود — رد شو و سراغ بلوکِ بعدی برو */ }
   }
   return null;
 }
@@ -506,21 +552,74 @@ function extractIframeSrcs(html, baseUrl) {
   return out;
 }
 
-// بخشِ «Main accords» (که روی سایت‌هایی مثل Fragrantica یا ویجت‌های مشابه، زیرِ یک عنوانِ کوچک با
-// چند برچسبِ رنگی — مثل Sweet, Gourmand, Oriental, Spicy, Creamy — نشان داده می‌شود) را مستقیماً
-// از متنِ خام استخراج می‌کند: عنوانِ «main accords» را پیدا می‌کند و کلماتِ سرمشقی (Capitalized)
-// بعدش را — تا رسیدن به عنوانِ بعدی مثل «Fragrance Pyramid» یا «Top Notes» — به‌عنوانِ آکورد
-// جمع می‌کند. نتیجه یک رشته‌ی انگلیسیِ ویرگول‌جدا (دقیقاً فرمتی که فیلدِ mainAccords انتظار دارد) است.
+// واژه‌نامه‌ی شناخته‌شده‌ی آکوردهای رایج عطر (انگلیسی) — پایه‌ی تشخیصِ «کدام کلمه واقعاً یک
+// آکورد است» به‌جای حدسِ صرفِ «کلمه‌ی با حرفِ اول بزرگ». عبارت‌های دوکلمه‌ای (مثل white floral،
+// warm spicy) عمداً قبل از تک‌کلمه‌ای‌هایشان آمده‌اند تا در تطبیق، اول آن‌ها بررسی شوند و به‌اشتباه
+// به دو آکوردِ جدا شکسته نشوند؛ ولی کلماتی که کنارِ هم آمده‌اند بدون این‌که یک عبارتِ دوکلمه‌ایِ
+// شناخته‌شده باشند (مثل «Oriental Woody» که خودش در این لیست نیست)، هرکدام جدا شناسایی می‌شوند.
+const KNOWN_ACCORD_WORDS = [
+  "white floral", "yellow floral", "green floral", "fruity floral", "citrus floral",
+  "warm spicy", "fresh spicy", "oriental woody", "woody floral musk", "aromatic fougere",
+  "resinous", "smoky", "powdery", "woody", "citrus", "citrusy", "floral", "patchouli", "musky",
+  "musk", "sweet", "amber", "aromatic", "fruity", "green", "aquatic", "marine", "leathery",
+  "leather", "gourmand", "tobacco", "chypre", "fougere", "earthy", "vanilla", "oud", "balsamic",
+  "soapy", "mossy", "spicy", "oriental", "sour", "bitter", "fresh", "clean", "dry", "creamy",
+  "soft", "herbal", "rose", "iris", "almond", "coconut", "honey", "caramel", "coffee", "tea",
+  "anise", "licorice", "whiskey", "rum", "animalic", "metallic", "ozonic", "salty", "lactonic",
+  "yeasty", "tropical", "mineral", "camphor", "medicinal", "nutty", "rummy", "smoked",
+];
+
+// متنِ داده‌شده را برای وجودِ هرکدام از KNOWN_ACCORD_WORDS می‌گردد و آکوردهایی که واقعاً پیدا
+// شده‌اند را به‌ترتیبِ ظاهرشدن‌شان در متن برمی‌گرداند — عبارت‌های دوکلمه‌ای (مثل white floral)
+// اول بررسی می‌شوند تا از تداخل با تک‌کلمه‌ای‌هایشان (floral) جلوگیری شود؛ هر بازه‌ی متنی که یک‌بار
+// تطبیق پیدا کرد دوباره برای عبارتِ دیگری بررسی نمی‌شود، پس «Oriental» و «Woody»ی کنارِ هم هرگز
+// یک آکورد واحد نمی‌شوند مگر خودِ عبارتِ دوکلمه‌ایشان در فهرست باشد.
+function matchKnownAccordsInText(text) {
+  const t = " " + String(text || "").toLowerCase() + " ";
+  const sorted = [...KNOWN_ACCORD_WORDS].sort((a, b) => b.length - a.length);
+  const usedRanges = [];
+  const found = [];
+  for (const word of sorted) {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp("\\b" + escaped + "\\b", "gi");
+    let m;
+    while ((m = re.exec(t))) {
+      const start = m.index;
+      const end = start + m[0].length;
+      const overlaps = usedRanges.some(([s, e]) => start < e && end > s);
+      if (!overlaps) {
+        usedRanges.push([start, end]);
+        found.push({ start, label: word.replace(/\b\w/g, (c) => c.toUpperCase()) });
+      }
+    }
+  }
+  found.sort((a, b) => a.start - b.start);
+  const seen = new Set();
+  const ordered = [];
+  for (const f of found) {
+    const key = f.label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    ordered.push(f.label);
+  }
+  return ordered;
+}
+
+// بخشِ «Main accords» (که روی سایت‌هایی مثل Fragrantica/Parfumo یا ویجت‌های مشابه، زیرِ یک
+// عنوانِ کوچک با چند برچسبِ رنگی — مثل Oriental, Woody, Spicy, Sweet, Floral — نشان داده
+// می‌شود) را مستقیماً از متنِ خام استخراج می‌کند: عنوانِ «main accords» را پیدا می‌کند و در
+// متنِ بعدش (تا رسیدن به عنوانِ بعدی مثل «Fragrance Pyramid») فقط دنبالِ کلماتی می‌گردد که در
+// واژه‌نامه‌ی KNOWN_ACCORD_WORDS باشند — همین یعنی هرچیزِ نامرتبط (مثل برندینگِ ویجت‌های
+// شخص‌ثالث یا نشانه‌های داخلیِ خودمان) دیگر هرگز به‌اشتباه به‌عنوانِ آکورد ثبت نمی‌شود، و ترتیبِ
+// ظاهرشدن‌شان هم دقیقاً همان ترتیبِ شدت/اهمیتِ آکورد در صفحه‌ی مبدأ (از قوی‌تر به ضعیف‌تر) است.
 function extractMainAccordsFromText(text) {
   const t = String(text || "");
   const m = t.match(/main accords[:\s]*(.*?)(?:fragrance pyramid|top notes|search by accords|user ratings|when to wear|$)/i);
   if (!m || !m[1]) return null;
   const chunk = m[1].trim();
   if (!chunk) return null;
-  const words = chunk.match(/[A-Z][a-zA-Z]*(?:\s[A-Z][a-zA-Z]*)?/g);
-  if (!words || words.length === 0) return null;
-  const cleaned = words.filter((w) => w.trim().length > 2).slice(0, 10);
-  return cleaned.length ? cleaned.join(", ") : null;
+  const words = matchKnownAccordsInText(chunk).slice(0, 10);
+  return words.length ? words.join(", ") : null;
 }
 
 // خیلی از این ویجت‌های شخص‌ثالث (مثل Smell & Feel) داده‌شان را با جاوااسکریپت رندر می‌کنند، اما
@@ -586,23 +685,25 @@ function extractRatingsFromScripts(scripts) {
 }
 
 // همان «Main accords» را این‌بار از یک آرایه‌ی JSON تعبیه‌شده (مثل "accords":["Sweet","Gourmand",...])
-// پیدا می‌کند — چه رشته‌های ساده باشند، چه اشیائی با یک فیلدِ name/label/title.
+// پیدا می‌کند — چه رشته‌های ساده باشند، چه اشیائی با یک فیلدِ name/label/title. نتیجه هم از همان
+// واژه‌نامه‌ی KNOWN_ACCORD_WORDS عبور می‌کند تا اگر کلیدهای نامرتبطِ دیگری از همان JSON به‌اشتباه
+// گرفته شده باشند، حذف شوند و فقط آکوردهای واقعی باقی بمانند.
 function extractAccordsFromScripts(scripts) {
   for (const s of scripts) {
     if (!/accord/i.test(s)) continue;
     const m = s.match(/accords?["']?\s*[:=]\s*(\[[^\]]{0,600}\])/i);
     if (!m) continue;
+    let rawWords = [];
     try {
       const arr = JSON.parse(m[1].replace(/'/g, '"'));
-      const words = arr.map((item) => (typeof item === "string" ? item : item && (item.name || item.label || item.title))).filter(Boolean);
-      if (words.length) return words.slice(0, 10).join(", ");
+      rawWords = arr.map((item) => (typeof item === "string" ? item : item && (item.name || item.label || item.title))).filter(Boolean);
     } catch (e) {
       const strs = m[1].match(/["']([A-Za-z][A-Za-z\s]{2,20})["']/g);
-      if (strs && strs.length) {
-        const words = strs.map((x) => x.replace(/["']/g, "").trim()).filter(Boolean);
-        if (words.length) return words.slice(0, 10).join(", ");
-      }
+      rawWords = strs ? strs.map((x) => x.replace(/["']/g, "").trim()).filter(Boolean) : [];
     }
+    if (rawWords.length === 0) continue;
+    const filtered = matchKnownAccordsInText(rawWords.join(", ")).slice(0, 10);
+    if (filtered.length) return filtered.join(", ");
   }
   return null;
 }
@@ -725,12 +826,12 @@ function buildGeminiProductPrompt(sourceText, sourceUrl) {
 منبع: ${sourceUrl}
 متن صفحه محصول در ادامه آمده است. هرجا نشانه‌ی [IMG src="..." alt="..."] دیدی، یعنی در آن نقطه از صفحه یک عکس بوده — src آدرس عکس و alt توضیح/برچسبِ کنار آن عکس است (مثلاً اسمِ رنگ در صفحه‌ی محصولاتی مثل رژلب یا کرم‌پودر). از این نشانه‌ها برای تشخیص «کدام عکس مالِ کدام طیفِ رنگ است» و «کدام عکس، تصویرِ اصلیِ خودِ محصول است» استفاده کن.
 فقط اطلاعاتی را وارد کن که از منبع قابل تشخیص است؛ هرگز حدس نزن و اطلاعات جعلی نساز.
-تمام فیلدهای متنی فارسی روان باشند، به‌جز nameEn که باید نام دقیق اصلی محصول باشد، concentration که باید مقدار استاندارد انگلیسی باشد، و mainAccords که باید همان کلمات انگلیسیِ اصلیِ «Main accords» (مثل Resinous, Smoky, Spicy, Woody) با ویرگول جدا از هم باشد.
+تمام فیلدهای متنی فارسی روان باشند، به‌جز nameEn که باید نام دقیق اصلی محصول باشد، concentration که باید مقدار استاندارد انگلیسی باشد، و mainAccords که باید همان کلمات انگلیسیِ اصلیِ بخشِ «Main accords» باشد — هر آکورد را جدا و با ویرگول از بعدی جدا کن (مثلاً Oriental, Woody, Spicy — نه «Oriental Woody» به‌عنوانِ یک آیتم، مگر خودِ عبارت روی صفحه دقیقاً یک اصطلاحِ دوکلمه‌ای شناخته‌شده مثل «White Floral» یا «Warm Spicy» باشد). ترتیبِ آکوردها را دقیقاً همان ترتیبِ روی صفحه (از قوی‌ترین/بزرگ‌ترین به ضعیف‌ترین) نگه دار. نامِ برندینگِ ویجت‌های شخص‌ثالثِ نمایش‌دهنده‌ی این بخش (مثل «Smell»، «Feel»، «Smell & Feel») و نشانه‌های [IMG ...] هرگز آکورد نیستند — آن‌ها را در mainAccords نیاور.
 قیمت خارجی را به تومان تبدیل نکن. اگر قیمت صفحه تومان/ریال است، priceToman را فقط به رقم خام بده؛ در غیر این صورت خالی و مقدار و ارز اصلی را در referencePriceNote بیاور.
 categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, electronics یا خالی.
 برای عطر، نت‌ها، آکوردهای اصلی، عطار و غلظت را فقط در صورت وجود منبع بده.
 scentScore/longevityScore/sillageScore فقط اعداد بین ۰ تا ۱۰ هستند (مثلاً همان امتیازهای Scent/Longevity/Sillage در Fragrantica)؛ scentRatings/longevityRatings/sillageRatings تعداد رأی‌دهندگان همان امتیاز است. اگر هیچ‌کدام در منبع نبود، همه را خالی بگذار.
-mainImageUrl را فقط اگر یک [IMG] با src مشخص، به‌وضوح تصویرِ اصلیِ خودِ محصول (نه لوگو، نه بنر، نه آیکون) باشد پر کن؛ همان src را بدون تغییر بده.
+mainImageUrl را فقط اگر یک [IMG] با src مشخص، به‌وضوح تصویرِ اصلیِ خودِ محصول (نه لوگو، نه بنر، نه آیکون، و نه یک دایره‌ی کوچکِ سوآچِ رنگ) باشد پر کن؛ همان src را بدون تغییر بده. اگر صفحه چند [IMG] پشتِ‌سرهم و شبیه‌به‌هم دارد که هرکدام با نامِ یک رنگ/شماره در alt همراه است، اینها سوآچِ رنگ‌ها هستند نه تصویرِ اصلی — آن‌ها را فقط در variants بیاور، نه در mainImageUrl.
 اگر محصول طیفِ رنگ دارد (مثل رژلب، کرم‌پودر، سایه، لاک)، برای هر رنگ یک آیتم در variants بساز: label نامِ فارسیِ همان رنگ/شماره، hex کدِ رنگِ نزدیک (اگر مشخص نبود خالی)، و imageUrl همان src از نزدیک‌ترین [IMG] که alt یا متنِ اطرافش با نامِ همان رنگ می‌خواند — اگر برای یک رنگ عکسِ مجزا پیدا نشد، imageUrl را خالی بگذار (هرگز عکسِ یک رنگِ دیگر را به‌اشتباه نسبت نده).
 JSON دقیقاً با این ساختار برگردان:
 {
