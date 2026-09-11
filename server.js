@@ -385,6 +385,52 @@ async function identifyBarcodeWithAI(code) {
   return parsed;
 }
 
+// جستجوی عکسِ محصول (یا یک رنگِ خاص از محصول) در اینترنت — از همان قابلیتِ web_search کلودی که
+// برای تشخیصِ بارکد استفاده می‌شود کمک می‌گیرد؛ به‌جای یک عکسِ تک، چند نامزدِ مختلف برمی‌گرداند
+// تا مدیر خودش بهترین را از بین‌شان انتخاب کند (نه این‌که خودِ سیستم یکی را به‌صورتِ کور انتخاب کند).
+async function searchProductImageCandidates(query) {
+  if (!ANTHROPIC_API_KEY) throw new Error('کلید ANTHROPIC_API_KEY روی سرور تنظیم نشده است');
+  const instruction = `با جستجوی وب، ۵ تا ۶ عکسِ باکیفیت و مرتبط برای این محصول پیدا کن: "${query}"
+هر آدرس باید مستقیماً به خودِ فایلِ تصویر (jpg/jpeg/png/webp) ختم شود، نه به یک صفحه‌ی HTML. فقط عکس‌هایی را انتخاب کن که به‌وضوح همین محصول (یا همین رنگِ مشخص‌شده، اگر در عبارتِ جستجو نامِ رنگ آمده) را نشان می‌دهند — نه محصولِ مشابه از برندِ دیگر، نه بنر یا لوگو. اگر برای بخشی از درخواست (مثلاً یک رنگِ خاص) عکسِ مطمئنی پیدا نکردی، آن را خالی بگذار و فقط عکس‌های مطمئن را برگردان.
+فقط JSON معتبر: {"results":[{"url":"","source":""}]}`;
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 1500, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: instruction }] }),
+  });
+  const aiData = await aiRes.json();
+  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
+  const textCombined = (aiData.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
+  if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
+  const parsed = parseJsonObject(textCombined);
+  const results = Array.isArray(parsed && parsed.results) ? parsed.results : [];
+  return results.filter((r) => r && typeof r.url === 'string' && /^https?:\/\//i.test(r.url)).slice(0, 6);
+}
+
+app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
+  const query = ((req.body && req.body.query) || '').trim();
+  if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
+  try {
+    const candidates = await searchProductImageCandidates(query);
+    if (candidates.length === 0) return res.json({ results: [] });
+    // هرکدام از نتایج را همین الان روی Cloudinary خودمان آپلود می‌کنیم — تا چیزی که مدیر در
+    // پنجره‌ی نتایج می‌بیند، دقیقاً همان چیزی باشد که با یک کلیک ذخیره می‌شود (نه یک لینکِ
+    // خارجیِ ناپایدار که ممکن است فردا از دسترس خارج شود).
+    const mirrored = await Promise.all(
+      candidates.map(async (c) => {
+        try {
+          const url = await mirrorRemoteImageToCloudinary(c.url);
+          return url ? { url, source: c.source || '' } : null;
+        } catch (e) { return null; }
+      })
+    );
+    res.json({ results: mirrored.filter(Boolean) });
+  } catch (e) {
+    console.error('search-product-image error:', e);
+    res.status(502).json({ error: e.message || 'جستجوی عکس ناموفق بود' });
+  }
+});
+
 app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
   const code = (req.query.code || '').trim();
   if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
