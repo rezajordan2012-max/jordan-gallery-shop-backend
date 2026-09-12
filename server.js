@@ -24,11 +24,11 @@ const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 // 2) Product image -> Gemini -> structured product fields
 // ============================================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 // مدل اختصاصی جستجوی تصویری Gemini با Google Image Search grounding.
 // این مدل فقط برای پیدا کردن عکس‌های واقعی وب استفاده می‌شود؛ کارهای دیگر Gemini
 // همچنان با GEMINI_MODEL قبلی انجام می‌شوند.
-const GEMINI_IMAGE_SEARCH_MODEL = process.env.GEMINI_IMAGE_SEARCH_MODEL || 'gemini-3.1-flash-image';
+const GEMINI_IMAGE_SEARCH_MODEL = process.env.GEMINI_IMAGE_SEARCH_MODEL || 'gemini-3.5-flash';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 const GEMINI_IMAGE_SEARCH_BASE_URL = 'https://generativelanguage.googleapis.com/v1/models';
 
