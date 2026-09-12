@@ -598,15 +598,28 @@ async function searchProductImageCandidates(query) {
 app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
   const query = ((req.body && req.body.query) || '').trim();
   if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
-  app.post('/api/ai/search-product-color', auth, requireAdmin, async (req, res) => {
-
+  app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
   const query = ((req.body && req.body.query) || '').trim();
 
   if (!query) {
-    return res.status(400).json({
-      error: 'عبارت جستجوی رنگ وارد نشده است'
+    return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
+  }
+
+  try {
+    const candidates = await searchProductImageCandidates(query);
+
+    res.json({
+      results: candidates
+    });
+
+  } catch (e) {
+    console.error('search-product-image error:', e);
+
+    res.status(502).json({
+      error: friendlyAiError(e)
     });
   }
+});
 
 
   try {
