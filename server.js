@@ -24,13 +24,9 @@ const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 // 2) Product image -> Gemini -> structured product fields
 // ============================================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
-// مدل اختصاصی جستجوی تصویری Gemini با Google Image Search grounding.
-// این مدل فقط برای پیدا کردن عکس‌های واقعی وب استفاده می‌شود؛ کارهای دیگر Gemini
-// همچنان با GEMINI_MODEL قبلی انجام می‌شوند.
-const GEMINI_IMAGE_SEARCH_MODEL = process.env.GEMINI_IMAGE_SEARCH_MODEL || 'gemini-3.5-flash';
+// این فایل عمداً و صریحاً از Gemini 3.5 Flash استفاده می‌کند.
+const GEMINI_MODEL = 'gemini-3.5-flash';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
-const GEMINI_IMAGE_SEARCH_BASE_URL = 'https://generativelanguage.googleapis.com/v1/models';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 let mongoClientPromise = null;
@@ -196,708 +192,8 @@ async function removeBackgroundFromDataUri(dataUri) {
 
 async function uploadDataUriToCloudinary(dataUri) {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) throw new Error('تنظیمات Cloudinary روی سرور کامل نشده است');
-  const imageMatch = dataUri.match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/);
-  const videoMatch = dataUri.match(/^data:video\/(mp4|webm|quicktime|ogg|mov);base64,(.+)$/);
-  if (!imageMatch && !videoMatch) throw new Error('فرمت فایل پشتیبانی نمی‌شود');
-  const isVideo = !!videoMatch;
-  const dataPart = isVideo ? videoMatch[2] : imageMatch[2];
-  const approxBytes = Math.ceil((dataPart.length * 3) / 4);
-  const maxBytes = isVideo ? 30 * 1024 * 1024 : 10 * 1024 * 1024;
-  if (approxBytes > maxBytes) throw new Error(isVideo ? 'حجم ویدیو بیش از حد مجاز است (حداکثر ۳۰ مگابایت)' : 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)');
-  const timestamp = Math.floor(Date.now() / 1000);
-  const folder = 'maison-store';
-  const signature = crypto.createHash('sha1').update(`folder=${folder}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`).digest('hex');
-  const body = new URLSearchParams({ file: dataUri, api_key: CLOUDINARY_API_KEY, timestamp: String(timestamp), folder, signature });
-  const resourceType = isVideo ? 'video' : 'image';
-  const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
-  const data = await cloudRes.json();
-  if (!cloudRes.ok || !data.secure_url) throw new Error((data && data.error && data.error.message) || 'آپلود Cloudinary ناموفق بود');
-  return { url: data.secure_url, type: isVideo ? 'video' : 'image' };
-}
-
-async function mirrorRemoteImageToCloudinary(remoteUrl) {
-  try {
-    if (!remoteUrl || typeof remoteUrl !== 'string' || !/^https?:\/\//i.test(remoteUrl)) return null;
-    const imgRes = await fetch(remoteUrl);
-    if (!imgRes.ok) return null;
-    const contentType = imgRes.headers.get('content-type') || '';
-    if (!contentType.startsWith('image/')) return null;
-    const buffer = Buffer.from(await imgRes.arrayBuffer());
-    if (buffer.length > 10 * 1024 * 1024) return null;
-    const mimeForDataUri = contentType.split(';')[0].replace('image/jpg', 'image/jpeg');
-    const supported = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
-    if (!supported.includes(mimeForDataUri)) return null;
-    const dataUri = `data:${mimeForDataUri};base64,${buffer.toString('base64')}`;
-    const cleaned = await removeBackgroundFromDataUri(dataUri);
-    const uploaded = await uploadDataUriToCloudinary(cleaned);
-    return uploaded.url;
-  } catch (e) { console.error('mirrorRemoteImageToCloudinary failed:', e.message); return null; }
-}
-
-app.post('/api/upload', auth, requireAdmin, async (req, res) => {
-  const { imageBase64, removeBackground } = req.body || {};
-  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'فایل معتبر نیست' });
-  try {
-    const isVideo = imageBase64.startsWith('data:video/');
-    const dataToUpload = removeBackground && !isVideo ? await removeBackgroundFromDataUri(imageBase64) : imageBase64;
-    res.json(await uploadDataUriToCloudinary(dataToUpload));
-  } catch (e) {
-    const statusMap = { 'تنظیمات Cloudinary روی سرور کامل نشده است': 500, 'فرمت فایل پشتیبانی نمی‌شود': 400 };
-    res.status(statusMap[e.message] || (e.message && e.message.includes('حجم') ? 413 : 502)).json({ error: e.message || 'آپلود ناموفق بود' });
-  }
-});
-
-// Existing image extraction endpoint — Gemini free-tier model
-app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
-  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
-  const { imageBase64 } = req.body || {};
-  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
-  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
-  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، webp)' });
-  const approxBytes = Math.ceil((match[2].length * 3) / 4);
-  if (approxBytes > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
-  try {
-    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-    const aiRes = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [
-          { inline_data: { mime_type: match[1], data: match[2] } },
-          { text: buildProductExtractionPrompt() },
-        ] }],
-        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
-      }),
-    });
-    const aiData = await aiRes.json().catch(() => ({}));
-    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || `خطا در ارتباط با Gemini (${aiRes.status})` });
-    const textBlock = (aiData.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((c) => c.text || '').join('').trim();
-    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
-    res.json(parseJsonObject(textBlock));
-  } catch (e) {
-    console.error('Gemini image extraction error:', e);
-    res.status(502).json({ error: e.message || 'خطای سرور هنگام تحلیل تصویر با Gemini' });
-  }
-});
-
-function buildProductExtractionPrompt() {
-  return `عکسی از محصول/جعبه/برچسب/صفحه مرجع محصول دریافت کرده‌ای. هدف: پر کردن فیلدهای فرم محصول در پنل مدیریت.
-اگر چیزی مطمئن نیستی یا در تصویر دیده نمی‌شود، همان فیلد را خالی یا آرایه خالی بگذار؛ هرگز حدس نزن.
-تمام فیلدهای متنی فارسی باشند، به‌جز nameEn که دقیقاً به زبان اصلی بماند، concentration که یکی از مقادیر استاندارد انگلیسی باشد، و mainAccords که همان کلماتِ انگلیسیِ اصلیِ «Main accords» (در صورت وجود روی تصویر) با ویرگول جدا از هم باشد.
-priceToman فقط وقتی عدد خام قیمت تومان/ریال روی تصویر واضح است. ارز خارجی را تبدیل نکن و در referencePriceNote نگه دار.
-categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, electronics یا خالی.
-فقط JSON معتبر و بدون Markdown برگردان:
-{
-"name":"","nameEn":"","brand":"","categoryGuess":"","subcategoryHint":"","priceToman":"","referencePriceNote":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":"","variants":[]
-}
-variants آرایه‌ای از {"label":"","hex":""} باشد.`;
-}
-
-function parseJsonObject(text) {
-  const cleaned = String(text || '').replace(/```json/gi, '').replace(/```/g, '').trim();
-  const start = cleaned.indexOf('{');
-  const end = cleaned.lastIndexOf('}');
-  return JSON.parse(start >= 0 && end >= start ? cleaned.slice(start, end + 1) : cleaned);
-}
-
-// Existing Fraganty endpoints.
-const FRAGANTY_QUOTA_MESSAGE = 'سهمیه ماهانه رایگان ai.fraganty تمام شده — تا ماه بعد صبر کن یا از پلن پولی بگیر';
-app.get('/api/ai/search-perfume', auth, requireAdmin, async (req, res) => {
-  if (!FRAGANTY_API_KEY) return res.status(500).json({ error: 'کلید FRAGANTY_API_KEY روی سرور تنظیم نشده است' });
-  const q = (req.query.q || '').trim();
-  if (!q) return res.status(400).json({ error: 'نام محصول را وارد کن' });
-  try {
-    const fRes = await fetch(`${FRAGANTY_BASE_URL}/api/perfumes?q=${encodeURIComponent(q)}&limit=8`, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
-    const fData = await fRes.json();
-    if (!fRes.ok) return res.status(fRes.status === 429 ? 429 : 502).json({ error: fRes.status === 429 ? FRAGANTY_QUOTA_MESSAGE : (fData && fData.error) || 'خطا در ارتباط با ai.fraganty' });
-    const results = (Array.isArray(fData.data) ? fData.data : []).filter((p) => p && p.id).map((p) => ({ id: p.id, name: p.name, brand: p.brand, year: p.year, image: p.image }));
-    res.json({ data: results });
-  } catch (e) { console.error('Fraganty search error:', e); res.status(500).json({ error: 'خطای سرور هنگام جستجو در ai.fraganty' }); }
-});
-
-app.get('/api/ai/perfume-details', auth, requireAdmin, async (req, res) => {
-  if (!FRAGANTY_API_KEY) return res.status(500).json({ error: 'کلید FRAGANTY_API_KEY روی سرور تنظیم نشده است' });
-  const slug = (req.query.slug || '').trim();
-  if (!slug) return res.status(400).json({ error: 'شناسه محصول نامعتبر است' });
-  try {
-    const fRes = await fetch(`${FRAGANTY_BASE_URL}/api/perfumes/${encodeURIComponent(slug)}`, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
-    const fData = await fRes.json();
-    if (!fRes.ok) return res.status(fRes.status === 429 ? 429 : fRes.status === 404 ? 404 : 502).json({ error: fRes.status === 429 ? FRAGANTY_QUOTA_MESSAGE : fRes.status === 404 ? 'این محصول در ai.fraganty پیدا نشد — یک نتیجه دیگر را امتحان کن' : (fData && fData.error) || 'خطا در دریافت جزئیات از ai.fraganty' });
-    if (!fData || !fData.name) return res.status(502).json({ error: 'این محصول در ai.fraganty اطلاعات کاملی ندارد — یک نتیجه دیگر را امتحان کن یا فیلدها را دستی پر کن' });
-    res.json(fData);
-  } catch (e) { console.error('Fraganty details error:', e); res.status(500).json({ error: 'خطای سرور هنگام دریافت جزئیات از ai.fraganty' }); }
-});
-
-app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) => {
-  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'کلید ANTHROPIC_API_KEY روی سرور تنظیم نشده است' });
-  const { name, brand, description, accords, seasons, dayNight, gender, rating } = req.body || {};
-  if (!name) return res.status(400).json({ error: 'نام محصول الزم است' });
-  const instruction = `اطلاعات زیر درباره یک عطر است. یک JSON معتبر بدون Markdown برگردان.
-نام: ${name}
-برند: ${brand || ''}
-جنسیت: ${gender || ''}
-امتیاز کاربران: ${rating || ''}
-توضیح اصلی: ${description || ''}
-آکوردها: ${Array.isArray(accords) ? accords.map((a) => typeof a === 'string' ? a : a.name).filter(Boolean).join('، ') : ''}
-فصل‌ها: ${JSON.stringify(seasons || '')}
-زمان استفاده روز/شب: ${JSON.stringify(dayNight || '')}
-ساختار دقیق: {"description":"توضیح کوتاه دو تا سه جمله‌ای کاملاً فارسی","properties":"چند ویژگی کوتاه فارسی، هرکدام در خط جدا، حداکثر ۵ خط"}`;
-  try {
-    const aiRes = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 700, messages: [{ role: 'user', content: instruction }] }) });
-    const aiData = await aiRes.json();
-    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی' });
-    const textBlock = (aiData.content || []).find((c) => c.type === 'text');
-    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
-    const parsed = parseJsonObject(textBlock.text);
-    res.json({ description: parsed.description || '', properties: parsed.properties || '' });
-  } catch (e) { console.error('AI translate-perfume-text error:', e); res.status(500).json({ error: 'خطای سرور هنگام ترجمه توضیحات' }); }
-});
-
-async function lookupOpenFacts(code) {
-  const bases = ['https://world.openbeautyfacts.org/api/v2/product', 'https://world.openfoodfacts.org/api/v2/product'];
-  for (const base of bases) {
-    try {
-      const r = await fetch(`${base}/${encodeURIComponent(code)}.json`);
-      if (!r.ok) continue;
-      const data = await r.json();
-      if (!data || data.status !== 1 || !data.product) continue;
-      const p = data.product;
-      const title = (p.product_name || p.product_name_en || p.generic_name || '').trim();
-      if (!title) continue;
-      const brand = (p.brands || '').split(',')[0].trim();
-      const image = p.image_front_url || p.image_url || '';
-      const ingredients = (p.ingredients_text || p.ingredients_text_en || '').trim();
-      const volMatch = (p.quantity || p.product_quantity || '').toString().match(/([\d.,]+)\s*m?l\b/i);
-      const volume = volMatch ? volMatch[1].replace(',', '.') : '';
-      return { title, brand, image, ingredients, volume };
-    } catch (e) { console.error('Open Facts lookup failed:', base, e.message); }
-  }
-  return null;
-}
-
-async function identifyBarcodeWithAI(code) {
-  if (!ANTHROPIC_API_KEY) return null;
-  const instruction = `کد بارکد زیر متعلق به یک محصول است: ${code}
-با جستجوی وب، محصول واقعی متناظر را با اطمینان شناسایی کن. اگر مطمئن نیستی حدس نزن.
-فقط JSON معتبر: {"found":true,"isPerfume":false,"name":"","nameEn":"","brand":"","imageUrl":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":""}`;
-  const aiRes = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 2000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: instruction }] }) });
-  const aiData = await aiRes.json();
-  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
-  const textCombined = (aiData.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
-  if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
-  const parsed = parseJsonObject(textCombined);
-  if (!parsed || !parsed.found || !parsed.name) return null;
-  return parsed;
-}
-
-// جستجوی عکسِ محصول (یا یک رنگِ خاص از محصول) در اینترنت — اکنون خودِ Gemini
-// با Google Image Search grounding جستجو می‌کند. این مسیر دیگر به Anthropic وابسته نیست.
-// Gemini هم نام محصول/رنگ را تحلیل می‌کند و هم نامزدهای تصویری واقعی وب را برمی‌گرداند.
-// برای هر عکس، علاوه بر imageUri، صفحه‌ی مبدأ (sourceUri) را هم نگه می‌داریم تا
-// انتساب منبع تصویر حفظ شود.
-async function searchProductImageCandidates(query) {
-  if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
-
-  const endpoint = `${GEMINI_IMAGE_SEARCH_BASE_URL}/${encodeURIComponent(GEMINI_IMAGE_SEARCH_MODEL)}:generateContent`;
-  const instruction = `تو مسئول جستجوی واقعیِ عکس در اینترنت برای پنل مدیریت فروشگاه Jordan Gallery هستی.
-عبارت جستجو: "${query}"
-
-با Google Image Search دقیقاً همین محصول را پیدا کن. اگر در عبارت، نام/شماره/کد یک رنگ یا shade وجود دارد، همان رنگ دقیق را اولویت بده.
-- محصول مشابه از برند دیگر، لوگو، بنر، عکس تبلیغاتی نامرتبط یا تصویر عمومی را انتخاب نکن.
-- برای تصویر اصلی محصول، عکس واضح از خودِ محصول/بسته‌بندی را ترجیح بده.
-- برای طیف رنگ، عکس سوآچ یا تصویر همان رنگ/شماره را ترجیح بده.
-- نتیجه باید از منبع واقعی وب باشد؛ عکس تولید نکن و چیزی را حدس نزن.
-- چند نامزد مختلف و باکیفیت پیدا کن تا مدیر بتواند یکی را انتخاب کند.
-فقط از جستجوی تصویری Google برای پیدا کردن منابع استفاده کن؛ خروجی تصویری تولیدشده برای ما لازم نیست.`;
-
-  const aiRes = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: instruction }] }],
-      tools: [{ google_search: { searchTypes: { webSearch: {}, imageSearch: {} } } }],
-      // طبق API فعلی، imageSearch در Gemini 3.1 Flash Image به‌عنوان grounding
-      // برای پاسخ تصویری فعال می‌شود. تصویر تولیدی را استفاده نمی‌کنیم و فقط groundingChunks را می‌خوانیم.
-      generationConfig: { responseModalities: ['IMAGE'] },
-    }),
-  });
-
-  const aiData = await aiRes.json().catch(() => ({}));
-  if (!aiRes.ok) {
-    throw new Error((aiData && aiData.error && aiData.error.message) || `خطا در ارتباط با Gemini Image Search (${aiRes.status})`);
-  }
-
-  const candidates = Array.isArray(aiData.candidates) ? aiData.candidates : [];
-  const chunks = candidates.flatMap((candidate) => {
-    const metadata = candidate && candidate.groundingMetadata;
-    return metadata && Array.isArray(metadata.groundingChunks) ? metadata.groundingChunks : [];
-  });
-
-  const seen = new Set();
-  const results = [];
-  for (const chunk of chunks) {
-    const image = chunk && chunk.image ? chunk.image : null;
-    if (!image) continue;
-
-    // REST responses may expose camelCase or snake_case depending on API surface/version.
-    const imageUrl = image.imageUri || image.image_uri || image.uri || '';
-    const sourceUrl = image.sourceUri || image.source_uri || '';
-    const title = image.title || '';
-    const domain = image.domain || '';
-    if (!/^https?:\/\//i.test(imageUrl)) continue;
-    if (!/^https?:\/\//i.test(sourceUrl)) continue;
-    if (seen.has(imageUrl)) continue;
-    seen.add(imageUrl);
-    results.push({ url: imageUrl, source: sourceUrl, title, domain });
-    if (results.length >= 8) break;
-  }
-
-  return results.slice(0, 6);
-}
-
-app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
-  const query = ((req.body && req.body.query) || '').trim();
-  if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
-  try {
-    const candidates = await searchProductImageCandidates(query);
-    if (candidates.length === 0) return res.json({ results: [] });
-    // هرکدام از نتایج را همین الان روی Cloudinary خودمان آپلود می‌کنیم — تا چیزی که مدیر در
-    // پنجره‌ی نتایج می‌بیند، دقیقاً همان چیزی باشد که با یک کلیک ذخیره می‌شود (نه یک لینکِ
-    // خارجیِ ناپایدار که ممکن است فردا از دسترس خارج شود).
-    const mirrored = await Promise.all(
-      candidates.map(async (c) => {
-        try {
-          const url = await mirrorRemoteImageToCloudinary(c.url);
-          return url ? { url, source: c.source || '' } : null;
-        } catch (e) { return null; }
-      })
-    );
-    res.json({ results: mirrored.filter(Boolean) });
-  } catch (e) {
-    console.error('search-product-image error:', e);
-    res.status(502).json({ error: e.message || 'جستجوی عکس ناموفق بود' });
-  }
-});
-
-app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
-  const code = (req.query.code || '').trim();
-  if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
-  const db = await readDB();
-  const ownMatch = db.products.find((p) => p.barcode && p.barcode === code);
-  if (ownMatch) return res.json({ foundInOwnDb: true, product: { id: ownMatch.id, name: ownMatch.name, category: ownMatch.category, subcategory: ownMatch.subcategory } });
-  let free = null;
-  try { free = await lookupOpenFacts(code); } catch (e) { console.error('lookupOpenFacts error:', e.message); }
-  let ai = null; let aiError = null;
-  if (ANTHROPIC_API_KEY) {
-    try { ai = await identifyBarcodeWithAI(code); if (!ai) aiError = 'محصول با جستجوی هوش مصنوعی هم شناسایی نشد'; }
-    catch (e) { aiError = e.message; console.error('identifyBarcodeWithAI failed (non-fatal):', aiError); }
-  }
-  let note = null;
-  if (!ai) note = !ANTHROPIC_API_KEY ? 'کلید هوش مصنوعی روی سرور تنظیم نشده — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی' : `غنی‌سازی با هوش مصنوعی ناموفق بود — ${aiError || ''}`;
-  if (!free && !ai) return res.json({ foundInOwnDb: false, external: null, note });
-  const rawImage = (ai && ai.imageUrl) || (free && free.image) || '';
-  const mirroredImage = rawImage ? await mirrorRemoteImageToCloudinary(rawImage) : null;
-  res.json({ foundInOwnDb: false, note, external: { found: true, source: ai ? (free ? 'ai+free' : 'ai') : 'free', isPerfume: ai ? !!ai.isPerfume : null, name: (ai && ai.name) || '', title: (ai && ai.nameEn) || (free && free.title) || '', brand: (ai && ai.brand) || (free && free.brand) || '', image: mirroredImage || rawImage || '', description: (ai && ai.description) || '', properties: (ai && ai.properties) || '', ingredients: (ai && ai.ingredients) || (free && free.ingredients) || '', volume: (ai && ai.volume) || (free && free.volume) || '', concentration: (ai && ai.concentration) || '', topNotes: (ai && ai.topNotes) || '', middleNotes: (ai && ai.middleNotes) || '', baseNotes: (ai && ai.baseNotes) || '', mainAccords: (ai && ai.mainAccords) || '', perfumer: (ai && ai.perfumer) || '', countryOfOrigin: (ai && ai.countryOfOrigin) || '', yearMade: ai && ai.yearMade ? String(ai.yearMade) : '' } });
-}));
-
-// ============================================================
-// NEW CAPABILITY #1: Product page URL -> Gemini
-// ============================================================
-function validateProductUrl(value) {
-  try {
-    const u = new URL(String(value));
-    if (!['http:', 'https:'].includes(u.protocol)) return null;
-    return u;
-  } catch { return null; }
-}
-
-function stripHtmlForGemini(html) {
-  let imgCount = 0;
-  const IMG_LIMIT = 60;
-  let text = String(html || '')
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
-    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ');
-
-  // پیش از حذفِ کلیِ تگ‌ها، تگ‌های <img> را به یک نشانه‌ی متنیِ فشرده تبدیل می‌کند که هم آدرسِ
-  // عکس (src — یا معادل‌های تنبل‌بارگذاری مثل data-src/data-original/srcset) و هم متنِ
-  // جایگزینش (alt — معمولاً همان نامِ رنگ/طیف در صفحاتِ محصولاتِ آرایشی) را نگه می‌دارد؛ همین
-  // یعنی Gemini می‌تواند تشخیص دهد کدام عکس مالِ کدام طیفِ رنگ است.
-  text = text.replace(/<img[^>]*>/gi, (tag) => {
-    imgCount += 1;
-    if (imgCount > IMG_LIMIT) return ' ';
-    const srcMatch =
-      tag.match(/\ssrc=["']([^"']+)["']/i) ||
-      tag.match(/\sdata-src=["']([^"']+)["']/i) ||
-      tag.match(/\sdata-original=["']([^"']+)["']/i) ||
-      tag.match(/\sdata-lazy(?:-src)?=["']([^"']+)["']/i) ||
-      tag.match(/\ssrcset=["']([^"',\s]+)/i);
-    const altMatch = tag.match(/\salt=["']([^"']*)["']/i) || tag.match(/\stitle=["']([^"']*)["']/i);
-    const src = srcMatch ? srcMatch[1] : '';
-    if (!src) return ' ';
-    const alt = altMatch ? altMatch[1].replace(/["\[\]]/g, '') : '';
-    return ` [IMG src="${src}" alt="${alt}"] `;
-  });
-
-  // خیلی از سوآچ‌های رنگِ محصولاتِ آرایشی (رژلب، سایه، کرم‌پودر) به‌جای <img>، یک عنصرِ ساده
-  // (div/span/a) با پس‌زمینه‌ی CSS تنظیم‌شده (background-image:url(...)) هستند — این عنصرها را
-  // هم به همان قالبِ نشانه‌ی [IMG] تبدیل می‌کند تا Gemini همان‌ها را هم به‌عنوانِ عکسِ طیف رنگ ببیند.
-  text = text.replace(/<[a-z][a-z0-9]*\b[^>]*\sstyle=["'][^"']*background(?:-image)?\s*:\s*url\(\s*['"]?([^'")]+)['"]?\s*\)[^"']*["'][^>]*>/gi, (tag, rawUrl) => {
-    imgCount += 1;
-    if (imgCount > IMG_LIMIT) return ' ';
-    const src = String(rawUrl || '').trim();
-    if (!src) return ' ';
-    const labelMatch = tag.match(/\s(?:title|aria-label|data-label|data-name|data-color)=["']([^"']*)["']/i);
-    const alt = labelMatch ? labelMatch[1].replace(/["\[\]]/g, '') : '';
-    return ` [IMG src="${src}" alt="${alt}"] `;
-  });
-
-  return text
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 120000);
-}
-
-// از روی HTML خام صفحه (پیش از حذف تگ‌ها)، محتمل‌ترین عکسِ اصلیِ محصول را با گشتن در متاتگ‌های
-// استاندارد og:image / twitter:image پیدا می‌کند — همان تگ‌هایی که تقریباً همه‌ی فروشگاه‌های
-// آنلاین برای پیش‌نمایشِ لینک (مثلاً هنگام اشتراک‌گذاری در تلگرام/واتساپ) پر می‌کنند، پس معمولاً
-// دقیق‌ترین و باکیفیت‌ترین عکسِ محصول همین است. آدرسِ نسبی را هم نسبت به baseUrl کامل می‌کند.
-function extractPrimaryImageFromHtml(html, baseUrl) {
-  if (!html) return null;
-  const patterns = [
-    /<meta[^>]+property=["']og:image:secure_url["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
-    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
-    // پشتیبانِ سایت‌هایی که og:image درست تنظیم نکرده‌اند (خیلی رایج در فروشگاه‌های آرایشی
-    // کوچک‌تر) — این سه الگو، منابعِ استانداردِ دیگری هستند که همچنان معمولاً به عکسِ واقعیِ
-    // محصول اشاره می‌کنند، نه لوگوی سایت.
-    /<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i,
-    /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']image_src["']/i,
-    /<meta[^>]+itemprop=["']image["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+itemprop=["']image["']/i,
-  ];
-  for (const re of patterns) {
-    const m = html.match(re);
-    if (m && m[1]) {
-      try { return new URL(m[1], baseUrl).toString(); } catch { /* skip invalid */ }
-    }
-  }
-  // راهِ آخر: خیلی از فروشگاه‌ها اطلاعاتِ ساختاریافته‌ی schema.org (JSON-LD) را برای موتورهای
-  // جست‌وجو در صفحه می‌گذارند که معمولاً شاملِ فیلدِ "image" همان محصول است — حتی اگر og:image
-  // خالی یا اشتباه (مثلاً لوگوی سایت) تنظیم شده باشد، این مقدار معمولاً درست است.
-  const ldBlocks = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi) || [];
-  for (const block of ldBlocks) {
-    const inner = block.replace(/^<script[^>]*>/i, '').replace(/<\/script>\s*$/i, '');
-    try {
-      const parsed = JSON.parse(inner);
-      const candidates = Array.isArray(parsed) ? parsed : (Array.isArray(parsed['@graph']) ? parsed['@graph'] : [parsed]);
-      for (const item of candidates) {
-        const img = item && item.image;
-        if (!img) continue;
-        const url = Array.isArray(img) ? img[0] : (img && typeof img === 'object' ? img.url : img);
-        if (url) { try { return new URL(url, baseUrl).toString(); } catch { /* skip invalid */ } }
-      }
-    } catch (e) { /* JSON-LD نامعتبر بود — رد شو و سراغ بلوکِ بعدی برو */ }
-  }
-  return null;
-}
-
-// نمودارهای «Ratings» (Scent/Longevity/Sillage) که در بسیاری از سایت‌های عطر (یا ویجت‌های شخص
-// ثالثِ تعبیه‌شده مثل «Smell & Feel») نمایش داده می‌شوند، معمولاً به‌صورت متنِ ساده‌ی «SCENT 7.9
-// 4608 RATINGS» کنار هم قرار دارند. چون خواندنِ این اعداد توسط مدلِ زبانی گاهی دقیق نیست (ممکن
-// است رند یا اشتباه کپی شود)، این‌جا مستقیماً با یک الگوی متنی، عددِ امتیاز (۰ تا ۱۰) و تعدادِ
-// رأی‌های هرکدام را از خودِ متن استخراج می‌کنیم — نتیجه‌اش همیشه دقیقاً همان عددی است که روی
-// سایتِ مبدأ نوشته شده، نه یک برآوردِ هوش مصنوعی.
-function extractPerfumeRatingBars(text) {
-  function grab(label) {
-    const re = new RegExp(label + "[^0-9]{0,60}(\\d{1,2}(?:\\.\\d)?)[^0-9]{0,60}([\\d,]{1,7})\\s*RATING", "i");
-    const m = String(text || "").match(re);
-    if (!m) return null;
-    const score = parseFloat(m[1]);
-    const ratings = parseInt(m[2].replace(/,/g, ""), 10);
-    if (!Number.isFinite(score) || score < 0 || score > 10) return null;
-    return { score, ratings: Number.isFinite(ratings) ? ratings : 0 };
-  }
-  const scent = grab("SCENT");
-  const longevity = grab("LONGEVITY");
-  const sillage = grab("SILLAGE");
-  if (!scent && !longevity && !sillage) return null;
-  return { scent, longevity, sillage };
-}
-
-// آدرس‌های همه‌ی iframeهای داخلِ یک صفحه را (نسبت به baseUrl کامل‌شده) برمی‌گرداند — برای وقتی که
-// نمودارِ Ratings یا بخشِ «Main accords» نه در خودِ HTML صفحه، بلکه داخلِ یک ویجتِ شخص‌ثالثِ
-// تعبیه‌شده (iframe، مثلاً ویجتِ «Smell & Feel») بارگذاری می‌شود و باید جداگانه واکشی شود.
-function extractIframeSrcs(html, baseUrl) {
-  const out = [];
-  const re = /<iframe[^>]+src=["']([^"']+)["']/gi;
-  let m;
-  while ((m = re.exec(String(html || ""))) && out.length < 5) {
-    try { out.push(new URL(m[1], baseUrl).toString()); } catch { /* skip invalid */ }
-  }
-  return out;
-}
-
-// واژه‌نامه‌ی شناخته‌شده‌ی آکوردهای رایج عطر (انگلیسی) — پایه‌ی تشخیصِ «کدام کلمه واقعاً یک
-// آکورد است» به‌جای حدسِ صرفِ «کلمه‌ی با حرفِ اول بزرگ». عبارت‌های دوکلمه‌ای (مثل white floral،
-// warm spicy) عمداً قبل از تک‌کلمه‌ای‌هایشان آمده‌اند تا در تطبیق، اول آن‌ها بررسی شوند و به‌اشتباه
-// به دو آکوردِ جدا شکسته نشوند؛ ولی کلماتی که کنارِ هم آمده‌اند بدون این‌که یک عبارتِ دوکلمه‌ایِ
-// شناخته‌شده باشند (مثل «Oriental Woody» که خودش در این لیست نیست)، هرکدام جدا شناسایی می‌شوند.
-const KNOWN_ACCORD_WORDS = [
-  "white floral", "yellow floral", "green floral", "fruity floral", "citrus floral",
-  "warm spicy", "fresh spicy", "oriental woody", "woody floral musk", "aromatic fougere",
-  "resinous", "smoky", "powdery", "woody", "citrus", "citrusy", "floral", "patchouli", "musky",
-  "musk", "sweet", "amber", "aromatic", "fruity", "green", "aquatic", "marine", "leathery",
-  "leather", "gourmand", "tobacco", "chypre", "fougere", "earthy", "vanilla", "oud", "balsamic",
-  "soapy", "mossy", "spicy", "oriental", "sour", "bitter", "fresh", "clean", "dry", "creamy",
-  "soft", "herbal", "rose", "iris", "almond", "coconut", "honey", "caramel", "coffee", "tea",
-  "anise", "licorice", "whiskey", "rum", "animalic", "metallic", "ozonic", "salty", "lactonic",
-  "yeasty", "tropical", "mineral", "camphor", "medicinal", "nutty", "rummy", "smoked",
-];
-
-// متنِ داده‌شده را برای وجودِ هرکدام از KNOWN_ACCORD_WORDS می‌گردد و آکوردهایی که واقعاً پیدا
-// شده‌اند را به‌ترتیبِ ظاهرشدن‌شان در متن برمی‌گرداند — عبارت‌های دوکلمه‌ای (مثل white floral)
-// اول بررسی می‌شوند تا از تداخل با تک‌کلمه‌ای‌هایشان (floral) جلوگیری شود؛ هر بازه‌ی متنی که یک‌بار
-// تطبیق پیدا کرد دوباره برای عبارتِ دیگری بررسی نمی‌شود، پس «Oriental» و «Woody»ی کنارِ هم هرگز
-// یک آکورد واحد نمی‌شوند مگر خودِ عبارتِ دوکلمه‌ایشان در فهرست باشد.
-function matchKnownAccordsInText(text) {
-  const t = " " + String(text || "").toLowerCase() + " ";
-  const sorted = [...KNOWN_ACCORD_WORDS].sort((a, b) => b.length - a.length);
-  const usedRanges = [];
-  const found = [];
-  for (const word of sorted) {
-    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp("\\b" + escaped + "\\b", "gi");
-    let m;
-    while ((m = re.exec(t))) {
-      const start = m.index;
-      const end = start + m[0].length;
-      const overlaps = usedRanges.some(([s, e]) => start < e && end > s);
-      if (!overlaps) {
-        usedRanges.push([start, end]);
-        found.push({ start, label: word.replace(/\b\w/g, (c) => c.toUpperCase()) });
-      }
-    }
-  }
-  found.sort((a, b) => a.start - b.start);
-  const seen = new Set();
-  const ordered = [];
-  for (const f of found) {
-    const key = f.label.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    ordered.push(f.label);
-  }
-  return ordered;
-}
-
-// بخشِ «Main accords» (که روی سایت‌هایی مثل Fragrantica/Parfumo یا ویجت‌های مشابه، زیرِ یک
-// عنوانِ کوچک با چند برچسبِ رنگی — مثل Oriental, Woody, Spicy, Sweet, Floral — نشان داده
-// می‌شود) را مستقیماً از متنِ خام استخراج می‌کند: عنوانِ «main accords» را پیدا می‌کند و در
-// متنِ بعدش (تا رسیدن به عنوانِ بعدی مثل «Fragrance Pyramid») فقط دنبالِ کلماتی می‌گردد که در
-// واژه‌نامه‌ی KNOWN_ACCORD_WORDS باشند — همین یعنی هرچیزِ نامرتبط (مثل برندینگِ ویجت‌های
-// شخص‌ثالث یا نشانه‌های داخلیِ خودمان) دیگر هرگز به‌اشتباه به‌عنوانِ آکورد ثبت نمی‌شود، و ترتیبِ
-// ظاهرشدن‌شان هم دقیقاً همان ترتیبِ شدت/اهمیتِ آکورد در صفحه‌ی مبدأ (از قوی‌تر به ضعیف‌تر) است.
-function extractMainAccordsFromText(text) {
-  const t = String(text || "");
-  const m = t.match(/main accords[:\s]*(.*?)(?:fragrance pyramid|top notes|search by accords|user ratings|when to wear|$)/i);
-  if (!m || !m[1]) return null;
-  const chunk = m[1].trim();
-  if (!chunk) return null;
-  const words = matchKnownAccordsInText(chunk).slice(0, 10);
-  return words.length ? words.join(", ") : null;
-}
-
-// خیلی از این ویجت‌های شخص‌ثالث (مثل Smell & Feel) داده‌شان را با جاوااسکریپت رندر می‌کنند، اما
-// معمولاً همان داده‌ی خام (JSON) از قبل، داخل یک تگِ <script> در همان HTML اولیه هم قرار دارد —
-// این تابع تمام بلوک‌های <script>ی که کلمه‌ی scent/longevity/sillage/accord در آن‌ها هست را
-// برمی‌گرداند تا جدا از متنِ قابل‌مشاهده، همان‌جا هم دنبالِ اعداد/آکوردها بگردیم.
-function extractScriptBlobs(html) {
-  const out = [];
-  const re = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-  let m;
-  while ((m = re.exec(String(html || "")))) {
-    const body = m[1];
-    if (body && body.trim().length > 10 && /scent|longevity|sillage|accord/i.test(body)) {
-      out.push(body.length > 300000 ? body.slice(0, 300000) : body);
-    }
-  }
-  return out;
-}
-
-function grabScoreNear(text, keys) {
-  for (const key of keys) {
-    const re = new RegExp("[\"']?" + key + "[\"']?\\s*[:=]\\s*\\{?\\s*[\"']?(?:value[\"']?\\s*[:=]\\s*)?[\"']?(\\d{1,2}(?:\\.\\d)?)", "i");
-    const m = String(text || "").match(re);
-    if (m) {
-      const score = parseFloat(m[1]);
-      if (Number.isFinite(score) && score >= 0 && score <= 10) return score;
-    }
-  }
-  return null;
-}
-
-function grabCountNear(text, keys) {
-  for (const key of keys) {
-    const re = new RegExp("[\"']?" + key + "[\"']?\\s*[:=]\\s*[\"']?(\\d{2,7})", "i");
-    const m = String(text || "").match(re);
-    if (m) {
-      const n = parseInt(m[1], 10);
-      if (Number.isFinite(n)) return n;
-    }
-  }
-  return null;
-}
-
-// همان سه امتیازِ Scent/Longevity/Sillage را این‌بار از داخلِ بلوک‌های JSON/جاوااسکریپتِ تعبیه‌شده
-// (نه متنِ قابل‌مشاهده) پیدا می‌کند — برای سایت‌هایی که این عدد‌ها را با جاوااسکریپت رسم می‌کنند
-// ولی خودِ داده‌ی خام در HTML اولیه هم هست.
-function extractRatingsFromScripts(scripts) {
-  for (const s of scripts) {
-    const scentScore = grabScoreNear(s, ["scentScore", "scent_score", "scent"]);
-    const longevityScore = grabScoreNear(s, ["longevityScore", "longevity_score", "longevity"]);
-    const sillageScore = grabScoreNear(s, ["sillageScore", "sillage_score", "sillage"]);
-    if (scentScore == null && longevityScore == null && sillageScore == null) continue;
-    const scentRatings = grabCountNear(s, ["scentRatings", "scentCount", "scent_count", "scentVotes"]);
-    const longevityRatings = grabCountNear(s, ["longevityRatings", "longevityCount", "longevity_count", "longevityVotes"]);
-    const sillageRatings = grabCountNear(s, ["sillageRatings", "sillageCount", "sillage_count", "sillageVotes"]);
-    return {
-      scent: scentScore != null ? { score: scentScore, ratings: scentRatings || 0 } : null,
-      longevity: longevityScore != null ? { score: longevityScore, ratings: longevityRatings || 0 } : null,
-      sillage: sillageScore != null ? { score: sillageScore, ratings: sillageRatings || 0 } : null,
-    };
-  }
-  return null;
-}
-
-// همان «Main accords» را این‌بار از یک آرایه‌ی JSON تعبیه‌شده (مثل "accords":["Sweet","Gourmand",...])
-// پیدا می‌کند — چه رشته‌های ساده باشند، چه اشیائی با یک فیلدِ name/label/title. نتیجه هم از همان
-// واژه‌نامه‌ی KNOWN_ACCORD_WORDS عبور می‌کند تا اگر کلیدهای نامرتبطِ دیگری از همان JSON به‌اشتباه
-// گرفته شده باشند، حذف شوند و فقط آکوردهای واقعی باقی بمانند.
-function extractAccordsFromScripts(scripts) {
-  for (const s of scripts) {
-    if (!/accord/i.test(s)) continue;
-    const m = s.match(/accords?["']?\s*[:=]\s*(\[[^\]]{0,600}\])/i);
-    if (!m) continue;
-    let rawWords = [];
-    try {
-      const arr = JSON.parse(m[1].replace(/'/g, '"'));
-      rawWords = arr.map((item) => (typeof item === "string" ? item : item && (item.name || item.label || item.title))).filter(Boolean);
-    } catch (e) {
-      const strs = m[1].match(/["']([A-Za-z][A-Za-z\s]{2,20})["']/g);
-      rawWords = strs ? strs.map((x) => x.replace(/["']/g, "").trim()).filter(Boolean) : [];
-    }
-    if (rawWords.length === 0) continue;
-    const filtered = matchKnownAccordsInText(rawWords.join(", ")).slice(0, 10);
-    if (filtered.length) return filtered.join(", ");
-  }
-  return null;
-}
-
-// موتورِ اصلیِ پیدا کردنِ نمودارِ Ratings و بخشِ Main accords — چهار لایه، از دقیق‌ترین به کلی‌ترین:
-// ۱) متنِ قابل‌مشاهده‌ی خودِ صفحه   ۲) بلوک‌های JSON تعبیه‌شده در خودِ صفحه
-// ۳) متنِ قابل‌مشاهده‌ی iframeهای صفحه (با هدرِ Referer درست، چون بعضی ویجت‌ها بدونش جواب نمی‌دهند)
-// ۴) بلوک‌های JSON تعبیه‌شده داخل همان iframeها
-// به‌محض این‌که هم امتیازها و هم آکوردها پیدا شوند، جست‌وجو متوقف می‌شود؛ در غیر این صورت تا آخرین
-// iframe ادامه می‌دهد و هرکدام را که پیدا کرد برمی‌گرداند (حتی اگر فقط یکی از دو مورد باشد).
-async function analyzeFragranceWidget(mainHtml, mainText, baseUrl) {
-  let bars = extractPerfumeRatingBars(mainText);
-  let accords = extractMainAccordsFromText(mainText);
-  if (bars && accords) return { bars, mainAccords: accords };
-
-  const mainScripts = extractScriptBlobs(mainHtml);
-  if (!bars) bars = extractRatingsFromScripts(mainScripts);
-  if (!accords) accords = extractAccordsFromScripts(mainScripts);
-  if (bars && accords) return { bars, mainAccords: accords };
-
-  const iframeSrcs = extractIframeSrcs(mainHtml, baseUrl);
-  for (const src of iframeSrcs) {
-    try {
-      const r = await fetch(src, {
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)",
-          "Referer": baseUrl,
-          "Accept": "text/html,application/xhtml+xml",
-        },
-      });
-      if (!r.ok) continue;
-      const html = await r.text();
-      if (!bars) bars = extractPerfumeRatingBars(stripHtmlForGemini(html));
-      if (!accords) accords = extractMainAccordsFromText(stripHtmlForGemini(html));
-      if (!bars || !accords) {
-        const scripts = extractScriptBlobs(html);
-        if (!bars) bars = extractRatingsFromScripts(scripts);
-        if (!accords) accords = extractAccordsFromScripts(scripts);
-      }
-      if (bars && accords) break;
-    } catch (e) { /* این iframe جواب نداد — سراغ بعدی */ }
-  }
-  return { bars, mainAccords: accords };
-}
-
-// نتیجه‌ی extractPerfumeRatingBars را (در صورت پیدا شدن هرکدام) روی شیء محصولِ برگشتی از Gemini
-// می‌نشاند — این اعداد چون مستقیماً از خودِ متنِ سایتِ مبدأ خوانده شده‌اند، همیشه به عددهایی که
-// هوش مصنوعی احتمالاً حدس زده یا کمی نادرست کپی کرده، اولویت دارند (جایگزینشان می‌شوند).
-function applyRatingBarsToProduct(product, bars) {
-  if (!bars) return product;
-  if (bars.scent) { product.scentScore = String(bars.scent.score); product.scentRatings = String(bars.scent.ratings); }
-  if (bars.longevity) { product.longevityScore = String(bars.longevity.score); product.longevityRatings = String(bars.longevity.ratings); }
-  if (bars.sillage) { product.sillageScore = String(bars.sillage.score); product.sillageRatings = String(bars.sillage.ratings); }
-  return product;
-}
-
-// عکسِ هرکدام از طیف‌های رنگ (variants) را — اگر Gemini از روی نشانه‌های [IMG] صفحه، آدرسِ عکسِ
-// همان رنگ را تشخیص داده باشد — دانلود و مستقیماً روی Cloudinary خودمان آپلود می‌کند (نه یک
-// لینکِ خارجیِ خام)، دقیقاً همان اتفاقی که برای عکسِ اصلیِ محصول می‌افتد. حداکثر ۱۲ رنگِ اول
-// پردازش می‌شود (برای جلوگیری از کندیِ بیش از حد در صفحاتی با طیفِ خیلی زیاد).
-async function mirrorVariantImages(variants, baseUrl) {
-  if (!Array.isArray(variants) || variants.length === 0) return [];
-  const LIMIT = 12;
-  const toProcess = variants.slice(0, LIMIT);
-  const rest = variants.slice(LIMIT);
-  const mirrored = await Promise.all(
-    toProcess.map(async (v) => {
-      const label = (v && v.label) || '';
-      const hex = (v && v.hex) || '';
-      const rawUrl = v && v.imageUrl;
-      if (!rawUrl) return { label, hex, image: '' };
-      try {
-        const resolved = new URL(rawUrl, baseUrl).toString();
-        const uploadedUrl = await mirrorRemoteImageToCloudinary(resolved);
-        return { label, hex, image: uploadedUrl || '' };
-      } catch (e) {
-        return { label, hex, image: '' };
-      }
-    })
-  );
-  return [...mirrored, ...rest.map((v) => ({ label: (v && v.label) || '', hex: (v && v.hex) || '', image: '' }))];
-}
-
-async function fetchProductPage(url) {
-  const r = await fetch(url.toString(), {
-    method: 'GET',
-    redirect: 'follow',
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)',
-      'Accept': 'text/html,application/xhtml+xml',
-    },
-  });
-  if (!r.ok) throw new Error(`صفحه محصول قابل دریافت نیست (${r.status})`);
-  const contentType = r.headers.get('content-type') || '';
-  if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) throw new Error('لینک واردشده صفحه HTML محصول نیست');
-  const html = await r.text();
-  return { html, finalUrl: r.url || url.toString() };
-}
-
-async function callGeminiText(prompt) {
+  const imageMatch = dataUri.match(/^data:i
+  async function callGeminiText(prompt) {
   if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
   const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
   const r = await fetch(endpoint, {
@@ -971,7 +267,7 @@ app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res
     res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
   } catch (e) {
     console.error('Gemini URL extraction error:', e);
-    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
+    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: friendlyAiError(e) });
   }
 });
 
@@ -998,13 +294,13 @@ app.post('/api/ai/extract-product-from-image', auth, requireAdmin, async (req, r
       }),
     });
     const data = await r.json();
-    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini' });
+    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) ? friendlyAiError(new Error(data.error.message)) : 'خطا در ارتباط با Gemini' });
     const text = (data.candidates || []).flatMap((c) => c.content && c.content.parts || []).map((p) => p.text || '').join('').trim();
     if (!text) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
     res.json(parseJsonObject(text));
   } catch (e) {
     console.error('Gemini image extraction error:', e);
-    res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
+    res.status(502).json({ error: friendlyAiError(e) });
   }
 });
 
@@ -1019,164 +315,1195 @@ app.post('/api/ai/import-product-url', auth, requireAdmin, async (req, res) => {
     const product = await callGeminiText(buildGeminiProductPrompt(sourceText, page.finalUrl));
     // نمودارِ Ratings (رایحه/ماندگاری/پخش بو) و بخشِ «Main accords» را با چهار لایه‌ی جست‌وجو
     // (متنِ صفحه، JSONِ تعبیه‌شده در صفحه، متنِ iframeها، JSONِ تعبیه‌شده در iframeها) پیدا
-    // می‌کنیم؛ این مقادیر — چون مستقیماً از خودِ منبع خوانده شده‌اند — جایگزینِ حدسِ Gemini می‌شوند.
-    const { bars, mainAccords: mainAccordsFound } = await analyzeFragranceWidget(page.html, sourceText, page.finalUrl);
-    applyRatingBarsToProduct(product, bars);
-    if (mainAccordsFound) product.mainAccords = mainAccordsFound;
-    // طیف‌های رنگ (variants) که Gemini از روی نشانه‌های [IMG] صفحه تشخیص داده را — اگر عکسِ
-    // مجزایی برایشان پیدا شده — دانلود و روی Cloudinary آپلود می‌کنیم.
-    product.variants = await mirrorVariantImages(product.variants, page.finalUrl);
-    // همان منطقِ mirror کردنِ عکسِ اصلیِ صفحه (og:image/twitter:image) روی Cloudinary — این
-    // endpoint همان چیزی است که فرانت‌اند برای «ورود محصول با لینک» واقعاً صدا می‌زند.
-    const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
-    let mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
-    if (!mirroredImageUrl && product.mainImageUrl) {
-      try {
-        const resolved = new URL(product.mainImageUrl, page.finalUrl).toString();
-        mirroredImageUrl = await mirrorRemoteImageToCloudinary(resolved);
-      } catch (e) { /* لینکِ پیشنهادیِ Gemini معتبر نبود — بدون عکس ادامه می‌دهیم */ }
-    }
-    delete product.mainImageUrl;
-    res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
+    // می‌کنیم؛ این مقادیر — چون مستقیماً از خودِ منبع خوانده شده‌اند — جایگزینِ حدسِ Gemini می‌شون
+د.  const imageMatch = dataUri.match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/);
+  const videoMatch = dataUri.match(/^data:video\/(mp4|webm|quicktime|ogg|mov);base64,(.+)$/);
+  if (!imageMatch && !videoMatch) throw new Error('فرمت فایل پشتیبانی نمی‌شود');
+  const isVideo = !!videoMatch;
+  const dataPart = isVideo ? videoMatch[2] : imageMatch[2];
+  const approxBytes = Math.ceil((dataPart.length * 3) / 4);
+  const maxBytes = isVideo ? 30 * 1024 * 1024 : 10 * 1024 * 1024;
+  if (approxBytes > maxBytes) throw new Error(isVideo ? 'حجم ویدیو بیش از حد مجاز است (حداکثر ۳۰ مگابایت)' : 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)');
+  const timestamp = Math.floor(Date.now() / 1000);
+  const folder = 'maison-store';
+  const signature = crypto.createHash('sha1').update(`folder=${folder}&timestamp=${timestamp}${CLOUDINARY_API_SECRET}`).digest('hex');
+  const body = new URLSearchParams({ file: dataUri, api_key: CLOUDINARY_API_KEY, timestamp: String(timestamp), folder, signature });
+  const resourceType = isVideo ? 'video' : 'image';
+  const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+  const data = await cloudRes.json();
+  if (!cloudRes.ok || !data.secure_url) throw new Error((data && data.error && data.error.message) || 'آپلود Cloudinary ناموفق بود');
+  return { url: data.secure_url, type: isVideo ? 'video' : 'image' };
+}
+
+async function mirrorRemoteImageToCloudinary(remoteUrl) {
+  try {
+    if (!remoteUrl || typeof remoteUrl !== 'string' || !/^https?:\/\//i.test(remoteUrl)) return null;
+    const imgRes = await fetch(remoteUrl);
+    if (!imgRes.ok) return null;
+    const contentType = imgRes.headers.get('content-type') || '';
+    if (!contentType.startsWith('image/')) return null;
+    const buffer = Buffer.from(await imgRes.arrayBuffer());
+    if (buffer.length > 10 * 1024 * 1024) return null;
+    const mimeForDataUri = contentType.split(';')[0].replace('image/jpg', 'image/jpeg');
+    const supported = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+    if (!supported.includes(mimeForDataUri)) return null;
+    const dataUri = `data:${mimeForDataUri};base64,${buffer.toString('base64')}`;
+    const cleaned = await removeBackgroundFromDataUri(dataUri);
+    const uploaded = await uploadDataUriToCloudinary(cleaned);
+    return uploaded.url;
+  } catch (e) { console.error('mirrorRemoteImageToCloudinary failed:', e.message); return null; }
+}
+
+app.post('/api/upload', auth, requireAdmin, async (req, res) => {
+  const { imageBase64, removeBackground } = req.body || {};
+  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'فایل معتبر نیست' });
+  try {
+    const isVideo = imageBase64.startsWith('data:video/');
+    const dataToUpload = removeBackground && !isVideo ? await removeBackgroundFromDataUri(imageBase64) : imageBase64;
+    res.json(await uploadDataUriToCloudinary(dataToUpload));
   } catch (e) {
-    console.error('Gemini URL extraction error:', e);
-    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
+    const statusMap = { 'تنظیمات Cloudinary روی سرور کامل نشده است': 500, 'فرمت فایل پشتیبانی نمی‌شود': 400 };
+    res.status(statusMap[e.message] || (e.message && e.message.includes('حجم') ? 413 : 502)).json({ error: e.message || 'آپلود ناموفق بود' });
   }
 });
 
-app.post('/api/ai/analyze-perfume-image', auth, requireAdmin, async (req, res) => {
+// Existing image extraction endpoint — Gemini free-tier model
+app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
   if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
-  const imageBase64 = req.body && req.body.imageBase64;
+  const { imageBase64 } = req.body || {};
   if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
   const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
-  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، jpeg، webp)' });
-  if (Math.ceil((match[2].length * 3) / 4) > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
+  if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، webp)' });
+  const approxBytes = Math.ceil((match[2].length * 3) / 4);
+  if (approxBytes > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
   try {
     const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-    const r = await fetch(endpoint, {
+    const aiRes = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [
           { inline_data: { mime_type: match[1], data: match[2] } },
-          { text: buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار و هرگز حدس نزن.', 'image') },
+          { text: buildProductExtractionPrompt() },
         ] }],
         generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
       }),
     });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || `خطا در ارتباط با Gemini (${r.status})` });
-    const resultText = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
-    if (!resultText) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
-    res.json(parseJsonObject(resultText));
+    const aiData = await aiRes.json().catch(() => ({}));
+    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) ? friendlyAiError(new Error(aiData.error.message)) : `خطا در ارتباط با Gemini (${aiRes.status})` });
+    const textBlock = (aiData.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((c) => c.text || '').join('').trim();
+    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    res.json(parseJsonObject(textBlock));
   } catch (e) {
-    console.error('Gemini perfume image error:', e);
-    res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
+    console.error('Gemini image extraction error:', e);
+    res.status(502).json({ error: friendlyAiError(e) });
   }
 });
 
-app.get('/api/settings', noCache, withDb(async (req, res) => { const db = await readDB(); res.json(db.settings || {}); }));
-app.put('/api/settings', auth, requireAdmin, withDb(async (req, res) => { const db = await readDB(); db.settings = { ...db.settings, ...(req.body || {}) }; await writeDB(db); res.json(db.settings); }));
-
-function computeSalesCounts(orders) {
-  const counts = {};
-  (orders || []).forEach((order) => {
-    if (order.status !== 'paid') return;
-    (order.items || []).forEach((item) => { if (!item || !item.id) return; counts[item.id] = (counts[item.id] || 0) + (Number(item.qty) || 0); });
-  });
-  return counts;
+function buildProductExtractionPrompt() {
+  return `عکسی از محصول/جعبه/برچسب/صفحه مرجع محصول دریافت کرده‌ای. هدف: پر کردن فیلدهای فرم محصول در پنل مدیریت.
+اگر چیزی مطمئن نیستی یا در تصویر دیده نمی‌شود، همان فیلد را خالی یا آرایه خالی بگذار؛ هرگز حدس نزن.
+تمام فیلدهای متنی فارسی باشند، به‌جز nameEn که دقیقاً به زبان اصلی بماند، concentration که یکی از مقادیر استاندارد انگلیسی باشد، و mainAccords که همان کلماتِ انگلیسیِ اصلیِ «Main accords» (در صورت وجود روی تصویر) با ویرگول جدا از هم باشد.
+priceToman فقط وقتی عدد خام قیمت تومان/ریال روی تصویر واضح است. ارز خارجی را تبدیل نکن و در referencePriceNote نگه دار.
+categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, electronics یا خالی.
+فقط JSON معتبر و بدون Markdown برگردان:
+{
+"name":"","nameEn":"","brand":"","categoryGuess":"","subcategoryHint":"","priceToman":"","referencePriceNote":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":"","variants":[]
+}
+variants آرایه‌ای از {"label":"","hex":""} باشد.`;
 }
 
-app.get('/api/products', noCache, withDb(async (req, res) => {
-  const db = await readDB();
-  const salesCounts = computeSalesCounts(db.orders);
-  res.json((db.products || []).map((p) => ({ ...p, salesCount: salesCounts[p.id] || 0 })));
-}));
+function parseJsonObject(text) {
+  const cleaned = String(text || '').replace(/```json/gi, '').replace(/```/g, '').trim();
+  const start = cleaned.indexOf('{');
+  const end = cleaned.lastIndexOf('}');
+  return JSON.parse(start >= 0 && end >= start ? cleaned.slice(start, end + 1) : cleaned);
+}
 
-app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
-  const p = req.body || {};
-  if (!p.name || !p.price) return res.status(400).json({ error: 'قیمت و نام محصول الزامی است' });
-  const db = await readDB();
-  const id = 'p' + db.nextProductId++;
-  const product = {
-    id, name: p.name, nameEn: p.nameEn || '', brand: p.brand || '', category: p.category || 'perfume', subcategory: p.subcategory || '', type: p.type || '',
-    facets: (p.facets && typeof p.facets === 'object') ? p.facets : {}, price: Number(p.price), description: p.description || '', properties: p.properties || '', ingredients: p.ingredients || '',
-    topNotes: p.topNotes || '', middleNotes: p.middleNotes || '', baseNotes: p.baseNotes || '', mainAccords: p.mainAccords || '',
-    scentScore: Number.isFinite(Number(p.scentScore)) ? Number(p.scentScore) : 0, scentRatings: Number.isFinite(Number(p.scentRatings)) ? Number(p.scentRatings) : 0,
-    longevityScore: Number.isFinite(Number(p.longevityScore)) ? Number(p.longevityScore) : 0, longevityRatings: Number.isFinite(Number(p.longevityRatings)) ? Number(p.longevityRatings) : 0,
-    sillageScore: Number.isFinite(Number(p.sillageScore)) ? Number(p.sillageScore) : 0, sillageRatings: Number.isFinite(Number(p.sillageRatings)) ? Number(p.sillageRatings) : 0,
-    perfumer: p.perfumer || '', countryOfOrigin: p.countryOfOrigin || '', yearMade: p.yearMade || '', fragranticaRating: p.fragranticaRating || '', volume: p.volume || '', barcode: p.barcode || '', discountPercent: Number(p.discountPercent) || 0,
-    image: p.image || '', imageFit: p.imageFit === 'cover' ? 'cover' : 'contain', imagePosX: Number.isFinite(Number(p.imagePosX)) ? Number(p.imagePosX) : 50, imagePosY: Number.isFinite(Number(p.imagePosY)) ? Number(p.imagePosY) : 50,
-    imageZoom: Number.isFinite(Number(p.imageZoom)) && Number(p.imageZoom) > 0 ? Number(p.imageZoom) : 1,
-    ...(Array.isArray(p.variants) && p.variants.length > 0 ? { variants: p.variants } : {}),
-  };
-  db.products.push(product); await writeDB(db); res.json(product);
-}));
-
-app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
-  const db = await readDB();
-  const idx = db.products.findIndex((x) => x.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'محصول یافت نشد' });
-  const p = req.body || {}; const old = db.products[idx];
-  const updated = {
-    ...old, name: p.name ?? old.name, nameEn: p.nameEn !== undefined ? p.nameEn : (old.nameEn || ''), brand: p.brand ?? old.brand, category: p.category ?? old.category,
-    subcategory: p.subcategory !== undefined ? p.subcategory : old.subcategory, type: p.type !== undefined ? p.type : old.type, facets: p.facets !== undefined ? p.facets : old.facets,
-    price: p.price !== undefined ? Number(p.price) : old.price, description: p.description ?? old.description, properties: p.properties !== undefined ? p.properties : old.properties,
-    ingredients: p.ingredients !== undefined ? p.ingredients : old.ingredients, topNotes: p.topNotes !== undefined ? p.topNotes : (old.topNotes || ''), middleNotes: p.middleNotes !== undefined ? p.middleNotes : (old.middleNotes || ''), baseNotes: p.baseNotes !== undefined ? p.baseNotes : (old.baseNotes || ''),
-    mainAccords: p.mainAccords !== undefined ? p.mainAccords : (old.mainAccords || ''),
-    scentScore: p.scentScore !== undefined ? (Number(p.scentScore) || 0) : (old.scentScore || 0), scentRatings: p.scentRatings !== undefined ? (Number(p.scentRatings) || 0) : (old.scentRatings || 0),
-    longevityScore: p.longevityScore !== undefined ? (Number(p.longevityScore) || 0) : (old.longevityScore || 0), longevityRatings: p.longevityRatings !== undefined ? (Number(p.longevityRatings) || 0) : (old.longevityRatings || 0),
-    sillageScore: p.sillageScore !== undefined ? (Number(p.sillageScore) || 0) : (old.sillageScore || 0), sillageRatings: p.sillageRatings !== undefined ? (Number(p.sillageRatings) || 0) : (old.sillageRatings || 0),
-    perfumer: p.perfumer !== undefined ? p.perfumer : (old.perfumer || ''), countryOfOrigin: p.countryOfOrigin !== undefined ? p.countryOfOrigin : (old.countryOfOrigin || ''), yearMade: p.yearMade !== undefined ? p.yearMade : (old.yearMade || ''), fragranticaRating: p.fragranticaRating !== undefined ? p.fragranticaRating : (old.fragranticaRating || ''), volume: p.volume !== undefined ? p.volume : (old.volume || ''), barcode: p.barcode !== undefined ? p.barcode : (old.barcode || ''),
-    discountPercent: p.discountPercent !== undefined ? (Number(p.discountPercent) || 0) : old.discountPercent, image: p.image ?? old.image, imageFit: p.imageFit !== undefined ? (p.imageFit === 'cover' ? 'cover' : 'contain') : (old.imageFit || 'contain'), imagePosX: p.imagePosX !== undefined ? (Number(p.imagePosX) || 50) : (old.imagePosX ?? 50), imagePosY: p.imagePosY !== undefined ? (Number(p.imagePosY) || 50) : (old.imagePosY ?? 50), imageZoom: p.imageZoom !== undefined ? (Number(p.imageZoom) || 1) : (old.imageZoom ?? 1),
-  };
-  if (Array.isArray(p.variants) && p.variants.length > 0) updated.variants = p.variants;
-  else if (p.variants !== undefined) delete updated.variants;
-  db.products[idx] = updated; await writeDB(db); res.json(updated);
-}));
-
-app.delete('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
-  const db = await readDB(); const before = db.products.length; db.products = db.products.filter((x) => x.id !== req.params.id);
-  if (db.products.length === before) return res.status(404).json({ error: 'محصول یافت نشد' });
-  await writeDB(db); res.json({ ok: true });
-}));
-
-app.get('/api/orders', auth, noCache, withDb(async (req, res) => {
-  const db = await readDB();
-  res.json(db.orders.filter((o) => o.user_id === req.user.id).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
-}));
-
-app.post('/api/payment/request', auth, withDb(async (req, res) => {
-  const { items, amount, description } = req.body || {};
-  if (!amount || amount < 1000) return res.status(400).json({ error: 'مبلغ نامعتبر است' });
-  if (!ZARINPAL_MERCHANT_ID) return res.status(500).json({ error: 'ZARINPAL_MERCHANT_ID تنظیم نشده است' });
+// پیام‌های خطای خامِ سرویس‌های هوش مصنوعی (Gemini/Claude) گاهی چند پاراگراف طولانیِ انگلیسی و
+// فنی هستند (مثلاً وقتی سهمیه‌ی یک مدل تمام شده) که برای مدیرِ فارسی‌زبانِ پنل هیچ کمکی نمی‌کند
+// و فقط گیج‌کننده است. این تابع چنین خطاهایی را به یک پیامِ کوتاه و قابلِ‌اقدام تبدیل می‌کند؛ خطاهای
+// کوتاه و از قبل فارسی/قابل‌فهم را دست‌نخورده برمی‌گرداند.
+function friendlyAiError(err) {
+  const raw = (err && err.message) || String(err || '');
+  if (/quota|rate.?limit|429/i.test(raw)) {
+    return 'سهمیه یا محدودیتِ استفاده‌ی سرویسِ هوش مصنوعی برای این مدل تمام شده — چند دقیقه صبر کن، یا در تنظیماتِ Render مقدارِ GEMINI_MODEL را بررسی کن (نباید روی یک مدلِ «تولیدِ عکس» مثل gemini-…-image تنظیم شده باشد؛ این ابزارها به یک مدلِ متنی/بینایی مثل gemini-3.5-flash نیاز دارند).';
+  }
+  if (raw.length > 220) {
+    return raw.slice(0, 200).trim() + '…';
+  }
+  return raw || 'خطای نامشخصی رخ داد';
+}const FRAGANTY_QUOTA_MESSAGE = 'سهمیه ماهانه رایگان ai.fraganty تمام شده — تا ماه بعد صبر کن یا از پلن پولی بگیر';
+app.get('/api/ai/search-perfume', auth, requireAdmin, async (req, res) => {
+  if (!FRAGANTY_API_KEY) return res.status(500).json({ error: 'کلید FRAGANTY_API_KEY روی سرور تنظیم نشده است' });
+  const q = (req.query.q || '').trim();
+  if (!q) return res.status(400).json({ error: 'نام محصول را وارد کن' });
   try {
-    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/request.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount, callback_url: CALLBACK_URL, description: description || 'خرید از فروشگاه' }) });
-    const data = await zRes.json();
-    if (data.data && data.data.code === 100) {
-      const authority = data.data.authority; const db = await readDB();
-      db.orders.push({ id: db.nextOrderId++, user_id: req.user.id, items: items || [], amount, authority, ref_id: null, status: 'pending', created_at: new Date().toISOString() });
-      await writeDB(db); return res.json({ paymentUrl: `https://www.zarinpal.com/pg/StartPay/${authority}` });
-    }
-    res.status(400).json({ error: 'خطا در اتصال به درگاه پرداخت', detail: data });
-  } catch (e) { res.status(500).json({ error: 'خطای سرور در ارتباط با درگاه' }); }
-}));
-
-app.get('/payment/callback', async (req, res) => {
-  const { Authority, Status } = req.query; let db;
-  try { db = await readDB(); } catch { return res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
-  const order = db.orders.find((o) => o.authority === Authority);
-  if (!order) return res.redirect(`${FRONTEND_URL}/payment/result?status=notfound`);
-  if (Status !== 'OK') { order.status = 'canceled'; await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=canceled`); }
-  try {
-    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/verify.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount: order.amount, authority: Authority }) });
-    const data = await zRes.json();
-    if (data.data && (data.data.code === 100 || data.data.code === 101)) { order.status = 'paid'; order.ref_id = String(data.data.ref_id); await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=success&ref=${data.data.ref_id}`); }
-    order.status = 'failed'; await writeDB(db); res.redirect(`${FRONTEND_URL}/payment/result?status=failed`);
-  } catch { res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
+    const fRes = await fetch(`${FRAGANTY_BASE_URL}/api/perfumes?q=${encodeURIComponent(q)}&limit=8`, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
+    const fData = await fRes.json();
+    if (!fRes.ok) return res.status(fRes.status === 429 ? 429 : 502).json({ error: fRes.status === 429 ? FRAGANTY_QUOTA_MESSAGE : (fData && fData.error) || 'خطا در ارتباط با ai.fraganty' });
+    const results = (Array.isArray(fData.data) ? fData.data : []).filter((p) => p && p.id).map((p) => ({ id: p.id, name: p.name, brand: p.brand, year: p.year, image: p.image }));
+    res.json({ data: results });
+  } catch (e) { console.error('Fraganty search error:', e); res.status(500).json({ error: 'خطای سرور هنگام جستجو در ai.fraganty' }); }
 });
 
-app.get('/', (req, res) => res.send('Store API is running'));
+app.get('/api/ai/perfume-details', auth, requireAdmin, async (req, res) => {
+  if (!FRAGANTY_API_KEY) return res.status(500).json({ error: 'کلید FRAGANTY_API_KEY روی سرور تنظیم نشده است' });
+  const slug = (req.query.slug || '').trim();
+  if (!slug) return res.status(400).json({ error: 'شناسه محصول نامعتبر است' });
+  try {
+    const fRes = await fetch(`${FRAGANTY_BASE_URL}/api/perfumes/${encodeURIComponent(slug)}`, { headers: { 'X-API-Key': FRAGANTY_API_KEY } });
+    const fData = await fRes.json();
+    if (!fRes.ok) return res.status(fRes.status === 429 ? 429 : fRes.status === 404 ? 404 : 502).json({ error: fRes.status === 429 ? FRAGANTY_QUOTA_MESSAGE : fRes.status === 404 ? 'این محصول در ai.fraganty پیدا نشد — یک نتیجه دیگر را امتحان کن' : (fData && fData.error) || 'خطا در دریافت جزئیات از ai.fraganty' });
+    if (!fData || !fData.name) return res.status(502).json({ error: 'این محصول در ai.fraganty اطلاعات کاملی ندارد — یک نتیجه دیگر را امتحان کن یا فیلدها را دستی پر کن' });
+    res.json(fData);
+  } catch (e) { console.error('Fraganty details error:', e); res.status(500).json({ error: 'خطای سرور هنگام دریافت جزئیات از ai.fraganty' }); }
+});
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) => {
+  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'کلید ANTHROPIC_API_KEY روی سرور تنظیم نشده است' });
+  const { name, brand, description, accords, seasons, dayNight, gender, rating } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'نام محصول الزم است' });
+  const instruction = `اطلاعات زیر درباره یک عطر است. یک JSON معتبر بدون Markdown برگردان.
+نام: ${name}
+برند: ${brand || ''}
+جنسیت: ${gender || ''}
+امتیاز کاربران: ${rating || ''}
+توضیح اصلی: ${description || ''}
+آکوردها: ${Array.isArray(accords) ? accords.map((a) => typeof a === 'string' ? a : a.name).filter(Boolean).join('، ') : ''}
+فصل‌ها: ${JSON.stringify(seasons || '')}
+زمان استفاده روز/شب: ${JSON.stringify(dayNight || '')}
+ساختار دقیق: {"description":"توضیح کوتاه دو تا سه جمله‌ای کاملاً فارسی","properties":"چند ویژگی کوتاه فارسی، هرکدام در خط جدا، حداکثر ۵ خط"}`;
+  try {
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 700, messages: [{ role: 'user', content: instruction }] }) });
+    const aiData = await aiRes.json();
+    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) ? friendlyAiError(new Error(aiData.error.message)) : 'خطا در ارتباط با سرویس هوش مصنوعی' });
+    const textBlock = (aiData.content || []).find((c) => c.type === 'text');
+    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
+    const parsed = parseJsonObject(textBlock.text);
+    res.json({ description: parsed.description || '', properties: parsed.properties || '' });
+  } catch (e) { console.error('AI translate-perfume-text error:', e); res.status(500).json({ error: 'خطای سرور هنگام ترجمه توضیحات' }); }
+});
+
+async function lookupOpenFacts(code) {
+  const bases = ['https://world.openbeautyfacts.org/api/v2/product', 'https://world.openfoodfacts.org/api/v2/product'];
+  for (const base of bases) {
+    try {
+      const r = await fetch(`${base}/${encodeURIComponent(code)}.json`);
+      if (!r.ok) continue;
+      const data = await r.json();
+      if (!data || data.status !== 1 || !data.product) continue;
+      const p = data.product;
+      const title = (p.product_name || p.product_name_en || p.generic_name || '').trim();
+      if (!title) continue;
+      const brand = (p.brands || '').split(',')[0].trim();
+      const image = p.image_front_url || p.image_url || '';
+      const ingredients = (p.ingredients_text || p.ingredients_text_en || '').trim();
+      const volMatch = (p.quantity || p.product_quantity || '').toString().match(/([\d.,]+)\s*m?l\b/i);
+      const volume = volMatch ? volMatch[1].replace(',', '.') : '';
+      return { title, brand, image, ingredients, volume };
+    } catch (e) { console.error('Open Facts lookup failed:', base, e.message); }
+  }
+  return null;
+}
+
+async function identifyBarcodeWithAI(code) {
+  if (!ANTHROPIC_API_KEY) return null;
+  const instruction = `کد بارکد زیر متعلق به یک محصول است: ${code}
+با جستجوی وب، محصول واقعی متناظر را با اطمینان شناسایی کن. اگر مطمئن نیستی حدس نزن.
+فقط JSON معتبر: {"found":true,"isPerfume":false,"name":"","nameEn":"","brand":"","imageUrl":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":""}`;
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 2000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: instruction }] }) });
+  const aiData = await aiRes.json();
+  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
+  const textCombined = (aiData.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
+  if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
+  const parsed = parseJsonObject(textCombined);
+  if (!parsed || !parsed.found || !parsed.name) return null;
+  return parsed;
+}
+
+// جستجوی عکسِ محصول (یا یک رنگِ خاص از محصول) در اینترنت.
+//
+// نکته‌ی مهم: Gemini 3.5 Flash از Google Search grounding پشتیبانی می‌کند، اما
+// «Google Image Search grounding» مخصوص مدل‌های Image است. بنابراین برای اینکه
+// این قابلیت واقعاً روی همان Gemini 3.5 Flash متنی کار کند، ابتدا Gemini 3.5 Flash
+// با Google Search صفحات واقعی و مرتبط را پیدا می‌کند؛ سپس سرور عکس‌های واقعیِ همان
+// صفحات (og:image / twitter:image / JSON-LD / img / background-image) را استخراج،
+ // اعتبارسنجی و روی Cloudinary آینه می‌کند. به این ترتیب دیگر به
+// gemini-3.1-flash-image وابسته نیست و quota مدل تولید تصویر مصرف نمی‌شود.
+async function searchProductImageCandidates(query) {
+  if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
+
+  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const instruction = `تو مسئول پیدا کردن منبع واقعیِ عکس محصول برای پنل مدیریت Jordan Gallery هستی.
+عبارت جستجو: "${query}"
+
+با Google Search چند صفحه‌ی واقعی و معتبر پیدا کن که دقیقاً همین محصول یا همین shade/رنگ/شماره را نمایش می‌دهند.
+اولویت با صفحه رسمی برند، فروشگاه معتبر، یا صفحه محصول شناخته‌شده است.
+اگر عبارت شامل نام یا شماره رنگ است، همان رنگ/شماره دقیق را اولویت بده.
+صفحه‌ای که فقط محصول مشابه، برند دیگر، لوگو، بنر، مقاله عمومی یا محتوای نامرتبط دارد انتخاب نکن.
+خودت تصویر تولید نکن؛ فقط منابع واقعی وب را پیدا کن.
+پاسخ متنی لازم نیست؛ ما آدرس صفحات پیدا شده را از groundingMetadata می‌خوانیم.`;
+
+  const aiRes = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: instruction }] }],
+      tools: [{ google_search: {} }],
+      generationConfig: { temperature: 0.1 },
+    }),
+  });
+    });
+
+  const aiData = await aiRes.json().catch(() => ({}));
+  if (!aiRes.ok) {
+    throw new Error((aiData && aiData.error && aiData.error.message) || `خطا در ارتباط با Gemini Search (${aiRes.status})`);
+  }
+
+  const candidates = Array.isArray(aiData.candidates) ? aiData.candidates : [];
+  const sourcePages = [];
+  const seenPages = new Set();
+
+  for (const candidate of candidates) {
+    const metadata = candidate && candidate.groundingMetadata;
+    const chunks = metadata && Array.isArray(metadata.groundingChunks) ? metadata.groundingChunks : [];
+    for (const chunk of chunks) {
+      const web = chunk && chunk.web ? chunk.web : null;
+      const source = web && (web.uri || web.url) ? String(web.uri || web.url) : '';
+      const title = web && web.title ? String(web.title) : '';
+      if (!/^https?:\/\//i.test(source)) continue;
+      if (seenPages.has(source)) continue;
+      seenPages.add(source);
+      sourcePages.push({ source, title });
+      if (sourcePages.length >= 10) break;
+    }
+    if (sourcePages.length >= 10) break;
+  }
+
+  if (sourcePages.length === 0) return [];
+
+  // از صفحات واقعی، عکس‌های اصلی محصول را استخراج می‌کنیم. این مرحله عمداً بعد از
+  // Google Search انجام می‌شود تا مدل متنی 3.5 Flash همان نقشی را داشته باشد که در
+  // سایر جستجوهای هوشمند سایت دارد، ولی عکس نهایی مستقیماً از منبع واقعی بیاید.
+  const allImages = [];
+  const seenImages = new Set();
+
+  for (const page of sourcePages) {
+    try {
+      const imageCandidates = await extractProductImagesFromPage(page.source, query);
+      for (const image of imageCandidates) {
+        if (!image || !image.url || seenImages.has(image.url)) continue;
+        seenImages.add(image.url);
+        allImages.push({
+          url: image.url,
+          source: page.source,
+          title: image.title || page.title || '',
+          score: image.score || 0,
+        });
+        if (allImages.length >= 12) break;
+      }
+    } catch (e) {
+      // یک صفحه‌ی فروشگاهی ممکن است ضدبات/403/timeout باشد؛ سراغ منبع بعدی می‌رویم.
+    }
+    if (allImages.length >= 12) break;
+  }
+
+  return allImages
+    .sort((a, b) => (b.score || 0) - (a.score || 0))
+    .slice(0, 6)
+    .map(({ url, source, title }) => ({ url, source, title }));
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || '')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#x2F;/gi, '/')
+    .replace(/&#47;/gi, '/');
+}
+
+function absoluteHttpUrl(rawUrl, baseUrl) {
+  try {
+    const cleaned = decodeHtmlEntities(String(rawUrl || '').trim());
+    if (!cleaned || /^data:/i.test(cleaned) || /^blob:/i.test(cleaned)) return '';
+    const u = new URL(cleaned, baseUrl);
+    if (!/^https?:$/i.test(u.protocol)) return '';
+    return u.toString();
+  } catch (e) {
+    return '';
+  }
+}
+
+function imageUrlLooksUseful(url) {
+  if (!url) return false;
+  const lower = url.toLowerCase();
+  if (/\b(icon|favicon|sprite|avatar|logo|placeholder|loader|spinner|pixel|tracking|badge|rating|star)\b/.test(lower)) return false;
+  return true;
+}
+
+function imageRelevanceScore(url, label, query) {
+  const haystack = `${url} ${label} ${query}`.toLowerCase();
+  let score = 0;
+  if (/\b(og:image|product|pdp|sku|item|beauty|cosmetic|makeup|foundation|lipstick|shade|swatch)\b/i.test(haystack)) score += 3;
+  if (/\.(jpe?g|png|webp)(?:[?#]|$)/i.test(url)) score += 2;
+  if (/\b(1200|1000|800|600|500)\b/.test(url)) score += 1;
+  if (/\b(thumbnail|thumb|small|tiny)\b/i.test(haystack)) score -= 2;
+  if (/\b(banner|hero|campaign|advert|promo)\b/i.test(haystack)) score -= 3;
+  return score;
+}
+
+async function extractProductImagesFromPage(pageUrl, query) {
+  const r = await fetch(pageUrl, {
+    method: 'GET',
+    redirect: 'follow',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryImageSearch/1.0)',
+      'Accept': 'text/html,application/xhtml+xml',
+    },
+  });
+  if (!r.ok) throw new Error(`صفحه تصویر قابل دریافت نیست (${r.status})`);
+  const contentType = r.headers.get('content-type') || '';
+  if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) throw new Error('منبع جستجو صفحه HTML نیست');
+  const html = await r.text();
+  const baseUrl = r.url || pageUrl;
+  const found = [];
+  const push = (rawUrl, label, priority) => {
+    const url = absoluteHttpUrl(rawUrl, baseUrl);
+    if (!url || !imageUrlLooksUseful(url)) return;
+    const score = priority + imageRelevanceScore(url, label, query);
+    const existing = found.find((item) => item.url === url);
+    if (existing) {
+      existing.score = Math.max(existing.score, score);
+      if (!existing.title && label) existing.title = label;
+      return;
+    }
+    found.push({ url, title: label || '', score });
+  };
+
+  // Open Graph
+  const ogRegex = /<meta\b[^>]*\b(?:property|name)\s*=\s*["'](?:og:image|og:image:url|twitter:image)["'][^>]*\bcontent\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  let m;
+  while ((m = ogRegex.exec(html))) push(m[1], 'OpenGraph product image', 10);
+
+  // بعضی صفحات attribute ها را برعکس می‌نویسند.
+  const ogRegexReverse = /<meta\b[^>]*\bcontent\s*=\s*["']([^"']+)["'][^>]*\b(?:property|name)\s*=\s*["'](?:og:image|og:image:url|twitter:image)["'][^>]*>/gi;
+  while ((m = ogRegexReverse.exec(html))) push(m[1], 'OpenGraph product image', 10);
+
+  // JSON-LD / Product.image
+  const jsonLdRegex = /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  while ((m = jsonLdRegex.exec(html))) {
+    try {
+      const parsed = JSON.parse(m[1].trim());
+      const nodes = Array.isArray(parsed) ? parsed : [parsed];
+      const visit = (node) => {
+        if (!node || typeof node !== 'object') return;
+        if (node.image) {
+          const images = Array.isArray(node.image) ? node.image : [node.image];
+          for (const image of images) {
+            if (typeof image === 'string') push(image, 'JSON-LD product image', 9);
+            else if (image && typeof image === 'object' && image.url) push(image.url, 'JSON-LD product image', 9);
+          }
+        }
+        if (Array.isArray(node['@graph'])) node['@graph'].forEach(visit);
+      };
+      nodes.forEach(visit);
+    } catch (e) {
+      // JSON-LD ناقص/نامعتبر است؛ سایر روش‌های استخراج ادامه پیدا می‌کنند.
+    }
+  }
+
+  // <img> و lazy-loading attributes
+  const imgRegex = /<img\b[^>]*>/gi;
+  while ((m = imgRegex.exec(html))) {
+    const tag = m[0];
+    const attrs = {};
+    const attrRegex = /([:\w-]+)\s*=\s*["']([^"']*)["']/gi;
+    let a;
+    while ((a = attrRegex.exec(tag))) attrs[a[1].toLowerCase()] = a[2];
+
+    const label = [
+      attrs.alt,
+      attrs.title,
+      attrs['data-alt'],
+      attrs['aria-label'],
+    ].filter(Boolean).join(' ');
+
+    const candidates = [
+      attrs.src,
+      attrs['data-src'],
+      attrs['data-original'],
+      attrs['data-lazy-src'],
+      attrs['data-image'],
+      attrs['data-image-url'],
+    ].filter(Boolean);
+
+    for (const candidate of candidates) push(candidate, label, 6);
+
+    const srcsets = [
+      attrs.srcset,
+      attrs['data-srcset'],
+      attrs['data-lazy-srcset'],
+    ].filter(Boolean);
+
+    for (const srcset of srcsets) {
+      for (const item of srcset.split(',')) {
+        const parts = item.trim().split(/\s+/);
+        if (parts[0]) push(parts[0], label, 7);
+      }
+    }
+  }
+
+  // CSS background-image:url(...)
+  const bgRegex = /background-image\s*:\s*url\(\s*["']?([^"')]+)["']?\s*\)/gi;
+  while ((m = bgRegex.exec(html))) push(m[1], 'CSS product image', 4);
+
+  return found
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 12);
+}
+app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
+  const code = (req.query.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
+  const db = await readDB();
+  const ownMatch = db.products.find((p) => p.barcode && p.barcode === code);
+  if (ownMatch) return res.json({ foundInOwnDb: true, product: { id: ownMatch.id, name: ownMatch.name, category: ownMatch.category, subcategory: ownMatch.subcategory } });
+  let free = null;
+  try { free = await lookupOpenFacts(code); } catch (e) { console.error('lookupOpenFacts error:', e.message); }
+  let ai = null; let aiError = null;
+  if (ANTHROPIC_API_KEY) {
+    try { ai = await identifyBarcodeWithAI(code); if (!ai) aiError = 'محصول با جستجوی هوش مصنوعی هم شناسایی نشد'; }
+    catch (e) { aiError = e.message; console.error('identifyBarcodeWithAI failed (non-fatal):', aiError); }
+  }
+  let note = null;
+  if (!ai) note = !ANTHROPIC_API_KEY ? 'کلید هوش مصنوعی روی سرور تنظیم نشده — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی' : `غنی‌سازی با هوش مصنوعی ناموفق بود — ${aiError || ''}`;
+  if (!free && !ai) return res.json({ foundInOwnDb: false, external: null, note });
+  const rawImage = (ai && ai.imageUrl) || (free && free.image) || '';
+  const mirroredImage = rawImage ? await mirrorRemoteImageToCloudinary(rawImage) : null;
+  res.json({ foundInOwnDb: false, note, external: { found: true, source: ai ? (free ? 'ai+free' : 'ai') : 'free', isPerfume: ai ? !!ai.isPerfume : null, name: (ai && ai.name) || '', title: (ai && ai.nameEn) || (free && free.title) || '', brand: (ai && ai.brand) || (free && free.brand) || '', image: mirroredImage || rawImage || '', description: (ai && ai.description) || '', properties: (ai && ai.properties) || '', ingredients: (ai && ai.ingredients) || (free && free.ingredients) || '', volume: (ai && ai.volume) || (free && free.volume) || '', concentration: (ai && ai.concentration) || '', topNotes: (ai && ai.topNotes) || '', middleNotes: (ai && ai.middleNotes) || '', baseNotes: (ai && ai.baseNotes) || '', mainAccords: (ai && ai.mainAccords) || '', perfumer: (ai && ai.perfumer) || '', countryOfOrigin: (ai && ai.countryOfOrigin) || '', yearMade: ai && ai.yearMade ? String(ai.yearMade) : '' } });
+}));
+
+// ============================================================
+// NEW CAPABILITY #1: Product page URL -> Gemini
+// ============================================================
+function validateProductUrl(value) {
+  try {
+    const u = new URL(String(value));
+    if (!['http:', 'https:'].includes(u.protocol)) return null;
+    return u;
+  } catch { return null; }
+}
+
+function stripHtmlForGemini(html) {
+  let imgCount = 0;
+  const IMG_LIMIT = 60;
+      found.push({ url, title: label || '', score: priority + imageRelevanceScore(url, label, query) });
+  };
+
+  // OpenGraph / Twitter — معمولاً بهترین تصویر اصلی محصول.
+  for (const match of html.matchAll(/<meta[^>]+(?:property|name)=["'](?:og:image|og:image:url|twitter:image)["'][^>]+content=["']([^"']+)["'][^>]*>/gi)) {
+    push(match[1], 'product image', 10);
+  }
+
+  for (const match of html.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:image|og:image:url|twitter:image)["'][^>]*>/gi)) {
+    push(match[1], 'product image', 10);
+  }
+
+  // JSON-LD Product.image
+  for (const block of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    const raw = decodeHtmlEntities(block[1]);
+    try {
+      const json = JSON.parse(raw);
+      const walk = (value, keyName = '') => {
+        if (!value) return;
+        if (typeof value === 'string' && /image/i.test(keyName)) {
+          push(value, keyName, 8);
+          return;
+        }
+        if (Array.isArray(value)) {
+          for (const item of value) walk(item, keyName);
+          return;
+        }
+        if (typeof value === 'object') {
+          for (const [key, item] of Object.entries(value)) walk(item, key);
+        }
+      };
+      walk(json);
+    } catch (e) { /* JSON-LD خراب است؛ imgهای عادی را ادامه می‌دهیم */ }
+  }
+
+  // تصاویر واقعی داخل صفحه. srcset را هم می‌خوانیم و بزرگ‌ترین/آخرین گزینه را ترجیح می‌دهیم.
+  for (const match of html.matchAll(/<img\b[^>]*>/gi)) {
+    const tag = match[0];
+    const labelMatch = tag.match(/\b(?:alt|title|aria-label|data-name|data-color|data-testid)=["']([^"']*)["']/i);
+    const label = labelMatch ? decodeHtmlEntities(labelMatch[1]) : '';
+    const srcMatch = tag.match(/\b(?:src|data-src|data-original|data-lazy-src)=["']([^"']+)["']/i);
+    if (srcMatch) push(srcMatch[1], label, 4);
+
+    const srcsetMatch = tag.match(/\b(?:srcset|data-srcset)=["']([^"']+)["']/i);
+    if (srcsetMatch) {
+      const parts = srcsetMatch[1].split(',').map((part) => part.trim()).filter(Boolean);
+      const last = parts[parts.length - 1];
+      if (last) push(last.split(/\s+/)[0], label, 5);
+    }
+  }
+
+  // background-image سوآچ‌ها/عکس‌های محصول.
+  for (const match of html.matchAll(/background(?:-image)?\s*:\s*url\(\s*["']?([^"')]+)["']?\s*\)/gi)) {
+    push(match[1], 'background image / swatch', 2);
+  }
+
+  const dedup = new Map();
+  for (const item of found) {
+    if (!dedup.has(item.url) || dedup.get(item.url).score < item.score) {
+      dedup.set(item.url, item);
+    }
+  }
+
+  return Array.from(dedup.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8);
+}
+
+app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
+  const query = ((req.body && req.body.query) || '').trim();
+  if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
+
+  try {
+    const candidates = await searchProductImageCandidates(query);
+
+    if (candidates.length === 0) {
+      return res.json({ results: [] });
+    }
+
+    // هرکدام از نتایج را همین الان روی Cloudinary خودمان آپلود می‌کنیم — تا چیزی که مدیر در
+    // پنجره‌ی نتایج می‌بیند، دقیقاً همان چیزی باشد که با یک کلیک ذخیره می‌شود (نه یک لینکِ
+    // خارجیِ ناپایدار که ممکن است فردا از دسترس خارج شود).
+    const mirrored = await Promise.all(
+      candidates.map(async (c) => {
+        try {
+          const url = await mirrorRemoteImageToCloudinary(c.url);
+          return url ? { url, source: c.source || '' } : null;
+        } catch (e) {
+          return null;
+        }
+      })
+    );
+
+    res.json({ results: mirrored.filter(Boolean) });
+  } catch (e) {
+    console.error('search-product-image error:', e);
+    res.status(502).json({ error: friendlyAiError(e) });
+  }
+});
+
+app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
+  const code = (req.query.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'کد بارکد نامعتبر است' });
+
+  const db = await readDB();
+  const ownMatch = db.products.find((p) => p.barcode && p.barcode === code);
+
+  if (ownMatch) {
+    return res.json({
+      foundInOwnDb: true,
+      product: {
+        id: ownMatch.id,
+        name: ownMatch.name,
+        category: ownMatch.category,
+        subcategory: ownMatch.subcategory
+      }
+    });
+  }
+
+  let free = null;
+  try {
+    free = await lookupOpenFacts(code);
+  } catch (e) {
+    console.error('lookupOpenFacts error:', e.message);
+  }
+
+  let ai = null;
+  let aiError = null;
+
+  if (ANTHROPIC_API_KEY) {
+    try {
+      ai = await identifyBarcodeWithAI(code);
+      if (!ai) aiError = 'محصول با جستجوی هوش مصنوعی هم شناسایی نشد';
+    } catch (e) {
+      aiError = e.message;
+      console.error('identifyBarcodeWithAI failed (non-fatal):', aiError);
+    }
+  }
+
+  let note = null;
+  if (!ai) {
+    note = !ANTHROPIC_API_KEY
+      ? 'کلید هوش مصنوعی روی سرور تنظیم نشده — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی'
+      : `غنی‌سازی با هوش مصنوعی ناموفق بود — ${aiError || ''}`;
+  }
+
+  if (!free && !ai) {
+    return res.json({
+      foundInOwnDb: false,
+      external: null,
+      note
+    });
+  }
+
+  const rawImage = (ai && ai.imageUrl) || (free && free.image) || '';
+  const mirroredImage = rawImage
+    ? await mirrorRemoteImageToCloudinary(rawImage)
+    : null;
+
+  res.json({
+    foundInOwnDb: false,
+    note,
+    external: {
+      found: true,
+      source: ai ? (free ? 'ai+free' : 'ai') : 'free',
+      isPerfume: ai ? !!ai.isPerfume : null,
+      name: (ai && ai.name) || '',
+      title: (ai && ai.nameEn) || (free && free.title) || '',
+      brand: (ai && ai.brand) || (free && free.brand) || '',
+      image: mirroredImage || rawImage || '',
+      description: (ai && ai.description) || '',
+      properties: (ai && ai.properties) || '',
+      ingredients: (ai && ai.ingredients) || (free && free.ingredients) || '',
+      volume: (ai && ai.volume) || (free && free.volume) || '',
+      concentration: (ai && ai.concentration) || '',
+      topNotes: (ai && ai.topNotes) || '',
+      middleNotes: (ai && ai.middleNotes) || '',
+      baseNotes: (ai && ai.baseNotes) || '',
+      mainAccords: (ai && ai.mainAccords) || '',
+      perfumer: (ai && ai.perfumer) || '',
+      countryOfOrigin: (ai && ai.countryOfOrigin) || '',
+      yearMade: ai && ai.yearMade ? String(ai.yearMade) : ''
+    }
+  });
+}));
+
+// ============================================================
+// NEW CAPABILITY #1: Product page URL -> Gemini
+// ============================================================
+
+function validateProductUrl(value) {
+  try {
+    const u = new URL(String(value));
+    if (!['http:', 'https:'].includes(u.protocol)) return null;
+    return u;
+  } catch {
+    return null;
+  }
+}
+
+function stripHtmlForGemini(html) {
+  let imgCount = 0;
+  const IMG_LIMIT = 60;
+    let text = String(html || '');
+
+  text = text
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, ' ');
+
+  text = text.replace(/<img\b[^>]*>/gi, (tag) => {
+    if (imgCount >= IMG_LIMIT) return ' ';
+    imgCount += 1;
+
+    const srcMatch = tag.match(/\b(?:src|data-src|data-original|data-lazy-src)=["']([^"']+)["']/i);
+    const altMatch = tag.match(/\balt=["']([^"']*)["']/i);
+
+    const src = srcMatch ? srcMatch[1] : '';
+    const alt = altMatch ? altMatch[1] : '';
+
+    return ` تصویر محصول: ${src} ${alt} `;
+  });
+
+  text = text
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return text.slice(0, 30000);
+}
+
+async function fetchProductPage(url) {
+  const r = await fetch(url.toString(), {
+    method: 'GET',
+    redirect: 'follow',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryAI/1.0)',
+      'Accept': 'text/html,application/xhtml+xml'
+    }
+  });
+
+  if (!r.ok) {
+    throw new Error(`صفحه محصول قابل دریافت نیست (${r.status})`);
+  }
+
+  const contentType = r.headers.get('content-type') || '';
+
+  if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+    throw new Error('آدرس واردشده صفحه HTML محصول نیست');
+  }
+
+  const html = await r.text();
+
+  return {
+    html,
+    finalUrl: r.url || url.toString()
+  };
+}
+
+async function extractProductFromUrlWithGemini(pageUrl, html) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
+  }
+
+  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+
+  const cleanText = stripHtmlForGemini(html);
+
+  const prompt = `تو دستیار هوشمند ثبت محصول برای فروشگاه Jordan Gallery هستی.
+
+صفحه محصول زیر از اینترنت دریافت شده است.
+
+URL صفحه:
+${pageUrl}
+
+محتوای صفحه:
+${cleanText}
+
+اطلاعات واقعی محصول را فقط از همین صفحه استخراج کن.
+
+اگر یک مقدار در صفحه وجود ندارد، حدس نزن و مقدار خالی برگردان.
+
+پاسخ فقط JSON معتبر باشد و هیچ متن دیگری خارج از JSON ننویس.
+
+ساختار JSON:
+{
+  "name": "",
+  "nameEn": "",
+  "brand": "",
+  "category": "",
+  "subcategory": "",
+  "description": "",
+  "properties": "",
+  "ingredients": "",
+  "volume": "",
+  "concentration": "",
+  "barcode": "",
+  "imageUrl": "",
+  "images": [],
+  "topNotes": "",
+  "middleNotes": "",
+  "baseNotes": "",
+  "baseAccords": "",
+  "mainAccords": "",
+  "perfumer": "",
+  "countryOfOrigin": "",
+  "yearMade": "",
+  "isPerfume": false
+}
+
+نکات مهم:
+- نام محصول را دقیقاً از صفحه استخراج کن.
+- برند را از صفحه استخراج کن.
+- اگر محصول عطر است، نت‌های ابتدایی، میانی و پایه را استخراج کن.
+- اگر محصول آرایشی است، ویژگی‌ها، رنگ، نوع محصول و اطلاعات مربوط به آن را استخراج کن.
+- اگر چند تصویر واقعی محصول در صفحه وجود دارد، آنها را در images قرار بده.
+- imageUrl باید بهترین تصویر اصلی محصول باشد.
+- لوگوی برند، آیکون، بنر تبلیغاتی، عکس افراد و تصاویر نامرتبط را به‌عنوان تصویر اصلی انتخاب نکن.
+- barcode را فقط در صورت وجود واقعی در صفحه وارد کن.
+- اطلاعات ساختگی تولید نکن.`;
+
+  const aiRes = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': GEMINI_API_KEY
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: prompt
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        responseMimeType: 'application/json'
+      }
+    })
+  });
+
+  const aiData = await aiRes.json().catch(() => ({}));
+
+  if (!aiRes.ok) {
+    throw new Error(
+      (aiData && aiData.error && aiData.error.message) ||
+      `خطا در ارتباط با Gemini (${aiRes.status})`
+    );
+  }
+
+  const textBlock =
+    aiData &&
+    aiData.candidates &&
+    aiData.candidates[0] &&
+    aiData.candidates[0].content &&
+    Array.isArray(aiData.candidates[0].content.parts)
+      ? aiData.candidates[0].content.parts
+          .map((p) => p && p.text ? p.text : '')
+          .join('')
+      : '';
+
+  if (!textBlock) {
+    throw new Error('Gemini اطلاعاتی از صفحه محصول برنگرداند');
+  }
+
+  const parsed = parseJsonObject(textBlock);
+
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('پاسخ Gemini قابل پردازش نیست');
+  }
+
+  return parsed;
+}
+
+app.post('/api/ai/extract-product-url', auth, requireAdmin, async (req, res) => {
+  const rawUrl = ((req.body && req.body.url) || '').trim();
+  const url = validateProductUrl(rawUrl);
+
+  if (!url) {
+    return res.status(400).json({
+      error: 'آدرس صفحه محصول معتبر نیست'
+    });
+  }
+
+  try {
+    const page = await fetchProductPage(url);
+    const product = await extractProductFromUrlWithGemini(
+      page.finalUrl,
+      page.html
+    );
+
+    let imageUrl = product.imageUrl || '';
+
+    if (imageUrl) {
+      try {
+        const absoluteImage = absoluteHttpUrl(
+          imageUrl,
+          page.finalUrl
+        );
+
+        if (absoluteImage) {
+          const mirrored = await mirrorRemoteImageToCloudinary(
+            absoluteImage
+          );
+
+          if (mirrored) {
+            imageUrl = mirrored;
+          }
+        }
+      } catch (e) {
+        console.error(
+          'extract-product-url image mirror error:',
+          e.message
+        );
+      }
+    }
+
+    const images = Array.isArray(product.images)
+      ? product.images
+          .map((item) => absoluteHttpUrl(item, page.finalUrl))
+          .filter(Boolean)
+          .slice(0, 12)
+      : [];
+
+    res.json({
+      success: true,
+      sourceUrl: page.finalUrl,
+      product: {
+        ...product,
+        imageUrl,
+        images
+      }
+    });
+  } catch (e) {
+    console.error('extract-product-url error:', e);
+
+    res.status(502).json({
+      error: friendlyAiError(e)
+    });
+  }
+});
+  // آدرس‌های همه‌ی iframeهای داخلِ یک صفحه را (نسبت به baseUrl کامل‌شده) برمی‌گرداند — برای وقتی که
+  // اطلاعات محصول داخل یک ویجت/صفحه‌ی توکار قرار گرفته باشد.
+  function extractIframeUrls(html, baseUrl) {
+    const urls = [];
+    const seen = new Set();
+
+    for (const match of String(html || '').matchAll(
+      /<iframe[^>]+src=["']([^"']+)["'][^>]*>/gi
+    )) {
+      try {
+        const url = new URL(match[1], baseUrl).toString();
+        if (!seen.has(url)) {
+          seen.add(url);
+          urls.push(url);
+        }
+      } catch {
+        // URL نامعتبر را نادیده می‌گیریم.
+      }
+    }
+
+    return urls.slice(0, 10);
+  }
+
+  function normalizeAiProductResult(data) {
+    if (!data || typeof data !== 'object') return {};
+
+    const result = { ...data };
+
+    const stringFields = [
+      'name',
+      'nameEn',
+      'brand',
+      'category',
+      'subcategory',
+      'description',
+      'properties',
+      'ingredients',
+      'volume',
+      'concentration',
+      'barcode',
+      'imageUrl',
+      'topNotes',
+      'middleNotes',
+      'baseNotes',
+      'baseAccords',
+      'mainAccords',
+      'perfumer',
+      'countryOfOrigin',
+      'yearMade'
+    ];
+
+    for (const field of stringFields) {
+      if (result[field] == null) result[field] = '';
+      else if (typeof result[field] !== 'string') result[field] = String(result[field]);
+    }
+
+    if (!Array.isArray(result.images)) {
+      result.images = result.imageUrl ? [result.imageUrl] : [];
+    }
+
+    result.images = result.images
+      .filter((item) => typeof item === 'string')
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, 12);
+
+    result.isPerfume = !!result.isPerfume;
+
+    return result;
+  }
+
+  app.post('/api/ai/extract-product-url', auth, requireAdmin, async (req, res) => {
+    const rawUrl = ((req.body && req.body.url) || '').trim();
+    const url = validateProductUrl(rawUrl);
+
+    if (!url) {
+      return res.status(400).json({
+        error: 'آدرس صفحه محصول معتبر نیست'
+      });
+    }
+
+    try {
+      const page = await fetchProductPage(url);
+      let product = await extractProductFromUrlWithGemini(
+        page.finalUrl,
+        page.html
+      );
+
+      product = normalizeAiProductResult(product);
+
+      if (!product.imageUrl) {
+        product.imageUrl = extractPrimaryImageFromHtml(
+          page.html,
+          page.finalUrl
+        ) || '';
+      }
+
+      if (product.imageUrl) {
+        const absoluteImage = absoluteHttpUrl(
+          product.imageUrl,
+          page.finalUrl
+        );
+
+        if (absoluteImage) {
+          try {
+            const mirrored = await mirrorRemoteImageToCloudinary(
+              absoluteImage
+            );
+
+            if (mirrored) {
+              product.imageUrl = mirrored;
+            }
+          } catch (e) {
+            console.error(
+              'extract-product-url image mirror error:',
+              e.message
+            );
+          }
+        }
+      }
+
+      product.images = product.images
+        .map((item) => absoluteHttpUrl(item, page.finalUrl))
+        .filter(Boolean)
+        .slice(0, 12);
+
+      res.json({
+        success: true,
+        sourceUrl: page.finalUrl,
+        product
+      });
+    } catch (e) {
+      console.error('extract-product-url error:', e);
+      res.status(502).json({
+        error: friendlyAiError(e)
+      });
+    }
+  });
+
+  app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
+    try {
+      const imageBase64 = String(
+        (req.body && req.body.imageBase64) || ''
+      ).trim();
+
+      if (!imageBase64) {
+        return res.status(400).json({
+          error: 'تصویر محصول ارسال نشده است'
+        });
+      }
+
+      const match = imageBase64.match(
+        /^data:image\/(png|jpe?g|webp);base64,([A-Za-z0-9+/=]+)$/i
+      );
+
+      if (!match) {
+        return res.status(400).json({
+          error: 'فرمت تصویر باید PNG، JPG یا WEBP باشد'
+        });
+      }
+
+      const buffer = Buffer.from(match[2], 'base64');
+
+      if (buffer.length > 10 * 1024 * 1024) {
+        return res.status(400).json({
+          error: 'حجم تصویر نباید بیشتر از ۱۰ مگابایت باشد'
+        });
+      }
+
+      const mimeType =
+        match[1].toLowerCase() === 'jpg' ||
+        match[1].toLowerCase() === 'jpeg'
+          ? 'image/jpeg'
+          : `image/${match[1].toLowerCase()}`;
+
+      const endpoint =
+        `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+
+      const prompt = buildProductExtractionPrompt();
+
+      const aiRes = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: prompt },
+                {
+                  inline_data: {
+                    mime_type: mimeType,
+                    data: match[2]
+                  }
+                }
+              ]
+            }
+          ],
+          generationConfig: {
+            temperature: 0.1,
+            responseMimeType: 'application/json'
+          }
+        })
+      });
+
+      const aiData = await aiRes.json().catch(() => ({}));
+
+      if (!aiRes.ok) {
+        throw new Error(
+          (aiData &&
+            aiData.error &&
+            aiData.error.message) ||
+          `خطا در ارتباط با Gemini (${aiRes.status})`
+        );
+      }
+
+      const textBlock =
+        aiData &&
+        aiData.candidates &&
+        aiData.candidates[0] &&
+        aiData.candidates[0].content &&
+        Array.isArray(aiData.candidates[0].content.parts)
+          ? aiData.candidates[0].content.parts
+              .map((part) => part && part.text ? part.text : '')
+              .join('')
+          : '';
+
+      if (!textBlock) {
+        throw new Error(
+          'Gemini اطلاعاتی از تصویر محصول برنگرداند'
+        );
+      }
+
+      const parsed = parseJsonObject(textBlock);
+
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error(
+          'پاسخ Gemini قابل پردازش نیست'
+        );
+      }
+
+      res.json({
+        success: true,
+        product: normalizeAiProductResult(parsed)
+      });
+    } catch (e) {
+      console.error('extract-product error:', e);
+      res.status(502).json({
+        error: friendlyAiError(e)
+      });
+    }
+  });
