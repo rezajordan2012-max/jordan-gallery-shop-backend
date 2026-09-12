@@ -13,9 +13,6 @@ app.use(express.json({ limit: '50mb' }));
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const FRAGANTY_API_KEY = process.env.FRAGANTY_API_KEY;
-const FRAGANTY_BASE_URL = 'https://fraganty.ai';
 const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 
 // ============================================================
