@@ -502,13 +502,25 @@ app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) =>
     // پنجره‌ی نتایج می‌بیند، دقیقاً همان چیزی باشد که با یک کلیک ذخیره می‌شود (نه یک لینکِ
     // خارجیِ ناپایدار که ممکن است فردا از دسترس خارج شود).
     const mirrored = await Promise.all(
-      candidates.map(async (c) => {
-        try {
-          const url = await mirrorRemoteImageToCloudinary(c.url);
-          return url ? { url, source: c.source || '' } : null;
-        } catch (e) { return null; }
-      })
-    );
+  candidates.map(async (c) => {
+    try {
+      const imageUrl = await resolveImageUrlFromCandidate(c.url);
+
+      if (!imageUrl) return null;
+
+      const url = await mirrorRemoteImageToCloudinary(imageUrl);
+
+      return url ? { 
+        url, 
+        source: c.source || '' 
+      } : null;
+
+    } catch (e) { 
+      console.error('candidate mirror failed:', e.message);
+      return null;
+    }
+  })
+);
     res.json({ results: mirrored.filter(Boolean) });
   } catch (e) {
     console.error('search-product-image error:', e);
