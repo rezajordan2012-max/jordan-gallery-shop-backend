@@ -573,26 +573,26 @@ async function searchProductImageCandidatesAnthropic(query) {
   const results = Array.isArray(parsed && parsed.results) ? parsed.results : [];
   return results.filter((r) => r && typeof r.url === 'string' && /^https?:\/\//i.test(r.url)).slice(0, 6);
 }
-
 async function searchProductImageCandidates(query) {
-  async function searchProductImageCandidates(query) {
+
   if (!GEMINI_API_KEY) {
     throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
   }
 
-  const results = await searchProductImageCandidatesGemini(query);
+  try {
 
-  return results;
-}
-      if (results.length > 0) return results;
-    } catch (e) {
-      console.error('Gemini image search failed:', e.message);
-      if (!ANTHROPIC_API_KEY) throw e;
-      // اگر Anthropic هم تنظیم شده، بی‌سروصدا سراغش می‌رویم؛ اگر نه، همان خطای Gemini بالا می‌رود.
-    }
+    const results = await searchProductImageCandidatesGemini(query);
+
+    return results;
+
+  } catch (e) {
+
+    console.error('Gemini image search failed:', e.message);
+
+    throw e;
+
   }
-  if (ANTHROPIC_API_KEY) return searchProductImageCandidatesAnthropic(query);
-  throw new Error('برای جستجوی عکس، حداقل یکی از GEMINI_API_KEY یا ANTHROPIC_API_KEY باید روی سرور تنظیم شده باشد');
+
 }
   app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
   const query = ((req.body && req.body.query) || '').trim();
