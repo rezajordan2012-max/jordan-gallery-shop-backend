@@ -429,7 +429,104 @@ async function identifyBarcodeWithAI(code) {
 // جستجوی عکسِ محصول (یا یک رنگِ خاص از محصول) در اینترنت — دقیقاً از همان موتوری استفاده می‌کند
 // که «جستجوی هوشمند لینک» استفاده می‌کند (Gemini، با ابزارِ google_search برای جستجوی واقعیِ وب)؛
 // به‌جای یک عکسِ تک، چند نامزدِ مختلف برمی‌گرداند تا مدیر خودش بهترین را انتخاب کند.
-async function searchProductImageCandidatesGemini(query) {
+async function searchProductColorCandidatesGemini(query) {
+
+  if (!GEMINI_API_KEY)
+    throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
+
+
+  const endpoint =
+    `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+
+
+  const prompt = `
+با جستجوی وب صفحه‌های معتبر محصول را برای این درخواست پیدا کن:
+
+"${query}"
+
+هدف فقط پیدا کردن عکس‌های واقعی طیف رنگ محصول است.
+مخصوصاً:
+- swatch رنگ
+- shade image
+- color variant image
+- عکس شماره رنگ
+
+اگر صفحه محصول پیدا شد لینک صفحه را بده.
+اگر لینک مستقیم عکس رنگ پیدا شد همان را بده.
+
+هرگز لینک جعلی نساز.
+
+فقط JSON معتبر:
+{
+"results":[
+ {
+  "url":"",
+  "source":""
+ }
+]
+}
+`;
+
+
+  const r = await fetch(endpoint, {
+    method:'POST',
+    headers:{
+      'Content-Type':'application/json',
+      'x-goog-api-key':GEMINI_API_KEY
+    },
+
+    body:JSON.stringify({
+
+      contents:[
+        {
+          role:'user',
+          parts:[
+            {
+              text:prompt
+            }
+          ]
+        }
+      ],
+
+      tools:[
+        {
+          google_search:{}
+        }
+      ],
+
+      generationConfig:{
+        temperature:0.1
+      }
+
+    })
+  });
+
+
+  const data = await r.json().catch(()=>({}));
+
+  if(!r.ok)
+    throw new Error(
+      data?.error?.message ||
+      `Gemini error ${r.status}`
+    );
+
+
+  const text =
+    (data.candidates || [])
+    .flatMap(c=>c.content?.parts || [])
+    .map(p=>p.text || '')
+    .join('')
+    .trim();
+
+
+  const parsed=parseJsonObject(text);
+
+
+  return Array.isArray(parsed.results)
+    ? parsed.results.slice(0,10)
+    : [];
+
+}
   if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
   const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
   const prompt = `با جستجوی وب، ۵ تا ۶ عکسِ باکیفیت و مرتبط برای این محصول پیدا کن: "${query}"
