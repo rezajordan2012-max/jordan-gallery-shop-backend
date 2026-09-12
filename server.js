@@ -192,7 +192,7 @@ async function removeBackgroundFromDataUri(dataUri) {
 
 async function uploadDataUriToCloudinary(dataUri) {
   if (!CLOUDINARY_CLOUD_NAME || !CLOUDINARY_API_KEY || !CLOUDINARY_API_SECRET) throw new Error('تنظیمات Cloudinary روی سرور کامل نشده است');
-  const imageMatch = dataUri.match(/^data:i
+  const imageMatch = dataUri.match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/);
   async function callGeminiText(prompt) {
   if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
   const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
