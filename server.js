@@ -598,7 +598,9 @@ async function searchProductImageCandidates(query) {
   const query = ((req.body && req.body.query) || '').trim();
 
   if (!query) {
-    return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
+    return res.status(400).json({
+      error: 'عبارتِ جستجو را وارد کن'
+    });
   }
 
   try {
@@ -617,18 +619,6 @@ async function searchProductImageCandidates(query) {
   }
 });
 
-
-  try {
-
-    // مرحله اول: جستجو با Gemini
-    const candidates = await searchProductColorCandidatesGemini(query);
-
-
-    if (!Array.isArray(candidates) || candidates.length === 0) {
-      return res.json({
-        results: []
-      });
-    }
 
 
     const finalResults = [];
