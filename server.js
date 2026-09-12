@@ -140,7 +140,33 @@ function noCache(req, res, next) {
   res.set('Surrogate-Control', 'no-store');
   next();
 }
+async function resolveImageUrlFromCandidate(url) {
+  if (!url) return null;
 
+  // اگر خودش لینک تصویر بود
+  if (/\.(jpg|jpeg|png|webp|gif)(\?|$)/i.test(url)) {
+    return url;
+  }
+
+  // اگر لینک صفحه محصول بود
+  try {
+    const pageRes = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0'
+      }
+    });
+
+    if (!pageRes.ok) return null;
+
+    const html = await pageRes.text();
+
+    return extractPrimaryImageFromHtml(html, url);
+
+  } catch (e) {
+    console.error('resolveImageUrlFromCandidate failed:', e.message);
+    return null;
+  }
+}
 app.post('/api/auth/register', withDb(async (req, res) => {
   const { email, password, fullName } = req.body || {};
   if (!email || !password || password.length < 6) return res.status(400).json({ error: 'ایمیل و رمز عبور (حداقل ۶ کاراکتر) الزامی است' });
