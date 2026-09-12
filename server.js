@@ -617,7 +617,69 @@ function stripHtmlForGemini(html) {
 // استاندارد og:image / twitter:image پیدا می‌کند — همان تگ‌هایی که تقریباً همه‌ی فروشگاه‌های
 // آنلاین برای پیش‌نمایشِ لینک (مثلاً هنگام اشتراک‌گذاری در تلگرام/واتساپ) پر می‌کنند، پس معمولاً
 // دقیق‌ترین و باکیفیت‌ترین عکسِ محصول همین است. آدرسِ نسبی را هم نسبت به baseUrl کامل می‌کند.
-function extractPrimaryImageFromHtml(html, baseUrl) {
+function extractPrimaryImageFromHtml(html, baseUrl) {// استخراج عکس‌های طیف رنگ محصول از صفحه
+// مخصوص رژلب، سایه، کرم‌پودر، لاک و محصولات دارای shade/variant
+function extractColorImagesFromHtml(html, baseUrl) {
+  const results = [];
+  if (!html) return results;
+
+  const seen = new Set();
+
+  function addImage(url, label = '') {
+    if (!url) return;
+
+    try {
+      const absolute = new URL(url, baseUrl).toString();
+
+      if (!/^https?:\/\//i.test(absolute)) return;
+
+      if (seen.has(absolute)) return;
+
+      seen.add(absolute);
+
+      results.push({
+        url: absolute,
+        label
+      });
+
+    } catch {}
+  }
+
+
+  // img های رنگی
+  const imgTags = html.match(/<img[^>]*>/gi) || [];
+
+  for (const tag of imgTags) {
+
+    const src =
+      (tag.match(/\ssrc=["']([^"']+)/i) || [])[1] ||
+      (tag.match(/\sdata-src=["']([^"']+)/i) || [])[1] ||
+      (tag.match(/\sdata-original=["']([^"']+)/i) || [])[1];
+
+    const label =
+      (tag.match(/\salt=["']([^"']+)/i) || [])[1] ||
+      (tag.match(/\sdata-color=["']([^"']+)/i) || [])[1] ||
+      (tag.match(/\sdata-label=["']([^"']+)/i) || [])[1] ||
+      '';
+
+    if (src) {
+      addImage(src, label);
+    }
+  }
+
+
+  // background-image رنگ‌ها
+  const bgMatches = html.matchAll(
+    /background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)/gi
+  );
+
+  for (const m of bgMatches) {
+    addImage(m[1], '');
+  }
+
+
+  return results.slice(0, 20);
+}
   if (!html) return null;
   const patterns = [
     /<meta[^>]+property=["']og:image:secure_url["'][^>]+content=["']([^"']+)["']/i,
