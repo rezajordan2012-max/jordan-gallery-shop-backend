@@ -594,10 +594,6 @@ async function searchProductImageCandidates(query) {
   if (ANTHROPIC_API_KEY) return searchProductImageCandidatesAnthropic(query);
   throw new Error('برای جستجوی عکس، حداقل یکی از GEMINI_API_KEY یا ANTHROPIC_API_KEY باید روی سرور تنظیم شده باشد');
 }
-
-app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
-  const query = ((req.body && req.body.query) || '').trim();
-  if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
   app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
   const query = ((req.body && req.body.query) || '').trim();
 
