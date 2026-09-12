@@ -24,7 +24,7 @@ const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 // 2) Product image -> Gemini -> structured product fields
 // ============================================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -400,10 +400,37 @@ async function identifyBarcodeWithAI(code) {
   return parsed;
 }
 
-// جستجوی عکسِ محصول (یا یک رنگِ خاص از محصول) در اینترنت — از همان قابلیتِ web_search کلودی که
-// برای تشخیصِ بارکد استفاده می‌شود کمک می‌گیرد؛ به‌جای یک عکسِ تک، چند نامزدِ مختلف برمی‌گرداند
-// تا مدیر خودش بهترین را از بین‌شان انتخاب کند (نه این‌که خودِ سیستم یکی را به‌صورتِ کور انتخاب کند).
-async function searchProductImageCandidates(query) {
+// جستجوی عکسِ محصول (یا یک رنگِ خاص از محصول) در اینترنت — دقیقاً از همان موتوری استفاده می‌کند
+// که «جستجوی هوشمند لینک» استفاده می‌کند (Gemini، با ابزارِ google_search برای جستجوی واقعیِ وب)؛
+// به‌جای یک عکسِ تک، چند نامزدِ مختلف برمی‌گرداند تا مدیر خودش بهترین را انتخاب کند.
+async function searchProductImageCandidatesGemini(query) {
+  if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
+  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const prompt = `با جستجوی وب، ۵ تا ۶ عکسِ باکیفیت و مرتبط برای این محصول پیدا کن: "${query}"
+هر آدرس باید مستقیماً به خودِ فایلِ تصویر (jpg/jpeg/png/webp) ختم شود، نه به یک صفحه‌ی HTML. فقط عکس‌هایی را انتخاب کن که به‌وضوح همین محصول (یا همین رنگِ مشخص‌شده، اگر در عبارتِ جستجو نامِ رنگ آمده) را نشان می‌دهند — نه محصولِ مشابه از برندِ دیگر، نه بنر یا لوگو. اگر برای بخشی از درخواست عکسِ مطمئنی پیدا نکردی، آن را خالی بگذار و فقط عکس‌های مطمئن را برگردان؛ هرگز آدرس جعل نکن.
+فقط یک JSON معتبر و بدون Markdown برگردان، دقیقاً با این ساختار: {"results":[{"url":"","source":""}]}`;
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      tools: [{ google_search: {} }],
+      generationConfig: { temperature: 0.1 },
+    }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((data && data.error && data.error.message) ? friendlyAiError(new Error(data.error.message)) : `خطا در ارتباط با Gemini (${r.status})`);
+  const text = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
+  if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
+  const parsed = parseJsonObject(text);
+  const results = Array.isArray(parsed && parsed.results) ? parsed.results : [];
+  return results.filter((item) => item && typeof item.url === 'string' && /^https?:\/\//i.test(item.url)).slice(0, 6);
+}
+
+// نسخه‌ی پشتیبان (fallback) — همان جستجوی عکس، این‌بار با Claude + web_search. فقط وقتی به کار
+// می‌رود که Gemini در دسترس نباشد یا شکست بخورد و کلیدِ Anthropic هم روی سرور تنظیم شده باشد؛
+// این‌طور اگر یکی از دو سرویس موقتاً مشکل داشت (مثلاً اتمامِ اعتبار یا سهمیه)، کارِ مدیر متوقف نمی‌شود.
+async function searchProductImageCandidatesAnthropic(query) {
   if (!ANTHROPIC_API_KEY) throw new Error('کلید ANTHROPIC_API_KEY روی سرور تنظیم نشده است');
   const instruction = `با جستجوی وب، ۵ تا ۶ عکسِ باکیفیت و مرتبط برای این محصول پیدا کن: "${query}"
 هر آدرس باید مستقیماً به خودِ فایلِ تصویر (jpg/jpeg/png/webp) ختم شود، نه به یک صفحه‌ی HTML. فقط عکس‌هایی را انتخاب کن که به‌وضوح همین محصول (یا همین رنگِ مشخص‌شده، اگر در عبارتِ جستجو نامِ رنگ آمده) را نشان می‌دهند — نه محصولِ مشابه از برندِ دیگر، نه بنر یا لوگو. اگر برای بخشی از درخواست (مثلاً یک رنگِ خاص) عکسِ مطمئنی پیدا نکردی، آن را خالی بگذار و فقط عکس‌های مطمئن را برگردان.
@@ -414,12 +441,27 @@ async function searchProductImageCandidates(query) {
     body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 1500, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: instruction }] }),
   });
   const aiData = await aiRes.json();
-  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
+  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) ? friendlyAiError(new Error(aiData.error.message)) : 'خطا در ارتباط با سرویس هوش مصنوعی');
   const textCombined = (aiData.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
   if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
   const parsed = parseJsonObject(textCombined);
   const results = Array.isArray(parsed && parsed.results) ? parsed.results : [];
   return results.filter((r) => r && typeof r.url === 'string' && /^https?:\/\//i.test(r.url)).slice(0, 6);
+}
+
+async function searchProductImageCandidates(query) {
+  if (GEMINI_API_KEY) {
+    try {
+      const results = await searchProductImageCandidatesGemini(query);
+      if (results.length > 0) return results;
+    } catch (e) {
+      console.error('Gemini image search failed:', e.message);
+      if (!ANTHROPIC_API_KEY) throw e;
+      // اگر Anthropic هم تنظیم شده، بی‌سروصدا سراغش می‌رویم؛ اگر نه، همان خطای Gemini بالا می‌رود.
+    }
+  }
+  if (ANTHROPIC_API_KEY) return searchProductImageCandidatesAnthropic(query);
+  throw new Error('برای جستجوی عکس، حداقل یکی از GEMINI_API_KEY یا ANTHROPIC_API_KEY باید روی سرور تنظیم شده باشد');
 }
 
 app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
