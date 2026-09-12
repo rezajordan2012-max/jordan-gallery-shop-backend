@@ -575,9 +575,15 @@ async function searchProductImageCandidatesAnthropic(query) {
 }
 
 async function searchProductImageCandidates(query) {
-  if (GEMINI_API_KEY) {
-    try {
-      const results = await searchProductImageCandidatesGemini(query);
+  async function searchProductImageCandidates(query) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
+  }
+
+  const results = await searchProductImageCandidatesGemini(query);
+
+  return results;
+}
       if (results.length > 0) return results;
     } catch (e) {
       console.error('Gemini image search failed:', e.message);
