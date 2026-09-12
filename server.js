@@ -592,6 +592,155 @@ async function searchProductImageCandidates(query) {
 app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
   const query = ((req.body && req.body.query) || '').trim();
   if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
+  app.post('/api/ai/search-product-color', auth, requireAdmin, async (req, res) => {
+
+  const query = ((req.body && req.body.query) || '').trim();
+
+  if (!query) {
+    return res.status(400).json({
+      error: 'عبارت جستجوی رنگ وارد نشده است'
+    });
+  }
+
+
+  try {
+
+    // مرحله اول: جستجو با Gemini
+    const candidates = await searchProductColorCandidatesGemini(query);
+
+
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return res.json({
+        results: []
+      });
+    }
+
+
+    const finalResults = [];
+
+
+    for (const item of candidates) {
+
+      let imageUrls = [];
+
+
+      try {
+
+        // اگر لینک مستقیم عکس بود
+        if (/\.(jpg|jpeg|png|webp|gif)(\?|$)/i.test(item.url)) {
+
+          imageUrls.push({
+            url: item.url,
+            label: ''
+          });
+
+
+        } else {
+
+          // اگر لینک صفحه محصول بود
+          const pageRes = await fetch(item.url, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0'
+            }
+          });
+
+
+          if (pageRes.ok) {
+
+            const html = await pageRes.text();
+
+
+            imageUrls =
+              extractColorImagesFromHtml(
+                html,
+                item.url
+              );
+
+          }
+
+        }
+
+
+      } catch (e) {
+
+        console.error(
+          'color page extraction failed:',
+          e.message
+        );
+
+      }
+
+
+
+      // انتقال عکس‌های رنگ به Cloudinary
+
+      for (const img of imageUrls) {
+
+        try {
+
+          const cloudUrl =
+            await mirrorRemoteImageToCloudinary(
+              img.url
+            );
+
+
+          if (cloudUrl) {
+
+            finalResults.push({
+
+              url: cloudUrl,
+
+              label:
+                img.label ||
+                item.source ||
+                ''
+
+            });
+
+          }
+
+
+        } catch (e) {
+
+          console.error(
+            'color cloudinary upload failed:',
+            e.message
+          );
+
+        }
+
+      }
+
+
+    }
+
+
+    res.json({
+
+      results:
+        finalResults.slice(0,20)
+
+    });
+
+
+  } catch (e) {
+
+    console.error(
+      'search-product-color error:',
+      e
+    );
+
+
+    res.status(502).json({
+
+      error:
+        friendlyAiError(e)
+
+    });
+
+  }
+
+});
   try {
     const candidates = await searchProductImageCandidates(query);
     if (candidates.length === 0) return res.json({ results: [] });
