@@ -23,7 +23,7 @@ const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 // 2) Product image -> Gemini -> structured product fields
 // ============================================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -402,38 +402,46 @@ async function identifyBarcodeWithGemini(code) {
   return parsed;
 }
 
-// جستجوی عکسِ محصول در اینترنت — روش قبلی («از هوش مصنوعی بخواه لینکِ مستقیمِ عکس رو حدس بزند»)
-// غیرقابل‌اتکا بود، چون ابزارهای grounding/web_search خروجی‌شان معمولاً لینکِ «صفحه‌ای که در آن
-// پیدا شده» است، نه لینکِ مستقیمِ خودِ فایلِ عکس — و مدل ناچار می‌شد آدرسِ عکس را حدس بزند.
-// روشِ درست: از جستجوی واقعیِ Gemini (google_search) فقط آدرسِ «صفحاتِ واقعی و استنادشده‌ی
-// جست‌وجو» را می‌گیریم (نه چیزی که مدل نوشته، بلکه همان لینک‌هایی که در groundingMetadata خودِ
-// Gemini به‌عنوانِ منبع برگشته)، سپس هرکدام از آن صفحات را با همان تابعِ اثبات‌شده‌ی
-// extractPrimaryImageFromHtml (که برای «ورود محصول با لینک» هم استفاده می‌شود) می‌خوانیم تا
-// عکسِ واقعیِ محصول را از خودِ صفحه دربیاوریم — نتیجه بسیار قابل‌اعتمادتر از حدسِ مستقیمِ مدل است.
-async function searchProductPagesGemini(query) {
-  if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
-  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-  const prompt = `این محصول را در اینترنت جستجو کن و صفحاتِ فروش یا معرفیِ همین محصول (نه محصولِ مشابه از برندِ دیگر) را پیدا کن: "${query}"`;
-  const r = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      tools: [{ google_search: {} }],
-    }),
+// جستجوی عکسِ محصول در اینترنت — نسخه‌ی قبلی از ابزارِ google_search خودِ Gemini استفاده می‌کرد،
+// اما آن ابزار یک سهمیه‌ی کاملاً جدا و در تجربه بسیار محدودتر از سهمیه‌ی معمولیِ Gemini دارد (برای
+// همین با اینکه «ورود محصول با لینک» — که هیچ جستجویی نمی‌کند، فقط یک صفحه‌ی مشخص را می‌خواند و
+// متنش را به Gemini می‌دهد — خوب کار می‌کرد، همین قسمت به «سهمیه تمام شده» می‌خورد. راه‌حل: این
+// قسمت را دقیقاً روی همان مسیرِ «ورود محصول با لینک» سوار کردیم — یعنی هیچ سهمیه‌ی هوش مصنوعیِ
+// جداگانه‌ای مصرف نمی‌کند. ابتدا با یک جستجوی سادهٔ رایگان و بدون کلید (صفحه‌ی HTML ساده‌ی
+// DuckDuckGo، بدون جاوااسکریپت) چند لینکِ صفحه‌ی واقعی پیدا می‌کنیم، سپس دقیقاً با همان تابعِ
+// extractPrimaryImageFromHtml که «ورود محصول با لینک» استفاده می‌کند، عکسِ اصلیِ هرکدام از آن
+// صفحات را درمی‌آوریم.
+async function searchWebPages(query) {
+  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+  const r = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)',
+      'Accept': 'text/html,application/xhtml+xml',
+    },
   });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error((data && data.error && data.error.message) ? friendlyAiError(new Error(data.error.message)) : `خطا در ارتباط با Gemini (${r.status})`);
-  const chunks = (data.candidates || []).flatMap((c) => (c.groundingMetadata && c.groundingMetadata.groundingChunks) || []);
-  const urls = chunks.map((ch) => ch && ch.web && ch.web.uri).filter(Boolean);
-  return [...new Set(urls)].slice(0, 8);
+  if (!r.ok) throw new Error(`جستجوی وب پاسخ نداد (کد ${r.status}) — چند لحظه صبر کن و دوباره امتحان کن`);
+  const html = await r.text();
+  const urls = [];
+  const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"/gi;
+  let m;
+  while ((m = re.exec(html)) && urls.length < 10) {
+    let href = m[1];
+    // DuckDuckGo لینکِ نتیجه را داخل یک ریدایرکتِ خودش می‌پیچد؛ آدرسِ واقعیِ صفحه داخل پارامترِ
+    // uddg است — باید از آن استخراج شود، وگرنه به‌جای صفحه‌ی محصول به duckduckgo.com می‌رویم.
+    const uddgMatch = href.match(/[?&]uddg=([^&]+)/);
+    if (uddgMatch) {
+      try { href = decodeURIComponent(uddgMatch[1]); } catch (e) { continue; }
+    }
+    if (/^https?:\/\//i.test(href)) urls.push(href);
+  }
+  return [...new Set(urls)];
 }
 
-// از روی لینک‌های واقعیِ صفحاتی که Gemini در جست‌وجویش پیدا کرده، هرکدام را جداگانه واکشی
-// می‌کند و با extractPrimaryImageFromHtml (همان تابعِ اثبات‌شده‌ی «ورود محصول با لینک») عکسِ
-// اصلیِ آن صفحه را درمی‌آورد؛ به‌محض رسیدن به ۶ نتیجه متوقف می‌شود.
-async function searchProductImageCandidatesGemini(query) {
-  const pageUrls = await searchProductPagesGemini(query);
+// از روی لینک‌های واقعیِ صفحاتی که جستجو پیدا کرده، هرکدام را جداگانه واکشی می‌کند و با
+// extractPrimaryImageFromHtml (همان تابعِ اثبات‌شده‌ی «ورود محصول با لینک») عکسِ اصلیِ آن صفحه
+// را درمی‌آورد؛ به‌محض رسیدن به ۶ نتیجه متوقف می‌شود.
+async function searchProductImageCandidates(query) {
+  const pageUrls = await searchWebPages(query);
   const found = [];
   for (const pageUrl of pageUrls) {
     if (found.length >= 6) break;
@@ -452,10 +460,6 @@ async function searchProductImageCandidatesGemini(query) {
     } catch (e) { /* این صفحه جواب نداد یا عکسی نداشت — سراغ صفحه‌ی بعدی */ }
   }
   return found;
-}
-
-async function searchProductImageCandidates(query) {
-  return searchProductImageCandidatesGemini(query);
 }
 
 app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
