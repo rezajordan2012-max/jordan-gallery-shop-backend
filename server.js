@@ -18,35 +18,7 @@ const FRAGANTY_BASE_URL = 'https://fraganty.ai';
 const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 
 // ============================================================
-// NEW: // =====================================================
-// NEW: Gemini Smart Image Features
-//
-// The following two features must use the same Gemini
-// smart search pipeline already used by the existing
-// working AI search sections.
-//
-// 1) Main product image search:
-// Product name / product information
-// -> Gemini
-// -> Internet image search candidates
-// -> validate image result
-// -> Cloudinary upload
-// -> save as product main image
-//
-// 2) Product color spectrum search:
-// Product image / product information
-// -> Gemini vision analysis
-// -> detect available color spectrum
-// -> return structured color names,
-//    hex values and selectable variants
-//
-// IMPORTANT:
-// Do NOT use Anthropic API or separate image model routes
-// for these two features.
-// They must use GEMINI_MODEL configured in environment
-// exactly like the existing working smart search.
-// =====================================================
-Gemini — only the two requested additions
+// NEW: Gemini — only the two requested additions
 // 1) Product page URL -> Gemini -> structured product fields
 // 2) Product image -> Gemini -> structured product fields
 // ============================================================
