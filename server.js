@@ -560,6 +560,21 @@ function stripHtmlForGemini(html) {
     return ` [IMG src="${src}" alt="${alt}"] `;
   });
 
+  // بعضی سوآچ‌های رنگ اصلاً عکس ندارند — فقط یک دایره‌ی رنگیِ ساده هستند که با CSS
+  // (background-color یا background: به‌صورتِ هگز/rgb) رنگ گرفته‌اند، نه با عکس. این عنصرها را به
+  // نشانه‌ی [COLOR hex="..." alt="..."] تبدیل می‌کند — فقط وقتی که عنصر یک برچسبِ قابل‌خواندن
+  // (title/aria-label/data-name/data-color) هم داشته باشد؛ بدونِ برچسب، نمی‌دانیم اسمِ رنگ چیست و
+  // ممکن است یک رنگِ دکوراتیوِ بی‌ربط (مثلاً پس‌زمینه‌ی یک دکمه) باشد، نه سوآچِ واقعیِ محصول.
+  text = text.replace(/<[a-z][a-z0-9]*\b[^>]*\sstyle=["'][^"']*background(?:-color)?\s*:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)"']+\))[^"']*["'][^>]*>/gi, (tag, rawColor) => {
+    const labelMatch = tag.match(/\s(?:title|aria-label|data-label|data-name|data-color)=["']([^"']*)["']/i);
+    if (!labelMatch) return tag;
+    imgCount += 1;
+    if (imgCount > IMG_LIMIT) return ' ';
+    const alt = labelMatch[1].replace(/["\[\]]/g, '');
+    if (!alt) return tag;
+    return ` [COLOR hex="${String(rawColor || '').trim()}" alt="${alt}"] `;
+  });
+
   return text
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
@@ -925,7 +940,7 @@ async function callGeminiText(prompt) {
 function buildGeminiProductPrompt(sourceText, sourceUrl) {
   return `تو مسئول استخراج اطلاعات دقیق محصول برای پنل مدیریت فروشگاه هستی.
 منبع: ${sourceUrl}
-متن صفحه محصول در ادامه آمده است. هرجا نشانه‌ی [IMG src="..." alt="..."] دیدی، یعنی در آن نقطه از صفحه یک عکس بوده — src آدرس عکس و alt توضیح/برچسبِ کنار آن عکس است (مثلاً اسمِ رنگ در صفحه‌ی محصولاتی مثل رژلب یا کرم‌پودر). از این نشانه‌ها برای تشخیص «کدام عکس مالِ کدام طیفِ رنگ است» و «کدام عکس، تصویرِ اصلیِ خودِ محصول است» استفاده کن.
+متن صفحه محصول در ادامه آمده است. هرجا نشانه‌ی [IMG src="..." alt="..."] دیدی، یعنی در آن نقطه از صفحه یک عکس بوده — src آدرس عکس و alt توضیح/برچسبِ کنار آن عکس است (مثلاً اسمِ رنگ در صفحه‌ی محصولاتی مثل رژلب یا کرم‌پودر). هرجا نشانه‌ی [COLOR hex="..." alt="..."] دیدی، یعنی یک سوآچِ رنگِ ساده (بدون عکس، فقط یک دایره‌ی تخت‌رنگ) بوده — hex کدِ رنگ و alt نامِ همان رنگ است. از این نشانه‌ها برای تشخیص «کدام عکس/رنگ مالِ کدام طیفِ رنگ است» و «کدام عکس، تصویرِ اصلیِ خودِ محصول است» استفاده کن.
 فقط اطلاعاتی را وارد کن که از منبع قابل تشخیص است؛ هرگز حدس نزن و اطلاعات جعلی نساز.
 تمام فیلدهای متنی فارسی روان باشند، به‌جز nameEn که باید نام دقیق اصلی محصول باشد، concentration که باید مقدار استاندارد انگلیسی باشد، و mainAccords که باید همان کلمات انگلیسیِ اصلیِ بخشِ «Main accords» باشد — هر آکورد را جدا و با ویرگول از بعدی جدا کن (مثلاً Oriental, Woody, Spicy — نه «Oriental Woody» به‌عنوانِ یک آیتم، مگر خودِ عبارت روی صفحه دقیقاً یک اصطلاحِ دوکلمه‌ای شناخته‌شده مثل «White Floral» یا «Warm Spicy» باشد). ترتیبِ آکوردها را دقیقاً همان ترتیبِ روی صفحه (از قوی‌ترین/بزرگ‌ترین به ضعیف‌ترین) نگه دار. نامِ برندینگِ ویجت‌های شخص‌ثالثِ نمایش‌دهنده‌ی این بخش (مثل «Smell»، «Feel»، «Smell & Feel») و نشانه‌های [IMG ...] هرگز آکورد نیستند — آن‌ها را در mainAccords نیاور.
 قیمت خارجی را به تومان تبدیل نکن. اگر قیمت صفحه تومان/ریال است، priceToman را فقط به رقم خام بده؛ در غیر این صورت خالی و مقدار و ارز اصلی را در referencePriceNote بیاور.
@@ -933,7 +948,7 @@ categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, elect
 برای عطر، نت‌ها، آکوردهای اصلی، عطار و غلظت را فقط در صورت وجود منبع بده.
 scentScore/longevityScore/sillageScore فقط اعداد بین ۰ تا ۱۰ هستند (مثلاً همان امتیازهای Scent/Longevity/Sillage در Fragrantica)؛ scentRatings/longevityRatings/sillageRatings تعداد رأی‌دهندگان همان امتیاز است. اگر هیچ‌کدام در منبع نبود، همه را خالی بگذار.
 mainImageUrl را فقط اگر یک [IMG] با src مشخص، به‌وضوح تصویرِ اصلیِ خودِ محصول (نه لوگو، نه بنر، نه آیکون، و نه یک دایره‌ی کوچکِ سوآچِ رنگ) باشد پر کن؛ همان src را بدون تغییر بده. اگر صفحه چند [IMG] پشتِ‌سرهم و شبیه‌به‌هم دارد که هرکدام با نامِ یک رنگ/شماره در alt همراه است، اینها سوآچِ رنگ‌ها هستند نه تصویرِ اصلی — آن‌ها را فقط در variants بیاور، نه در mainImageUrl.
-اگر محصول طیفِ رنگ دارد (مثل رژلب، کرم‌پودر، سایه، لاک)، برای هر رنگ یک آیتم در variants بساز: label نامِ فارسیِ همان رنگ/شماره، hex کدِ رنگِ نزدیک (اگر مشخص نبود خالی)، و imageUrl همان src از نزدیک‌ترین [IMG] که alt یا متنِ اطرافش با نامِ همان رنگ می‌خواند — اگر برای یک رنگ عکسِ مجزا پیدا نشد، imageUrl را خالی بگذار (هرگز عکسِ یک رنگِ دیگر را به‌اشتباه نسبت نده).
+اگر محصول طیفِ رنگ دارد (مثل رژلب، کرم‌پودر، سایه، لاک)، برای هر رنگ یک آیتم در variants بساز: label نامِ فارسیِ همان رنگ/شماره، hex کدِ رنگِ نزدیک (از یک [COLOR] یا هر جای دیگرِ صفحه که کد رنگ آمده؛ اگر پیدا نشد خالی)، و imageUrl همان src از نزدیک‌ترین [IMG] که alt یا متنِ اطرافش با نامِ همان رنگ می‌خواند — اگر برای یک رنگ عکسِ مجزا پیدا نشد، imageUrl را خالی بگذار (هرگز عکسِ یک رنگِ دیگر را به‌اشتباه نسبت نده).
 JSON دقیقاً با این ساختار برگردان:
 {
 "name":"","nameEn":"","brand":"","categoryGuess":"","subcategoryHint":"","priceToman":"","referencePriceNote":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":"","scentScore":"","scentRatings":"","longevityScore":"","longevityRatings":"","sillageScore":"","sillageRatings":"","mainImageUrl":"","variants":[]
@@ -943,6 +958,45 @@ variants آرایه‌ای از {"label":"","hex":"","imageUrl":""} باشد.
 متن صفحه:
 ${sourceText}`;
 }
+
+// پرامپتِ اختصاصیِ «فقط طیفِ رنگ» — برخلافِ buildGeminiProductPrompt که همه‌ی فیلدهای محصول را
+// می‌خواهد، این یکی عمداً محدود و متمرکز است: هیچ فیلدی جز variants نمی‌خواهد، پس Gemini حواسش
+// پرتِ توضیح/قیمت/عکسِ اصلی/نت و غیره نمی‌شود و فقط و فقط دنبالِ رنگ‌ها می‌گردد — دقیقاً همان
+// چیزی که کاربر خواسته: تمرکزِ کامل روی «Color / Select Color» و نمونه‌رنگ‌های کنارش.
+function buildVariantExtractionPrompt(sourceText, sourceUrl) {
+  return `تو فقط و فقط مسئولِ یک کار هستی: پیدا کردنِ «طیف رنگِ» این محصول از صفحه‌ی زیر. هیچ فیلدِ دیگری (نام، قیمت، توضیح، عکسِ اصلیِ محصول، نت، آکورد و غیره) نمی‌خواهیم — رویشان وقت نگذار.
+منبع: ${sourceUrl}
+هرجا نشانه‌ی [IMG src="..." alt="..."] دیدی، یعنی یک عکس بوده (alt معمولاً اسمِ همان رنگ است). هرجا نشانه‌ی [COLOR hex="..." alt="..."] دیدی، یعنی یک سوآچِ رنگِ ساده (بدونِ عکس) بوده که alt اسمِ رنگ و hex کدِ آن است.
+معمولاً این بخش زیرِ عنوانی مثل «Color»، «Select Color»، «Shade» یا فارسی‌اش «انتخاب رنگ»/«رنگ‌بندی» می‌آید و شاملِ چند دایره یا مربعِ کوچکِ رنگی پشتِ‌سرهم است. تمامِ رنگ‌های موجودِ همان محصول (نه محصولاتِ مرتبطِ دیگر، نه رنگِ عناصرِ تزئینیِ صفحه) را پیدا کن.
+برای هر رنگ یک آیتم بساز:
+- label: نامِ دقیقِ همان رنگ، عیناً همان‌طور که روی صفحه نوشته شده (اگر انگلیسی بود انگلیسی بده، ترجمه نکن و از خودت اسم نساز)
+- hex: کدِ رنگِ آن (از یک [COLOR] یا هر نشانه‌ی دیگری از کدِ رنگ در متن)؛ اگر پیدا نکردی، خالی بگذار
+- imageUrl: اگر همان رنگ عکسِ مجزای خودش را دارد (از نزدیک‌ترین [IMG] که alt‌اش با نامِ همان رنگ می‌خواند)، همان src را بده؛ اگر مطمئن نیستی کدام عکس مالِ کدام رنگ است، imageUrl را خالی بگذار — هرگز حدسی به یک رنگ نسبت نده.
+اگر اصلاً طیفِ رنگی روی صفحه پیدا نکردی، آرایه‌ی variants را خالی برگردان.
+فقط یک JSON معتبر و بدون Markdown برگردان، دقیقاً با این ساختار: {"variants":[{"label":"","hex":"","imageUrl":""}]}
+
+متن صفحه:
+${sourceText}`;
+}
+
+app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, res) => {
+  const url = validateProductUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'لینک محصول معتبر نیست' });
+  try {
+    const page = await fetchProductPage(url);
+    const text = stripHtmlForGemini(page.html);
+    if (!text) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
+    const parsed = await callGeminiText(buildVariantExtractionPrompt(text, page.finalUrl));
+    const rawVariants = Array.isArray(parsed && parsed.variants) ? parsed.variants : [];
+    // عکسِ هرکدام از رنگ‌ها را (اگر Gemini آدرسی پیدا کرده) همین‌جا روی Cloudinary آپلود می‌کنیم —
+    // دقیقاً همان کاری که برای طیفِ رنگِ «ورود محصول با لینک» هم انجام می‌شود.
+    const variants = await mirrorVariantImages(rawVariants, page.finalUrl);
+    res.json({ variants });
+  } catch (e) {
+    console.error('extract-variants-from-url error:', e);
+    res.status(502).json({ error: friendlyAiError(e) });
+  }
+});
 
 app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res) => {
   const url = validateProductUrl(req.body && req.body.url);
