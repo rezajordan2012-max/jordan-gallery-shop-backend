@@ -13,6 +13,7 @@ app.use(express.json({ limit: '50mb' }));
 const CLOUDINARY_CLOUD_NAME = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUDINARY_API_KEY = process.env.CLOUDINARY_API_KEY;
 const CLOUDINARY_API_SECRET = process.env.CLOUDINARY_API_SECRET;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const FRAGANTY_API_KEY = process.env.FRAGANTY_API_KEY;
 const FRAGANTY_BASE_URL = 'https://fraganty.ai';
 const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
@@ -23,7 +24,7 @@ const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 // 2) Product image -> Gemini -> structured product fields
 // ============================================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -264,13 +265,13 @@ app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
       }),
     });
     const aiData = await aiRes.json().catch(() => ({}));
-    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) ? friendlyAiError(new Error(aiData.error.message)) : `خطا در ارتباط با Gemini (${aiRes.status})` });
+    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || `خطا در ارتباط با Gemini (${aiRes.status})` });
     const textBlock = (aiData.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((c) => c.text || '').join('').trim();
     if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
     res.json(parseJsonObject(textBlock));
   } catch (e) {
     console.error('Gemini image extraction error:', e);
-    res.status(502).json({ error: friendlyAiError(e) });
+    res.status(502).json({ error: e.message || 'خطای سرور هنگام تحلیل تصویر با Gemini' });
   }
 });
 
@@ -292,21 +293,6 @@ function parseJsonObject(text) {
   const start = cleaned.indexOf('{');
   const end = cleaned.lastIndexOf('}');
   return JSON.parse(start >= 0 && end >= start ? cleaned.slice(start, end + 1) : cleaned);
-}
-
-// پیام‌های خطای خامِ سرویسِ هوش مصنوعی (Gemini) گاهی چند پاراگراف طولانیِ انگلیسی و
-// فنی هستند (مثلاً وقتی سهمیه‌ی یک مدل تمام شده) که برای مدیرِ فارسی‌زبانِ پنل هیچ کمکی نمی‌کند
-// و فقط گیج‌کننده است. این تابع چنین خطاهایی را به یک پیامِ کوتاه و قابلِ‌اقدام تبدیل می‌کند؛ خطاهای
-// کوتاه و از قبل فارسی/قابل‌فهم را دست‌نخورده برمی‌گرداند.
-function friendlyAiError(err) {
-  const raw = (err && err.message) || String(err || '');
-  if (/quota|rate.?limit|429/i.test(raw)) {
-    return 'سهمیه یا محدودیتِ استفاده‌ی سرویسِ هوش مصنوعی برای این مدل تمام شده — چند دقیقه صبر کن، یا در تنظیماتِ Render مقدارِ GEMINI_MODEL را بررسی کن (نباید روی یک مدلِ «تولیدِ عکس» مثل gemini-…-image تنظیم شده باشد؛ این ابزارها به یک مدلِ متنی/بینایی مثل gemini-2.5-flash نیاز دارند).';
-  }
-  if (raw.length > 220) {
-    return raw.slice(0, 200).trim() + '…';
-  }
-  return raw || 'خطای نامشخصی رخ داد';
 }
 
 // Existing Fraganty endpoints.
@@ -338,7 +324,7 @@ app.get('/api/ai/perfume-details', auth, requireAdmin, async (req, res) => {
 });
 
 app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) => {
-  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
+  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'کلید ANTHROPIC_API_KEY روی سرور تنظیم نشده است' });
   const { name, brand, description, accords, seasons, dayNight, gender, rating } = req.body || {};
   if (!name) return res.status(400).json({ error: 'نام محصول الزم است' });
   const instruction = `اطلاعات زیر درباره یک عطر است. یک JSON معتبر بدون Markdown برگردان.
@@ -352,9 +338,14 @@ app.post('/api/ai/translate-perfume-text', auth, requireAdmin, async (req, res) 
 زمان استفاده روز/شب: ${JSON.stringify(dayNight || '')}
 ساختار دقیق: {"description":"توضیح کوتاه دو تا سه جمله‌ای کاملاً فارسی","properties":"چند ویژگی کوتاه فارسی، هرکدام در خط جدا، حداکثر ۵ خط"}`;
   try {
-    const parsed = await callGeminiText(instruction);
-    res.json({ description: (parsed && parsed.description) || '', properties: (parsed && parsed.properties) || '' });
-  } catch (e) { console.error('AI translate-perfume-text error:', e); res.status(502).json({ error: friendlyAiError(e) }); }
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 700, messages: [{ role: 'user', content: instruction }] }) });
+    const aiData = await aiRes.json();
+    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی' });
+    const textBlock = (aiData.content || []).find((c) => c.type === 'text');
+    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از هوش مصنوعی دریافت شد' });
+    const parsed = parseJsonObject(textBlock.text);
+    res.json({ description: parsed.description || '', properties: parsed.properties || '' });
+  } catch (e) { console.error('AI translate-perfume-text error:', e); res.status(500).json({ error: 'خطای سرور هنگام ترجمه توضیحات' }); }
 });
 
 async function lookupOpenFacts(code) {
@@ -379,87 +370,41 @@ async function lookupOpenFacts(code) {
   return null;
 }
 
-async function identifyBarcodeWithGemini(code) {
-  if (!GEMINI_API_KEY) return null;
-  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+async function identifyBarcodeWithAI(code) {
+  if (!ANTHROPIC_API_KEY) return null;
   const instruction = `کد بارکد زیر متعلق به یک محصول است: ${code}
-با جستجوی وب، محصول واقعی متناظر را با اطمینان شناسایی کن. اگر مطمئن نیستی حدس نزن و found را false بگذار.
-فقط یک JSON معتبر و بدون Markdown برگردان، دقیقاً با این ساختار: {"found":true,"isPerfume":false,"name":"","nameEn":"","brand":"","imageUrl":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":""}`;
-  const r = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: instruction }] }],
-      tools: [{ google_search: {} }],
-    }),
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error((data && data.error && data.error.message) ? friendlyAiError(new Error(data.error.message)) : `خطا در ارتباط با Gemini (${r.status})`);
-  const text = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
-  if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
-  const parsed = parseJsonObject(text);
+با جستجوی وب، محصول واقعی متناظر را با اطمینان شناسایی کن. اگر مطمئن نیستی حدس نزن.
+فقط JSON معتبر: {"found":true,"isPerfume":false,"name":"","nameEn":"","brand":"","imageUrl":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":""}`;
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }, body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 2000, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: instruction }] }) });
+  const aiData = await aiRes.json();
+  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
+  const textCombined = (aiData.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
+  if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
+  const parsed = parseJsonObject(textCombined);
   if (!parsed || !parsed.found || !parsed.name) return null;
   return parsed;
 }
 
-// جستجوی عکسِ محصول در اینترنت — نسخه‌ی قبلی از ابزارِ google_search خودِ Gemini استفاده می‌کرد،
-// اما آن ابزار یک سهمیه‌ی کاملاً جدا و در تجربه بسیار محدودتر از سهمیه‌ی معمولیِ Gemini دارد (برای
-// همین با اینکه «ورود محصول با لینک» — که هیچ جستجویی نمی‌کند، فقط یک صفحه‌ی مشخص را می‌خواند و
-// متنش را به Gemini می‌دهد — خوب کار می‌کرد، همین قسمت به «سهمیه تمام شده» می‌خورد. راه‌حل: این
-// قسمت را دقیقاً روی همان مسیرِ «ورود محصول با لینک» سوار کردیم — یعنی هیچ سهمیه‌ی هوش مصنوعیِ
-// جداگانه‌ای مصرف نمی‌کند. ابتدا با یک جستجوی سادهٔ رایگان و بدون کلید (صفحه‌ی HTML ساده‌ی
-// DuckDuckGo، بدون جاوااسکریپت) چند لینکِ صفحه‌ی واقعی پیدا می‌کنیم، سپس دقیقاً با همان تابعِ
-// extractPrimaryImageFromHtml که «ورود محصول با لینک» استفاده می‌کند، عکسِ اصلیِ هرکدام از آن
-// صفحات را درمی‌آوریم.
-async function searchWebPages(query) {
-  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const r = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)',
-      'Accept': 'text/html,application/xhtml+xml',
-    },
-  });
-  if (!r.ok) throw new Error(`جستجوی وب پاسخ نداد (کد ${r.status}) — چند لحظه صبر کن و دوباره امتحان کن`);
-  const html = await r.text();
-  const urls = [];
-  const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"/gi;
-  let m;
-  while ((m = re.exec(html)) && urls.length < 10) {
-    let href = m[1];
-    // DuckDuckGo لینکِ نتیجه را داخل یک ریدایرکتِ خودش می‌پیچد؛ آدرسِ واقعیِ صفحه داخل پارامترِ
-    // uddg است — باید از آن استخراج شود، وگرنه به‌جای صفحه‌ی محصول به duckduckgo.com می‌رویم.
-    const uddgMatch = href.match(/[?&]uddg=([^&]+)/);
-    if (uddgMatch) {
-      try { href = decodeURIComponent(uddgMatch[1]); } catch (e) { continue; }
-    }
-    if (/^https?:\/\//i.test(href)) urls.push(href);
-  }
-  return [...new Set(urls)];
-}
-
-// از روی لینک‌های واقعیِ صفحاتی که جستجو پیدا کرده، هرکدام را جداگانه واکشی می‌کند و با
-// extractPrimaryImageFromHtml (همان تابعِ اثبات‌شده‌ی «ورود محصول با لینک») عکسِ اصلیِ آن صفحه
-// را درمی‌آورد؛ به‌محض رسیدن به ۶ نتیجه متوقف می‌شود.
+// جستجوی عکسِ محصول (یا یک رنگِ خاص از محصول) در اینترنت — از همان قابلیتِ web_search کلودی که
+// برای تشخیصِ بارکد استفاده می‌شود کمک می‌گیرد؛ به‌جای یک عکسِ تک، چند نامزدِ مختلف برمی‌گرداند
+// تا مدیر خودش بهترین را از بین‌شان انتخاب کند (نه این‌که خودِ سیستم یکی را به‌صورتِ کور انتخاب کند).
 async function searchProductImageCandidates(query) {
-  const pageUrls = await searchWebPages(query);
-  const found = [];
-  for (const pageUrl of pageUrls) {
-    if (found.length >= 6) break;
-    try {
-      const pr = await fetch(pageUrl, {
-        method: 'GET',
-        redirect: 'follow',
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)', 'Accept': 'text/html,application/xhtml+xml' },
-      });
-      if (!pr.ok) continue;
-      const contentType = pr.headers.get('content-type') || '';
-      if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) continue;
-      const html = await pr.text();
-      const imgUrl = extractPrimaryImageFromHtml(html, pr.url || pageUrl);
-      if (imgUrl) found.push({ url: imgUrl, source: pageUrl });
-    } catch (e) { /* این صفحه جواب نداد یا عکسی نداشت — سراغ صفحه‌ی بعدی */ }
-  }
-  return found;
+  if (!ANTHROPIC_API_KEY) throw new Error('کلید ANTHROPIC_API_KEY روی سرور تنظیم نشده است');
+  const instruction = `با جستجوی وب، ۵ تا ۶ عکسِ باکیفیت و مرتبط برای این محصول پیدا کن: "${query}"
+هر آدرس باید مستقیماً به خودِ فایلِ تصویر (jpg/jpeg/png/webp) ختم شود، نه به یک صفحه‌ی HTML. فقط عکس‌هایی را انتخاب کن که به‌وضوح همین محصول (یا همین رنگِ مشخص‌شده، اگر در عبارتِ جستجو نامِ رنگ آمده) را نشان می‌دهند — نه محصولِ مشابه از برندِ دیگر، نه بنر یا لوگو. اگر برای بخشی از درخواست (مثلاً یک رنگِ خاص) عکسِ مطمئنی پیدا نکردی، آن را خالی بگذار و فقط عکس‌های مطمئن را برگردان.
+فقط JSON معتبر: {"results":[{"url":"","source":""}]}`;
+  const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 1500, tools: [{ type: 'web_search_20250305', name: 'web_search' }], messages: [{ role: 'user', content: instruction }] }),
+  });
+  const aiData = await aiRes.json();
+  if (!aiRes.ok) throw new Error((aiData && aiData.error && aiData.error.message) || 'خطا در ارتباط با سرویس هوش مصنوعی');
+  const textCombined = (aiData.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('\n').trim();
+  if (!textCombined) throw new Error('پاسخ نامعتبر از هوش مصنوعی دریافت شد');
+  const parsed = parseJsonObject(textCombined);
+  const results = Array.isArray(parsed && parsed.results) ? parsed.results : [];
+  return results.filter((r) => r && typeof r.url === 'string' && /^https?:\/\//i.test(r.url)).slice(0, 6);
 }
 
 app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
@@ -482,7 +427,7 @@ app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) =>
     res.json({ results: mirrored.filter(Boolean) });
   } catch (e) {
     console.error('search-product-image error:', e);
-    res.status(502).json({ error: friendlyAiError(e) });
+    res.status(502).json({ error: e.message || 'جستجوی عکس ناموفق بود' });
   }
 });
 
@@ -495,12 +440,12 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
   let free = null;
   try { free = await lookupOpenFacts(code); } catch (e) { console.error('lookupOpenFacts error:', e.message); }
   let ai = null; let aiError = null;
-  if (GEMINI_API_KEY) {
-    try { ai = await identifyBarcodeWithGemini(code); if (!ai) aiError = 'محصول با جستجوی هوش مصنوعی هم شناسایی نشد'; }
-    catch (e) { aiError = e.message; console.error('identifyBarcodeWithGemini failed (non-fatal):', aiError); }
+  if (ANTHROPIC_API_KEY) {
+    try { ai = await identifyBarcodeWithAI(code); if (!ai) aiError = 'محصول با جستجوی هوش مصنوعی هم شناسایی نشد'; }
+    catch (e) { aiError = e.message; console.error('identifyBarcodeWithAI failed (non-fatal):', aiError); }
   }
   let note = null;
-  if (!ai) note = !GEMINI_API_KEY ? 'کلید هوش مصنوعی روی سرور تنظیم نشده — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی' : `غنی‌سازی با هوش مصنوعی ناموفق بود — ${aiError || ''}`;
+  if (!ai) note = !ANTHROPIC_API_KEY ? 'کلید هوش مصنوعی روی سرور تنظیم نشده — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی' : `غنی‌سازی با هوش مصنوعی ناموفق بود — ${aiError || ''}`;
   if (!free && !ai) return res.json({ foundInOwnDb: false, external: null, note });
   const rawImage = (ai && ai.imageUrl) || (free && free.image) || '';
   const mirroredImage = rawImage ? await mirrorRemoteImageToCloudinary(rawImage) : null;
@@ -558,21 +503,6 @@ function stripHtmlForGemini(html) {
     const labelMatch = tag.match(/\s(?:title|aria-label|data-label|data-name|data-color)=["']([^"']*)["']/i);
     const alt = labelMatch ? labelMatch[1].replace(/["\[\]]/g, '') : '';
     return ` [IMG src="${src}" alt="${alt}"] `;
-  });
-
-  // بعضی سوآچ‌های رنگ اصلاً عکس ندارند — فقط یک دایره‌ی رنگیِ ساده هستند که با CSS
-  // (background-color یا background: به‌صورتِ هگز/rgb) رنگ گرفته‌اند، نه با عکس. این عنصرها را به
-  // نشانه‌ی [COLOR hex="..." alt="..."] تبدیل می‌کند — فقط وقتی که عنصر یک برچسبِ قابل‌خواندن
-  // (title/aria-label/data-name/data-color) هم داشته باشد؛ بدونِ برچسب، نمی‌دانیم اسمِ رنگ چیست و
-  // ممکن است یک رنگِ دکوراتیوِ بی‌ربط (مثلاً پس‌زمینه‌ی یک دکمه) باشد، نه سوآچِ واقعیِ محصول.
-  text = text.replace(/<[a-z][a-z0-9]*\b[^>]*\sstyle=["'][^"']*background(?:-color)?\s*:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)"']+\))[^"']*["'][^>]*>/gi, (tag, rawColor) => {
-    const labelMatch = tag.match(/\s(?:title|aria-label|data-label|data-name|data-color)=["']([^"']*)["']/i);
-    if (!labelMatch) return tag;
-    imgCount += 1;
-    if (imgCount > IMG_LIMIT) return ' ';
-    const alt = labelMatch[1].replace(/["\[\]]/g, '');
-    if (!alt) return tag;
-    return ` [COLOR hex="${String(rawColor || '').trim()}" alt="${alt}"] `;
   });
 
   return text
@@ -940,7 +870,7 @@ async function callGeminiText(prompt) {
 function buildGeminiProductPrompt(sourceText, sourceUrl) {
   return `تو مسئول استخراج اطلاعات دقیق محصول برای پنل مدیریت فروشگاه هستی.
 منبع: ${sourceUrl}
-متن صفحه محصول در ادامه آمده است. هرجا نشانه‌ی [IMG src="..." alt="..."] دیدی، یعنی در آن نقطه از صفحه یک عکس بوده — src آدرس عکس و alt توضیح/برچسبِ کنار آن عکس است (مثلاً اسمِ رنگ در صفحه‌ی محصولاتی مثل رژلب یا کرم‌پودر). هرجا نشانه‌ی [COLOR hex="..." alt="..."] دیدی، یعنی یک سوآچِ رنگِ ساده (بدون عکس، فقط یک دایره‌ی تخت‌رنگ) بوده — hex کدِ رنگ و alt نامِ همان رنگ است. از این نشانه‌ها برای تشخیص «کدام عکس/رنگ مالِ کدام طیفِ رنگ است» و «کدام عکس، تصویرِ اصلیِ خودِ محصول است» استفاده کن.
+متن صفحه محصول در ادامه آمده است. هرجا نشانه‌ی [IMG src="..." alt="..."] دیدی، یعنی در آن نقطه از صفحه یک عکس بوده — src آدرس عکس و alt توضیح/برچسبِ کنار آن عکس است (مثلاً اسمِ رنگ در صفحه‌ی محصولاتی مثل رژلب یا کرم‌پودر). از این نشانه‌ها برای تشخیص «کدام عکس مالِ کدام طیفِ رنگ است» و «کدام عکس، تصویرِ اصلیِ خودِ محصول است» استفاده کن.
 فقط اطلاعاتی را وارد کن که از منبع قابل تشخیص است؛ هرگز حدس نزن و اطلاعات جعلی نساز.
 تمام فیلدهای متنی فارسی روان باشند، به‌جز nameEn که باید نام دقیق اصلی محصول باشد، concentration که باید مقدار استاندارد انگلیسی باشد، و mainAccords که باید همان کلمات انگلیسیِ اصلیِ بخشِ «Main accords» باشد — هر آکورد را جدا و با ویرگول از بعدی جدا کن (مثلاً Oriental, Woody, Spicy — نه «Oriental Woody» به‌عنوانِ یک آیتم، مگر خودِ عبارت روی صفحه دقیقاً یک اصطلاحِ دوکلمه‌ای شناخته‌شده مثل «White Floral» یا «Warm Spicy» باشد). ترتیبِ آکوردها را دقیقاً همان ترتیبِ روی صفحه (از قوی‌ترین/بزرگ‌ترین به ضعیف‌ترین) نگه دار. نامِ برندینگِ ویجت‌های شخص‌ثالثِ نمایش‌دهنده‌ی این بخش (مثل «Smell»، «Feel»، «Smell & Feel») و نشانه‌های [IMG ...] هرگز آکورد نیستند — آن‌ها را در mainAccords نیاور.
 قیمت خارجی را به تومان تبدیل نکن. اگر قیمت صفحه تومان/ریال است، priceToman را فقط به رقم خام بده؛ در غیر این صورت خالی و مقدار و ارز اصلی را در referencePriceNote بیاور.
@@ -948,7 +878,7 @@ categoryGuess فقط یکی از perfume, sprayAndSplash, makeup, hygiene, elect
 برای عطر، نت‌ها، آکوردهای اصلی، عطار و غلظت را فقط در صورت وجود منبع بده.
 scentScore/longevityScore/sillageScore فقط اعداد بین ۰ تا ۱۰ هستند (مثلاً همان امتیازهای Scent/Longevity/Sillage در Fragrantica)؛ scentRatings/longevityRatings/sillageRatings تعداد رأی‌دهندگان همان امتیاز است. اگر هیچ‌کدام در منبع نبود، همه را خالی بگذار.
 mainImageUrl را فقط اگر یک [IMG] با src مشخص، به‌وضوح تصویرِ اصلیِ خودِ محصول (نه لوگو، نه بنر، نه آیکون، و نه یک دایره‌ی کوچکِ سوآچِ رنگ) باشد پر کن؛ همان src را بدون تغییر بده. اگر صفحه چند [IMG] پشتِ‌سرهم و شبیه‌به‌هم دارد که هرکدام با نامِ یک رنگ/شماره در alt همراه است، اینها سوآچِ رنگ‌ها هستند نه تصویرِ اصلی — آن‌ها را فقط در variants بیاور، نه در mainImageUrl.
-اگر محصول طیفِ رنگ دارد (مثل رژلب، کرم‌پودر، سایه، لاک)، برای هر رنگ یک آیتم در variants بساز: label نامِ فارسیِ همان رنگ/شماره، hex کدِ رنگِ نزدیک (از یک [COLOR] یا هر جای دیگرِ صفحه که کد رنگ آمده؛ اگر پیدا نشد خالی)، و imageUrl همان src از نزدیک‌ترین [IMG] که alt یا متنِ اطرافش با نامِ همان رنگ می‌خواند — اگر برای یک رنگ عکسِ مجزا پیدا نشد، imageUrl را خالی بگذار (هرگز عکسِ یک رنگِ دیگر را به‌اشتباه نسبت نده).
+اگر محصول طیفِ رنگ دارد (مثل رژلب، کرم‌پودر، سایه، لاک)، برای هر رنگ یک آیتم در variants بساز: label نامِ فارسیِ همان رنگ/شماره، hex کدِ رنگِ نزدیک (اگر مشخص نبود خالی)، و imageUrl همان src از نزدیک‌ترین [IMG] که alt یا متنِ اطرافش با نامِ همان رنگ می‌خواند — اگر برای یک رنگ عکسِ مجزا پیدا نشد، imageUrl را خالی بگذار (هرگز عکسِ یک رنگِ دیگر را به‌اشتباه نسبت نده).
 JSON دقیقاً با این ساختار برگردان:
 {
 "name":"","nameEn":"","brand":"","categoryGuess":"","subcategoryHint":"","priceToman":"","referencePriceNote":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":"","scentScore":"","scentRatings":"","longevityScore":"","longevityRatings":"","sillageScore":"","sillageRatings":"","mainImageUrl":"","variants":[]
@@ -958,45 +888,6 @@ variants آرایه‌ای از {"label":"","hex":"","imageUrl":""} باشد.
 متن صفحه:
 ${sourceText}`;
 }
-
-// پرامپتِ اختصاصیِ «فقط طیفِ رنگ» — برخلافِ buildGeminiProductPrompt که همه‌ی فیلدهای محصول را
-// می‌خواهد، این یکی عمداً محدود و متمرکز است: هیچ فیلدی جز variants نمی‌خواهد، پس Gemini حواسش
-// پرتِ توضیح/قیمت/عکسِ اصلی/نت و غیره نمی‌شود و فقط و فقط دنبالِ رنگ‌ها می‌گردد — دقیقاً همان
-// چیزی که کاربر خواسته: تمرکزِ کامل روی «Color / Select Color» و نمونه‌رنگ‌های کنارش.
-function buildVariantExtractionPrompt(sourceText, sourceUrl) {
-  return `تو فقط و فقط مسئولِ یک کار هستی: پیدا کردنِ «طیف رنگِ» این محصول از صفحه‌ی زیر. هیچ فیلدِ دیگری (نام، قیمت، توضیح، عکسِ اصلیِ محصول، نت، آکورد و غیره) نمی‌خواهیم — رویشان وقت نگذار.
-منبع: ${sourceUrl}
-هرجا نشانه‌ی [IMG src="..." alt="..."] دیدی، یعنی یک عکس بوده (alt معمولاً اسمِ همان رنگ است). هرجا نشانه‌ی [COLOR hex="..." alt="..."] دیدی، یعنی یک سوآچِ رنگِ ساده (بدونِ عکس) بوده که alt اسمِ رنگ و hex کدِ آن است.
-معمولاً این بخش زیرِ عنوانی مثل «Color»، «Select Color»، «Shade» یا فارسی‌اش «انتخاب رنگ»/«رنگ‌بندی» می‌آید و شاملِ چند دایره یا مربعِ کوچکِ رنگی پشتِ‌سرهم است. تمامِ رنگ‌های موجودِ همان محصول (نه محصولاتِ مرتبطِ دیگر، نه رنگِ عناصرِ تزئینیِ صفحه) را پیدا کن.
-برای هر رنگ یک آیتم بساز:
-- label: نامِ دقیقِ همان رنگ، عیناً همان‌طور که روی صفحه نوشته شده (اگر انگلیسی بود انگلیسی بده، ترجمه نکن و از خودت اسم نساز)
-- hex: کدِ رنگِ آن (از یک [COLOR] یا هر نشانه‌ی دیگری از کدِ رنگ در متن)؛ اگر پیدا نکردی، خالی بگذار
-- imageUrl: اگر همان رنگ عکسِ مجزای خودش را دارد (از نزدیک‌ترین [IMG] که alt‌اش با نامِ همان رنگ می‌خواند)، همان src را بده؛ اگر مطمئن نیستی کدام عکس مالِ کدام رنگ است، imageUrl را خالی بگذار — هرگز حدسی به یک رنگ نسبت نده.
-اگر اصلاً طیفِ رنگی روی صفحه پیدا نکردی، آرایه‌ی variants را خالی برگردان.
-فقط یک JSON معتبر و بدون Markdown برگردان، دقیقاً با این ساختار: {"variants":[{"label":"","hex":"","imageUrl":""}]}
-
-متن صفحه:
-${sourceText}`;
-}
-
-app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, res) => {
-  const url = validateProductUrl(req.body && req.body.url);
-  if (!url) return res.status(400).json({ error: 'لینک محصول معتبر نیست' });
-  try {
-    const page = await fetchProductPage(url);
-    const text = stripHtmlForGemini(page.html);
-    if (!text) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
-    const parsed = await callGeminiText(buildVariantExtractionPrompt(text, page.finalUrl));
-    const rawVariants = Array.isArray(parsed && parsed.variants) ? parsed.variants : [];
-    // عکسِ هرکدام از رنگ‌ها را (اگر Gemini آدرسی پیدا کرده) همین‌جا روی Cloudinary آپلود می‌کنیم —
-    // دقیقاً همان کاری که برای طیفِ رنگِ «ورود محصول با لینک» هم انجام می‌شود.
-    const variants = await mirrorVariantImages(rawVariants, page.finalUrl);
-    res.json({ variants });
-  } catch (e) {
-    console.error('extract-variants-from-url error:', e);
-    res.status(502).json({ error: friendlyAiError(e) });
-  }
-});
 
 app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res) => {
   const url = validateProductUrl(req.body && req.body.url);
@@ -1032,7 +923,7 @@ app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res
     res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
   } catch (e) {
     console.error('Gemini URL extraction error:', e);
-    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: friendlyAiError(e) });
+    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
   }
 });
 
@@ -1059,13 +950,13 @@ app.post('/api/ai/extract-product-from-image', auth, requireAdmin, async (req, r
       }),
     });
     const data = await r.json();
-    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) ? friendlyAiError(new Error(data.error.message)) : 'خطا در ارتباط با Gemini' });
+    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini' });
     const text = (data.candidates || []).flatMap((c) => c.content && c.content.parts || []).map((p) => p.text || '').join('').trim();
     if (!text) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
     res.json(parseJsonObject(text));
   } catch (e) {
     console.error('Gemini image extraction error:', e);
-    res.status(502).json({ error: friendlyAiError(e) });
+    res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
   }
 });
 
@@ -1101,7 +992,7 @@ app.post('/api/ai/import-product-url', auth, requireAdmin, async (req, res) => {
     res.json({ ...product, imageUrl: mirroredImageUrl || undefined, sourceUrl: page.finalUrl });
   } catch (e) {
     console.error('Gemini URL extraction error:', e);
-    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: friendlyAiError(e) });
+    res.status(e.message && e.message.includes('GEMINI_API_KEY') ? 500 : 502).json({ error: e.message || 'تحلیل لینک با Gemini ناموفق بود' });
   }
 });
 
@@ -1126,13 +1017,13 @@ app.post('/api/ai/analyze-perfume-image', auth, requireAdmin, async (req, res) =
       }),
     });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) ? friendlyAiError(new Error(data.error.message)) : `خطا در ارتباط با Gemini (${r.status})` });
+    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) || `خطا در ارتباط با Gemini (${r.status})` });
     const resultText = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
     if (!resultText) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
     res.json(parseJsonObject(resultText));
   } catch (e) {
     console.error('Gemini perfume image error:', e);
-    res.status(502).json({ error: friendlyAiError(e) });
+    res.status(502).json({ error: e.message || 'تحلیل تصویر با Gemini ناموفق بود' });
   }
 });
 
