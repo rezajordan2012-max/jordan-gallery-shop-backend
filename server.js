@@ -209,23 +209,57 @@ async function uploadDataUriToCloudinary(dataUri) {
   return { url: data.secure_url, type: isVideo ? 'video' : 'image' };
 }
 
-async function mirrorRemoteImageToCloudinary(remoteUrl) {
+// توضیحِ اصلاحِ مهم: نسخه‌ی قبلی این تابع، عکس را با یک fetch ساده (بدون هیچ هدری) از سایتِ
+// مبدأ می‌گرفت. خیلی از CDNهای بزرگ (از جمله همان‌هایی که برندهایی مثل دیور از آن‌ها استفاده
+// می‌کنند — Akamai، Scene7 و مشابه) هر درخواستی را که User-Agent مرورگر نداشته باشد یا هدرِ
+// Referer درستی (آدرسِ همان صفحه‌ای که عکس رویش نمایش داده می‌شود) نفرستد، با کدِ ۴۰۳ رد
+// می‌کنند — یعنی «حفاظت در برابر هات‌لینک». دقیقاً همین بود که باعث می‌شد این تابع همیشه (بدون
+// هیچ خطای قابل‌مشاهده‌ای برای مدیر، چون فقط در لاگِ سرور ثبت می‌شد) null برگرداند و در نتیجه
+// «فقط شماره‌ی رنگ» منتقل شود ولی خودِ عکس هرگز آپلود نشود. برای رفعِ این مشکل:
+//   ۱) یک User-Agent و Accept کاملاً شبیهِ مرورگرِ واقعی می‌فرستیم.
+//   ۲) اگر referer (آدرسِ صفحه‌ی مبدأ) داده شده باشد، آن را هم می‌فرستیم.
+//   ۳) اگر عکس مستقیماً به‌صورت data: URI باشد (بعضی صفحات به‌جای لینک، خودِ عکس را به همین شکل
+//      داخل HTML می‌گذارند)، دیگر نیازی به دانلود نیست — مستقیم آپلود می‌شود.
+//   ۴) اگر دانلود یا آپلود شکست بخورد، دلیلِ دقیق را برمی‌گرداند (نه فقط null) تا لایه‌ی بالاتر
+//      بتواند به‌جای عکس، لینکِ خامِ اصلی را نگه دارد (بهتر از گم‌شدنِ کاملِ عکس است) و اگر لازم
+//      شد پیام روشنی به مدیر نشان دهد.
+async function mirrorRemoteImageToCloudinary(remoteUrl, options = {}) {
+  const referer = options && options.referer;
   try {
-    if (!remoteUrl || typeof remoteUrl !== 'string' || !/^https?:\/\//i.test(remoteUrl)) return null;
-    const imgRes = await fetch(remoteUrl);
-    if (!imgRes.ok) return null;
+    if (!remoteUrl || typeof remoteUrl !== 'string') return { url: null, reason: 'آدرس عکس خالی است' };
+
+    // حالت data: URI — عکس از قبل داخلِ خودِ صفحه به‌صورت base64 آمده، نیازی به دانلود نیست.
+    if (/^data:image\//i.test(remoteUrl)) {
+      const cleanedDirect = await removeBackgroundFromDataUri(remoteUrl);
+      const uploadedDirect = await uploadDataUriToCloudinary(cleanedDirect);
+      return { url: uploadedDirect.url, reason: null };
+    }
+
+    if (!/^https?:\/\//i.test(remoteUrl)) return { url: null, reason: 'فرمتِ آدرسِ عکس پشتیبانی نمی‌شود' };
+
+    const fetchHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+    };
+    if (referer) fetchHeaders['Referer'] = referer;
+
+    const imgRes = await fetch(remoteUrl, { headers: fetchHeaders });
+    if (!imgRes.ok) return { url: null, reason: `دانلودِ عکس با کدِ ${imgRes.status} رد شد (احتمالاً سایتِ مبدأ دانلودِ خودکار را مسدود کرده)` };
     const contentType = imgRes.headers.get('content-type') || '';
-    if (!contentType.startsWith('image/')) return null;
+    if (!contentType.startsWith('image/')) return { url: null, reason: `پاسخِ سایتِ مبدأ عکس نبود (${contentType || 'نامشخص'})` };
     const buffer = Buffer.from(await imgRes.arrayBuffer());
-    if (buffer.length > 10 * 1024 * 1024) return null;
+    if (buffer.length > 10 * 1024 * 1024) return { url: null, reason: 'حجمِ عکس بیش از ۱۰ مگابایت است' };
     const mimeForDataUri = contentType.split(';')[0].replace('image/jpg', 'image/jpeg');
     const supported = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
-    if (!supported.includes(mimeForDataUri)) return null;
+    if (!supported.includes(mimeForDataUri)) return { url: null, reason: `فرمتِ عکس (${mimeForDataUri}) پشتیبانی نمی‌شود` };
     const dataUri = `data:${mimeForDataUri};base64,${buffer.toString('base64')}`;
     const cleaned = await removeBackgroundFromDataUri(dataUri);
     const uploaded = await uploadDataUriToCloudinary(cleaned);
-    return uploaded.url;
-  } catch (e) { console.error('mirrorRemoteImageToCloudinary failed:', e.message); return null; }
+    return { url: uploaded.url, reason: null };
+  } catch (e) {
+    console.error('mirrorRemoteImageToCloudinary failed:', e.message);
+    return { url: null, reason: e.message || 'خطای ناشناخته هنگام دانلود/آپلود عکس' };
+  }
 }
 
 app.post('/api/upload', auth, requireAdmin, async (req, res) => {
@@ -302,6 +336,12 @@ function friendlyAiError(err) {
   const raw = (err && err.message) || String(err || '');
   if (/quota|rate.?limit|429/i.test(raw)) {
     return 'سهمیه یا محدودیتِ استفاده‌ی سرویسِ هوش مصنوعی برای این مدل تمام شده — چند دقیقه صبر کن، یا در تنظیماتِ Render مقدارِ GEMINI_MODEL را بررسی کن (نباید روی یک مدلِ «تولیدِ عکس» مثل gemini-…-image تنظیم شده باشد؛ این ابزارها به یک مدلِ متنی/بینایی مثل gemini-2.5-flash نیاز دارند).';
+  }
+  // خطای «مدل پیدا نشد» — معمولاً یعنی مقدارِ GEMINI_MODEL روی Render دقیقاً با شناسه‌ی رسمیِ
+  // مدل در Google AI Studio یکی نیست (مثلاً gemini-3.5-flash اگر هنوز روی حسابِ شما فعال/منتشر
+  // نشده باشد). با همین پیام، مدیر می‌داند دقیقاً کجا را باید چک کند.
+  if (/not found|404|is not supported|not_found/i.test(raw) && /model/i.test(raw)) {
+    return `مدلِ هوش مصنوعیِ تنظیم‌شده (GEMINI_MODEL="${GEMINI_MODEL}") پیدا نشد یا برای این کلید فعال نیست — در Google AI Studio (aistudio.google.com) شناسهٔ دقیقِ مدلی که به آن دسترسی داری را ببین (مثلاً gemini-2.5-flash یا gemini-2.0-flash) و همان را در متغیرِ محیطیِ GEMINI_MODEL روی Render قرار بده.`;
   }
   if (raw.length > 220) {
     return raw.slice(0, 200).trim() + '…';
@@ -426,8 +466,6 @@ async function searchWebPages(query) {
   let m;
   while ((m = re.exec(html)) && urls.length < 10) {
     let href = m[1];
-    // DuckDuckGo لینکِ نتیجه را داخل یک ریدایرکتِ خودش می‌پیچد؛ آدرسِ واقعیِ صفحه داخل پارامترِ
-    // uddg است — باید از آن استخراج شود، وگرنه به‌جای صفحه‌ی محصول به duckduckgo.com می‌رویم.
     const uddgMatch = href.match(/[?&]uddg=([^&]+)/);
     if (uddgMatch) {
       try { href = decodeURIComponent(uddgMatch[1]); } catch (e) { continue; }
@@ -437,9 +475,6 @@ async function searchWebPages(query) {
   return [...new Set(urls)];
 }
 
-// از روی لینک‌های واقعیِ صفحاتی که جستجو پیدا کرده، هرکدام را جداگانه واکشی می‌کند و با
-// extractPrimaryImageFromHtml (همان تابعِ اثبات‌شده‌ی «ورود محصول با لینک») عکسِ اصلیِ آن صفحه
-// را درمی‌آورد؛ به‌محض رسیدن به ۶ نتیجه متوقف می‌شود.
 async function searchProductImageCandidates(query) {
   const pageUrls = await searchWebPages(query);
   const found = [];
@@ -468,13 +503,10 @@ app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) =>
   try {
     const candidates = await searchProductImageCandidates(query);
     if (candidates.length === 0) return res.json({ results: [] });
-    // هرکدام از نتایج را همین الان روی Cloudinary خودمان آپلود می‌کنیم — تا چیزی که مدیر در
-    // پنجره‌ی نتایج می‌بیند، دقیقاً همان چیزی باشد که با یک کلیک ذخیره می‌شود (نه یک لینکِ
-    // خارجیِ ناپایدار که ممکن است فردا از دسترس خارج شود).
     const mirrored = await Promise.all(
       candidates.map(async (c) => {
         try {
-          const url = await mirrorRemoteImageToCloudinary(c.url);
+          const { url } = await mirrorRemoteImageToCloudinary(c.url, { referer: c.source });
           return url ? { url, source: c.source || '' } : null;
         } catch (e) { return null; }
       })
@@ -503,7 +535,7 @@ app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) =>
   if (!ai) note = !GEMINI_API_KEY ? 'کلید هوش مصنوعی روی سرور تنظیم نشده — نام فارسی، توضیح، ویژگی‌ها، ترکیبات و نت‌های عطر را باید دستی وارد کنی' : `غنی‌سازی با هوش مصنوعی ناموفق بود — ${aiError || ''}`;
   if (!free && !ai) return res.json({ foundInOwnDb: false, external: null, note });
   const rawImage = (ai && ai.imageUrl) || (free && free.image) || '';
-  const mirroredImage = rawImage ? await mirrorRemoteImageToCloudinary(rawImage) : null;
+  const mirroredImage = rawImage ? (await mirrorRemoteImageToCloudinary(rawImage)).url : null;
   res.json({ foundInOwnDb: false, note, external: { found: true, source: ai ? (free ? 'ai+free' : 'ai') : 'free', isPerfume: ai ? !!ai.isPerfume : null, name: (ai && ai.name) || '', title: (ai && ai.nameEn) || (free && free.title) || '', brand: (ai && ai.brand) || (free && free.brand) || '', image: mirroredImage || rawImage || '', description: (ai && ai.description) || '', properties: (ai && ai.properties) || '', ingredients: (ai && ai.ingredients) || (free && free.ingredients) || '', volume: (ai && ai.volume) || (free && free.volume) || '', concentration: (ai && ai.concentration) || '', topNotes: (ai && ai.topNotes) || '', middleNotes: (ai && ai.middleNotes) || '', baseNotes: (ai && ai.baseNotes) || '', mainAccords: (ai && ai.mainAccords) || '', perfumer: (ai && ai.perfumer) || '', countryOfOrigin: (ai && ai.countryOfOrigin) || '', yearMade: ai && ai.yearMade ? String(ai.yearMade) : '' } });
 }));
 
@@ -518,38 +550,148 @@ function validateProductUrl(value) {
   } catch { return null; }
 }
 
+// از یک مقدارِ srcset (که می‌تواند چند کاندیدِ "آدرس عرضِ‌پیکسلی" با ویرگول جدا از هم داشته
+// باشد — مثلاً «a.jpg 400w, b.jpg 800w, c.jpg 1600w») بزرگ‌ترین/باکیفیت‌ترین کاندید را برمی‌گرداند؛
+// نسخه‌ی قبلی فقط اولین آدرسِ قبل از اولین ویرگول را برمی‌داشت که اغلب کوچک‌ترین/کم‌کیفیت‌ترین
+// نسخه بود. اگر هیچ‌کدام عددِ عرض نداشتند، آخرین کاندید (که معمولاً بزرگ‌ترین است) انتخاب می‌شود.
+function pickLargestFromSrcset(srcsetStr) {
+  const candidates = String(srcsetStr || '')
+    .split(',')
+    .map((c) => c.trim())
+    .filter(Boolean)
+    .map((c) => {
+      const parts = c.split(/\s+/);
+      const url = parts[0];
+      const descriptor = parts[1] || '';
+      const widthMatch = descriptor.match(/(\d+)w/);
+      const densityMatch = descriptor.match(/(\d+(?:\.\d+)?)x/);
+      const weight = widthMatch ? Number(widthMatch[1]) : densityMatch ? Number(densityMatch[1]) * 1000 : 0;
+      return { url, weight };
+    })
+    .filter((c) => c.url);
+  if (candidates.length === 0) return '';
+  candidates.sort((a, b) => b.weight - a.weight);
+  return candidates[0].url;
+}
+
+// خیلی از فروشگاه‌های مدرن (از جمله سایت‌های ساخته‌شده با فریم‌ورک‌های Reactگونه مثل Next.js —
+// دقیقاً مدلی که دیور و برندهای مشابه استفاده می‌کنند) اطلاعاتِ رنگ‌ها/طیف را به‌جای HTML ساده،
+// به‌صورت یک بلوکِ JSON داخلِ <script> (مثلاً __NEXT_DATA__ یا state اولیه‌ی اپ) توی خودِ صفحه
+// می‌گذارند تا بعداً با جاوااسکریپت رندر شود. چون سرورِ ما فقط HTMLِ خام را می‌خواند (جاوااسکریپت
+// اجرا نمی‌کند)، تگ‌های <img> واقعی برای این رنگ‌ها هرگز به‌وجود نمی‌آیند — برای همین بود که فقط
+// اسمِ رنگ (که جایی دیگر، مثلاً در متنِ نمایشی، هم آمده) پیدا می‌شد ولی عکسش نه. این تابع، پیش
+// از حذفِ تگ‌های <script>، همان بلوک‌های JSON را می‌گردد و با یک تطبیقِ نزدیکی (کلیدهای شبیه به
+// نام‌رنگ که نزدیکِ کلیدهای شبیه به عکس/کدِ‌رنگ افتاده‌اند) نشانه‌های مصنوعیِ [IMG]/[COLOR]
+// می‌سازد و به متنی که برای Gemini فرستاده می‌شود اضافه می‌کند.
+function extractSwatchDataFromScripts(html) {
+  const scriptBlocks = [];
+  const scriptRe = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = scriptRe.exec(String(html || '')))) {
+    const body = m[1];
+    if (body && body.length > 20 && /colou?r|swatch|variant/i.test(body)) {
+      scriptBlocks.push(body.length > 400000 ? body.slice(0, 400000) : body);
+    }
+  }
+  if (scriptBlocks.length === 0) return '';
+
+  const nameRe = /"(?:colorName|colourName|colorTitle|colourTitle|variantName|shadeName|swatchName|name|title|label)"\s*:\s*"([^"]{1,80})"/gi;
+  const imageRe = /"(?:swatchImage|swatchImageUrl|swatchUrl|colorImage|colourImage|variantImage|thumbnailImage|thumbnail|image|imageUrl|img|media|url)"\s*:\s*"((?:https?:)?\/\/[^"\\]+|\/[^"\\]+\.(?:jpg|jpeg|png|webp)[^"\\]*)"/gi;
+  const hexRe = /"(?:hex|hexCode|colorHex|colourHex|swatchHex)"\s*:\s*"(#?[0-9a-fA-F]{3,8})"/gi;
+
+  const WINDOW = 700; // بازه‌ی نزدیکیِ مجاز بین نامِ رنگ و عکس/کدش، برای جلوگیری از وصل‌شدنِ اشتباه به رنگِ کاملاً دیگر
+  const tokens = [];
+  const seenLabels = new Set();
+
+  scriptBlocks.forEach((block) => {
+    const names = [];
+    let nm;
+    nameRe.lastIndex = 0;
+    while ((nm = nameRe.exec(block))) names.push({ idx: nm.index, val: nm[1] });
+    const images = [];
+    let im;
+    imageRe.lastIndex = 0;
+    while ((im = imageRe.exec(block))) images.push({ idx: im.index, val: im[1] });
+    const hexes = [];
+    let hm;
+    hexRe.lastIndex = 0;
+    while ((hm = hexRe.exec(block))) hexes.push({ idx: hm.index, val: hm[1] });
+
+    names.forEach((n) => {
+      const label = n.val.replace(/["\[\]]/g, '').trim();
+      if (!label || seenLabels.has(label.toLowerCase())) return;
+      const closestImage = images.reduce((best, img) => {
+        const dist = Math.abs(img.idx - n.idx);
+        return dist <= WINDOW && (!best || dist < best.dist) ? { ...img, dist } : best;
+      }, null);
+      const closestHex = hexes.reduce((best, hx) => {
+        const dist = Math.abs(hx.idx - n.idx);
+        return dist <= WINDOW && (!best || dist < best.dist) ? { ...hx, dist } : best;
+      }, null);
+      if (closestImage) {
+        seenLabels.add(label.toLowerCase());
+        tokens.push(` [IMG src="${closestImage.val}" alt="${label}"] `);
+      } else if (closestHex) {
+        seenLabels.add(label.toLowerCase());
+        tokens.push(` [COLOR hex="${closestHex.val}" alt="${label}"] `);
+      }
+    });
+  });
+
+  return tokens.join('');
+}
+
 function stripHtmlForGemini(html) {
   let imgCount = 0;
-  const IMG_LIMIT = 60;
-  let text = String(html || '')
+  const IMG_LIMIT = 80;
+  const rawHtml = String(html || '');
+
+  // نکته‌ی مهم: این استخراج باید پیش از حذفِ <script> انجام شود، چون دقیقاً همان بلوک‌هایی که
+  // الان حذف می‌کنیم منبعِ اصلیِ داده‌ی رنگ‌ها در سایت‌های JS-محور است.
+  const swatchTokensFromScripts = extractSwatchDataFromScripts(rawHtml);
+
+  let text = rawHtml
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
     .replace(/<svg[\s\S]*?<\/svg>/gi, ' ');
 
-  // پیش از حذفِ کلیِ تگ‌ها، تگ‌های <img> را به یک نشانه‌ی متنیِ فشرده تبدیل می‌کند که هم آدرسِ
-  // عکس (src — یا معادل‌های تنبل‌بارگذاری مثل data-src/data-original/srcset) و هم متنِ
-  // جایگزینش (alt — معمولاً همان نامِ رنگ/طیف در صفحاتِ محصولاتِ آرایشی) را نگه می‌دارد؛ همین
-  // یعنی Gemini می‌تواند تشخیص دهد کدام عکس مالِ کدام طیفِ رنگ است.
+  // تگ‌های <source> داخلِ <picture> — خیلی از سایت‌های مدرن (ازجمله دیور) عکسِ اصلی را به‌جای
+  // یک <img> ساده، داخلِ چند <source srcset="..."> با فرمت‌ها/اندازه‌های مختلف می‌گذارند و فقط
+  // یک <img> بی‌ربط یا خالی به‌عنوانِ fallback در انتها می‌آید.
+  text = text.replace(/<source[^>]*>/gi, (tag) => {
+    imgCount += 1;
+    if (imgCount > IMG_LIMIT) return ' ';
+    const srcsetMatch = tag.match(/\ssrcset=["']([^"']+)["']/i);
+    const srcMatch = tag.match(/\ssrc=["']([^"']+)["']/i);
+    const src = srcsetMatch ? pickLargestFromSrcset(srcsetMatch[1]) : srcMatch ? srcMatch[1] : '';
+    if (!src) return ' ';
+    return ` [IMG src="${src}" alt=""] `;
+  });
+
   text = text.replace(/<img[^>]*>/gi, (tag) => {
     imgCount += 1;
     if (imgCount > IMG_LIMIT) return ' ';
+    const srcsetMatch =
+      tag.match(/\sdata-srcset=["']([^"']+)["']/i) ||
+      tag.match(/\ssrcset=["']([^"']+)["']/i);
     const srcMatch =
       tag.match(/\ssrc=["']([^"']+)["']/i) ||
       tag.match(/\sdata-src=["']([^"']+)["']/i) ||
       tag.match(/\sdata-original=["']([^"']+)["']/i) ||
       tag.match(/\sdata-lazy(?:-src)?=["']([^"']+)["']/i) ||
-      tag.match(/\ssrcset=["']([^"',\s]+)/i);
+      tag.match(/\sdata-zoom-image=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-large[_-]?image=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-full-src=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-defer-src=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-echo=["']([^"']+)["']/i);
     const altMatch = tag.match(/\salt=["']([^"']*)["']/i) || tag.match(/\stitle=["']([^"']*)["']/i);
-    const src = srcMatch ? srcMatch[1] : '';
-    if (!src) return ' ';
+    const src = srcsetMatch ? pickLargestFromSrcset(srcsetMatch[1]) : (srcMatch ? srcMatch[1] : '');
+    if (!src || /^data:image\/gif/i.test(src)) return ' '; // gifِ شفافِ ۱پیکسلی معمولِ lazy-load را نادیده می‌گیریم
     const alt = altMatch ? altMatch[1].replace(/["\[\]]/g, '') : '';
     return ` [IMG src="${src}" alt="${alt}"] `;
   });
 
-  // خیلی از سوآچ‌های رنگِ محصولاتِ آرایشی (رژلب، سایه، کرم‌پودر) به‌جای <img>، یک عنصرِ ساده
-  // (div/span/a) با پس‌زمینه‌ی CSS تنظیم‌شده (background-image:url(...)) هستند — این عنصرها را
-  // هم به همان قالبِ نشانه‌ی [IMG] تبدیل می‌کند تا Gemini همان‌ها را هم به‌عنوانِ عکسِ طیف رنگ ببیند.
   text = text.replace(/<[a-z][a-z0-9]*\b[^>]*\sstyle=["'][^"']*background(?:-image)?\s*:\s*url\(\s*['"]?([^'")]+)['"]?\s*\)[^"']*["'][^>]*>/gi, (tag, rawUrl) => {
     imgCount += 1;
     if (imgCount > IMG_LIMIT) return ' ';
@@ -560,11 +702,6 @@ function stripHtmlForGemini(html) {
     return ` [IMG src="${src}" alt="${alt}"] `;
   });
 
-  // بعضی سوآچ‌های رنگ اصلاً عکس ندارند — فقط یک دایره‌ی رنگیِ ساده هستند که با CSS
-  // (background-color یا background: به‌صورتِ هگز/rgb) رنگ گرفته‌اند، نه با عکس. این عنصرها را به
-  // نشانه‌ی [COLOR hex="..." alt="..."] تبدیل می‌کند — فقط وقتی که عنصر یک برچسبِ قابل‌خواندن
-  // (title/aria-label/data-name/data-color) هم داشته باشد؛ بدونِ برچسب، نمی‌دانیم اسمِ رنگ چیست و
-  // ممکن است یک رنگِ دکوراتیوِ بی‌ربط (مثلاً پس‌زمینه‌ی یک دکمه) باشد، نه سوآچِ واقعیِ محصول.
   text = text.replace(/<[a-z][a-z0-9]*\b[^>]*\sstyle=["'][^"']*background(?:-color)?\s*:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)"']+\))[^"']*["'][^>]*>/gi, (tag, rawColor) => {
     const labelMatch = tag.match(/\s(?:title|aria-label|data-label|data-name|data-color)=["']([^"']*)["']/i);
     if (!labelMatch) return tag;
@@ -575,21 +712,24 @@ function stripHtmlForGemini(html) {
     return ` [COLOR hex="${String(rawColor || '').trim()}" alt="${alt}"] `;
   });
 
-  return text
+  const cleaned = text
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/gi, "'")
     .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 120000);
+    .trim();
+
+  // نشانه‌های استخراج‌شده از JSONِ داخلِ اسکریپت‌ها را در انتها اضافه می‌کنیم — این‌طور همیشه
+  // در محدوده‌ی ۱۲۰هزار کاراکترِ نهایی باقی می‌مانند (نه این‌که وسطِ متنِ اصلی گم شوند)، و Gemini
+  // آن‌ها را دقیقاً مثلِ بقیه‌ی نشانه‌های [IMG]/[COLOR] می‌خواند.
+  const combined = swatchTokensFromScripts ? `${cleaned} ${swatchTokensFromScripts}` : cleaned;
+  return combined.slice(0, 120000);
 }
 
 // از روی HTML خام صفحه (پیش از حذف تگ‌ها)، محتمل‌ترین عکسِ اصلیِ محصول را با گشتن در متاتگ‌های
-// استاندارد og:image / twitter:image پیدا می‌کند — همان تگ‌هایی که تقریباً همه‌ی فروشگاه‌های
-// آنلاین برای پیش‌نمایشِ لینک (مثلاً هنگام اشتراک‌گذاری در تلگرام/واتساپ) پر می‌کنند، پس معمولاً
-// دقیق‌ترین و باکیفیت‌ترین عکسِ محصول همین است. آدرسِ نسبی را هم نسبت به baseUrl کامل می‌کند.
+// استاندارد og:image / twitter:image پیدا می‌کند.
 function extractPrimaryImageFromHtml(html, baseUrl) {
   if (!html) return null;
   const patterns = [
@@ -598,9 +738,6 @@ function extractPrimaryImageFromHtml(html, baseUrl) {
     /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
     /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
     /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
-    // پشتیبانِ سایت‌هایی که og:image درست تنظیم نکرده‌اند (خیلی رایج در فروشگاه‌های آرایشی
-    // کوچک‌تر) — این سه الگو، منابعِ استانداردِ دیگری هستند که همچنان معمولاً به عکسِ واقعیِ
-    // محصول اشاره می‌کنند، نه لوگوی سایت.
     /<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i,
     /<link[^>]+href=["']([^"']+)["'][^>]+rel=["']image_src["']/i,
     /<meta[^>]+itemprop=["']image["'][^>]+content=["']([^"']+)["']/i,
@@ -612,9 +749,6 @@ function extractPrimaryImageFromHtml(html, baseUrl) {
       try { return new URL(m[1], baseUrl).toString(); } catch { /* skip invalid */ }
     }
   }
-  // راهِ آخر: خیلی از فروشگاه‌ها اطلاعاتِ ساختاریافته‌ی schema.org (JSON-LD) را برای موتورهای
-  // جست‌وجو در صفحه می‌گذارند که معمولاً شاملِ فیلدِ "image" همان محصول است — حتی اگر og:image
-  // خالی یا اشتباه (مثلاً لوگوی سایت) تنظیم شده باشد، این مقدار معمولاً درست است.
   const ldBlocks = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi) || [];
   for (const block of ldBlocks) {
     const inner = block.replace(/^<script[^>]*>/i, '').replace(/<\/script>\s*$/i, '');
@@ -632,12 +766,6 @@ function extractPrimaryImageFromHtml(html, baseUrl) {
   return null;
 }
 
-// نمودارهای «Ratings» (Scent/Longevity/Sillage) که در بسیاری از سایت‌های عطر (یا ویجت‌های شخص
-// ثالثِ تعبیه‌شده مثل «Smell & Feel») نمایش داده می‌شوند، معمولاً به‌صورت متنِ ساده‌ی «SCENT 7.9
-// 4608 RATINGS» کنار هم قرار دارند. چون خواندنِ این اعداد توسط مدلِ زبانی گاهی دقیق نیست (ممکن
-// است رند یا اشتباه کپی شود)، این‌جا مستقیماً با یک الگوی متنی، عددِ امتیاز (۰ تا ۱۰) و تعدادِ
-// رأی‌های هرکدام را از خودِ متن استخراج می‌کنیم — نتیجه‌اش همیشه دقیقاً همان عددی است که روی
-// سایتِ مبدأ نوشته شده، نه یک برآوردِ هوش مصنوعی.
 function extractPerfumeRatingBars(text) {
   function grab(label) {
     const re = new RegExp(label + "[^0-9]{0,60}(\\d{1,2}(?:\\.\\d)?)[^0-9]{0,60}([\\d,]{1,7})\\s*RATING", "i");
@@ -655,9 +783,6 @@ function extractPerfumeRatingBars(text) {
   return { scent, longevity, sillage };
 }
 
-// آدرس‌های همه‌ی iframeهای داخلِ یک صفحه را (نسبت به baseUrl کامل‌شده) برمی‌گرداند — برای وقتی که
-// نمودارِ Ratings یا بخشِ «Main accords» نه در خودِ HTML صفحه، بلکه داخلِ یک ویجتِ شخص‌ثالثِ
-// تعبیه‌شده (iframe، مثلاً ویجتِ «Smell & Feel») بارگذاری می‌شود و باید جداگانه واکشی شود.
 function extractIframeSrcs(html, baseUrl) {
   const out = [];
   const re = /<iframe[^>]+src=["']([^"']+)["']/gi;
@@ -668,11 +793,6 @@ function extractIframeSrcs(html, baseUrl) {
   return out;
 }
 
-// واژه‌نامه‌ی شناخته‌شده‌ی آکوردهای رایج عطر (انگلیسی) — پایه‌ی تشخیصِ «کدام کلمه واقعاً یک
-// آکورد است» به‌جای حدسِ صرفِ «کلمه‌ی با حرفِ اول بزرگ». عبارت‌های دوکلمه‌ای (مثل white floral،
-// warm spicy) عمداً قبل از تک‌کلمه‌ای‌هایشان آمده‌اند تا در تطبیق، اول آن‌ها بررسی شوند و به‌اشتباه
-// به دو آکوردِ جدا شکسته نشوند؛ ولی کلماتی که کنارِ هم آمده‌اند بدون این‌که یک عبارتِ دوکلمه‌ایِ
-// شناخته‌شده باشند (مثل «Oriental Woody» که خودش در این لیست نیست)، هرکدام جدا شناسایی می‌شوند.
 const KNOWN_ACCORD_WORDS = [
   "white floral", "yellow floral", "green floral", "fruity floral", "citrus floral",
   "warm spicy", "fresh spicy", "oriental woody", "woody floral musk", "aromatic fougere",
@@ -685,11 +805,6 @@ const KNOWN_ACCORD_WORDS = [
   "yeasty", "tropical", "mineral", "camphor", "medicinal", "nutty", "rummy", "smoked",
 ];
 
-// متنِ داده‌شده را برای وجودِ هرکدام از KNOWN_ACCORD_WORDS می‌گردد و آکوردهایی که واقعاً پیدا
-// شده‌اند را به‌ترتیبِ ظاهرشدن‌شان در متن برمی‌گرداند — عبارت‌های دوکلمه‌ای (مثل white floral)
-// اول بررسی می‌شوند تا از تداخل با تک‌کلمه‌ای‌هایشان (floral) جلوگیری شود؛ هر بازه‌ی متنی که یک‌بار
-// تطبیق پیدا کرد دوباره برای عبارتِ دیگری بررسی نمی‌شود، پس «Oriental» و «Woody»ی کنارِ هم هرگز
-// یک آکورد واحد نمی‌شوند مگر خودِ عبارتِ دوکلمه‌ایشان در فهرست باشد.
 function matchKnownAccordsInText(text) {
   const t = " " + String(text || "").toLowerCase() + " ";
   const sorted = [...KNOWN_ACCORD_WORDS].sort((a, b) => b.length - a.length);
@@ -721,13 +836,6 @@ function matchKnownAccordsInText(text) {
   return ordered;
 }
 
-// بخشِ «Main accords» (که روی سایت‌هایی مثل Fragrantica/Parfumo یا ویجت‌های مشابه، زیرِ یک
-// عنوانِ کوچک با چند برچسبِ رنگی — مثل Oriental, Woody, Spicy, Sweet, Floral — نشان داده
-// می‌شود) را مستقیماً از متنِ خام استخراج می‌کند: عنوانِ «main accords» را پیدا می‌کند و در
-// متنِ بعدش (تا رسیدن به عنوانِ بعدی مثل «Fragrance Pyramid») فقط دنبالِ کلماتی می‌گردد که در
-// واژه‌نامه‌ی KNOWN_ACCORD_WORDS باشند — همین یعنی هرچیزِ نامرتبط (مثل برندینگِ ویجت‌های
-// شخص‌ثالث یا نشانه‌های داخلیِ خودمان) دیگر هرگز به‌اشتباه به‌عنوانِ آکورد ثبت نمی‌شود، و ترتیبِ
-// ظاهرشدن‌شان هم دقیقاً همان ترتیبِ شدت/اهمیتِ آکورد در صفحه‌ی مبدأ (از قوی‌تر به ضعیف‌تر) است.
 function extractMainAccordsFromText(text) {
   const t = String(text || "");
   const m = t.match(/main accords[:\s]*(.*?)(?:fragrance pyramid|top notes|search by accords|user ratings|when to wear|$)/i);
@@ -738,10 +846,6 @@ function extractMainAccordsFromText(text) {
   return words.length ? words.join(", ") : null;
 }
 
-// خیلی از این ویجت‌های شخص‌ثالث (مثل Smell & Feel) داده‌شان را با جاوااسکریپت رندر می‌کنند، اما
-// معمولاً همان داده‌ی خام (JSON) از قبل، داخل یک تگِ <script> در همان HTML اولیه هم قرار دارد —
-// این تابع تمام بلوک‌های <script>ی که کلمه‌ی scent/longevity/sillage/accord در آن‌ها هست را
-// برمی‌گرداند تا جدا از متنِ قابل‌مشاهده، همان‌جا هم دنبالِ اعداد/آکوردها بگردیم.
 function extractScriptBlobs(html) {
   const out = [];
   const re = /<script[^>]*>([\s\S]*?)<\/script>/gi;
@@ -779,9 +883,6 @@ function grabCountNear(text, keys) {
   return null;
 }
 
-// همان سه امتیازِ Scent/Longevity/Sillage را این‌بار از داخلِ بلوک‌های JSON/جاوااسکریپتِ تعبیه‌شده
-// (نه متنِ قابل‌مشاهده) پیدا می‌کند — برای سایت‌هایی که این عدد‌ها را با جاوااسکریپت رسم می‌کنند
-// ولی خودِ داده‌ی خام در HTML اولیه هم هست.
 function extractRatingsFromScripts(scripts) {
   for (const s of scripts) {
     const scentScore = grabScoreNear(s, ["scentScore", "scent_score", "scent"]);
@@ -800,10 +901,6 @@ function extractRatingsFromScripts(scripts) {
   return null;
 }
 
-// همان «Main accords» را این‌بار از یک آرایه‌ی JSON تعبیه‌شده (مثل "accords":["Sweet","Gourmand",...])
-// پیدا می‌کند — چه رشته‌های ساده باشند، چه اشیائی با یک فیلدِ name/label/title. نتیجه هم از همان
-// واژه‌نامه‌ی KNOWN_ACCORD_WORDS عبور می‌کند تا اگر کلیدهای نامرتبطِ دیگری از همان JSON به‌اشتباه
-// گرفته شده باشند، حذف شوند و فقط آکوردهای واقعی باقی بمانند.
 function extractAccordsFromScripts(scripts) {
   for (const s of scripts) {
     if (!/accord/i.test(s)) continue;
@@ -824,12 +921,6 @@ function extractAccordsFromScripts(scripts) {
   return null;
 }
 
-// موتورِ اصلیِ پیدا کردنِ نمودارِ Ratings و بخشِ Main accords — چهار لایه، از دقیق‌ترین به کلی‌ترین:
-// ۱) متنِ قابل‌مشاهده‌ی خودِ صفحه   ۲) بلوک‌های JSON تعبیه‌شده در خودِ صفحه
-// ۳) متنِ قابل‌مشاهده‌ی iframeهای صفحه (با هدرِ Referer درست، چون بعضی ویجت‌ها بدونش جواب نمی‌دهند)
-// ۴) بلوک‌های JSON تعبیه‌شده داخل همان iframeها
-// به‌محض این‌که هم امتیازها و هم آکوردها پیدا شوند، جست‌وجو متوقف می‌شود؛ در غیر این صورت تا آخرین
-// iframe ادامه می‌دهد و هرکدام را که پیدا کرد برمی‌گرداند (حتی اگر فقط یکی از دو مورد باشد).
 async function analyzeFragranceWidget(mainHtml, mainText, baseUrl) {
   let bars = extractPerfumeRatingBars(mainText);
   let accords = extractMainAccordsFromText(mainText);
@@ -865,9 +956,6 @@ async function analyzeFragranceWidget(mainHtml, mainText, baseUrl) {
   return { bars, mainAccords: accords };
 }
 
-// نتیجه‌ی extractPerfumeRatingBars را (در صورت پیدا شدن هرکدام) روی شیء محصولِ برگشتی از Gemini
-// می‌نشاند — این اعداد چون مستقیماً از خودِ متنِ سایتِ مبدأ خوانده شده‌اند، همیشه به عددهایی که
-// هوش مصنوعی احتمالاً حدس زده یا کمی نادرست کپی کرده، اولویت دارند (جایگزینشان می‌شوند).
 function applyRatingBarsToProduct(product, bars) {
   if (!bars) return product;
   if (bars.scent) { product.scentScore = String(bars.scent.score); product.scentRatings = String(bars.scent.ratings); }
@@ -876,31 +964,51 @@ function applyRatingBarsToProduct(product, bars) {
   return product;
 }
 
-// عکسِ هرکدام از طیف‌های رنگ (variants) را — اگر Gemini از روی نشانه‌های [IMG] صفحه، آدرسِ عکسِ
-// همان رنگ را تشخیص داده باشد — دانلود و مستقیماً روی Cloudinary خودمان آپلود می‌کند (نه یک
-// لینکِ خارجیِ خام)، دقیقاً همان اتفاقی که برای عکسِ اصلیِ محصول می‌افتد. حداکثر ۱۲ رنگِ اول
-// پردازش می‌شود (برای جلوگیری از کندیِ بیش از حد در صفحاتی با طیفِ خیلی زیاد).
+// این تابع هرکدام از طیف‌های رنگی که Gemini از روی صفحه‌ی مبدأ تشخیص داده (و برایشان یک
+// imageUrl پیشنهاد داده) را دانلود و روی Cloudinary خودمان آپلود می‌کند. دو اصلاحِ کلیدی نسبت
+// به نسخه‌ی قبلی:
+//   ۱) هدرِ Referer را برابرِ همان صفحه‌ی مبدأ (baseUrl) می‌فرستد — چون خیلی از CDNها بدون این
+//      هدر، درخواست را رد می‌کنند (دقیقاً همان دلیلی که فقط شماره‌ی رنگ منتقل می‌شد، نه عکس).
+//   ۲) اگر دانلود/آپلودِ خودکار به هر دلیلی شکست بخورد، به‌جای رها کردنِ عکس (رشته‌ی خالی)،
+//      همان لینکِ اصلیِ عکس را برمی‌گرداند — این‌طور مدیر لینک را از دست نمی‌دهد و می‌تواند خودش
+//      دستی همان لینک را باز کند یا از «جستجوی عکس» استفاده کند؛ ضمناً یک شمارشِ ساده
+//      (attempted/uploaded) هم برمی‌گرداند تا پیامِ روشنی به مدیر نشان داده شود.
 async function mirrorVariantImages(variants, baseUrl) {
-  if (!Array.isArray(variants) || variants.length === 0) return [];
-  const LIMIT = 12;
+  if (!Array.isArray(variants) || variants.length === 0) return { variants: [], attempted: 0, uploaded: 0 };
+  const LIMIT = 16;
   const toProcess = variants.slice(0, LIMIT);
   const rest = variants.slice(LIMIT);
+  let attempted = 0;
+  let uploaded = 0;
+  const refererOrigin = (() => {
+    try { return new URL(baseUrl).origin; } catch (e) { return baseUrl; }
+  })();
+
   const mirrored = await Promise.all(
     toProcess.map(async (v) => {
       const label = (v && v.label) || '';
       const hex = (v && v.hex) || '';
       const rawUrl = v && v.imageUrl;
       if (!rawUrl) return { label, hex, image: '' };
+      attempted += 1;
       try {
-        const resolved = new URL(rawUrl, baseUrl).toString();
-        const uploadedUrl = await mirrorRemoteImageToCloudinary(resolved);
-        return { label, hex, image: uploadedUrl || '' };
+        const resolved = /^data:/i.test(rawUrl) ? rawUrl : new URL(rawUrl, baseUrl).toString();
+        const { url: uploadedUrl, reason } = await mirrorRemoteImageToCloudinary(resolved, { referer: refererOrigin });
+        if (uploadedUrl) {
+          uploaded += 1;
+          return { label, hex, image: uploadedUrl };
+        }
+        if (reason) console.warn(`mirrorVariantImages: عکسِ رنگِ «${label}» آپلود نشد — ${reason}`);
+        // آپلودِ خودکار شکست خورد؛ به‌جای رها کردنِ کاملِ عکس، همان لینکِ خامِ اصلی را نگه می‌داریم
+        // تا مدیر بتواند بعداً دستی از همان لینک استفاده کند.
+        return { label, hex, image: resolved };
       } catch (e) {
         return { label, hex, image: '' };
       }
     })
   );
-  return [...mirrored, ...rest.map((v) => ({ label: (v && v.label) || '', hex: (v && v.hex) || '', image: '' }))];
+  const variantsOut = [...mirrored, ...rest.map((v) => ({ label: (v && v.label) || '', hex: (v && v.hex) || '', image: '' }))];
+  return { variants: variantsOut, attempted, uploaded };
 }
 
 async function fetchProductPage(url) {
@@ -959,10 +1067,6 @@ variants آرایه‌ای از {"label":"","hex":"","imageUrl":""} باشد.
 ${sourceText}`;
 }
 
-// پرامپتِ اختصاصیِ «فقط طیفِ رنگ» — برخلافِ buildGeminiProductPrompt که همه‌ی فیلدهای محصول را
-// می‌خواهد، این یکی عمداً محدود و متمرکز است: هیچ فیلدی جز variants نمی‌خواهد، پس Gemini حواسش
-// پرتِ توضیح/قیمت/عکسِ اصلی/نت و غیره نمی‌شود و فقط و فقط دنبالِ رنگ‌ها می‌گردد — دقیقاً همان
-// چیزی که کاربر خواسته: تمرکزِ کامل روی «Color / Select Color» و نمونه‌رنگ‌های کنارش.
 function buildVariantExtractionPrompt(sourceText, sourceUrl) {
   return `تو فقط و فقط مسئولِ یک کار هستی: پیدا کردنِ «طیف رنگِ» این محصول از صفحه‌ی زیر. هیچ فیلدِ دیگری (نام، قیمت، توضیح، عکسِ اصلیِ محصول، نت، آکورد و غیره) نمی‌خواهیم — رویشان وقت نگذار.
 منبع: ${sourceUrl}
@@ -988,10 +1092,16 @@ app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, re
     if (!text) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
     const parsed = await callGeminiText(buildVariantExtractionPrompt(text, page.finalUrl));
     const rawVariants = Array.isArray(parsed && parsed.variants) ? parsed.variants : [];
-    // عکسِ هرکدام از رنگ‌ها را (اگر Gemini آدرسی پیدا کرده) همین‌جا روی Cloudinary آپلود می‌کنیم —
-    // دقیقاً همان کاری که برای طیفِ رنگِ «ورود محصول با لینک» هم انجام می‌شود.
-    const variants = await mirrorVariantImages(rawVariants, page.finalUrl);
-    res.json({ variants });
+    const { variants, attempted, uploaded } = await mirrorVariantImages(rawVariants, page.finalUrl);
+    // پیامِ تشخیصی: اگر تعدادی از عکس‌ها پیدا شدند ولی هیچ‌کدام آپلود نشدند (مثلاً چون سایتِ
+    // مبدأ دانلودِ خودکار را مسدود می‌کند)، مدیر به‌جای سکوت، دلیلِ واقعی را می‌بیند.
+    let imageNote = null;
+    if (attempted > 0 && uploaded === 0) {
+      imageNote = 'رنگ‌ها پیدا شدند اما هیچ‌کدام از عکس‌هایشان دانلود نشد — احتمالاً سایتِ مبدأ دانلودِ خودکارِ عکس را مسدود می‌کند. لینکِ خامِ عکس (در صورت وجود) در همان ردیف نگه داشته شده؛ می‌توانی با «افزودن عکس این رنگ» دستی آپلود کنی.';
+    } else if (attempted > uploaded) {
+      imageNote = `از ${attempted} عکسِ پیشنهادی، ${uploaded} مورد با موفقیت دانلود و آپلود شد؛ بقیه را دستی تکمیل کن.`;
+    }
+    res.json({ variants, imageNote });
   } catch (e) {
     console.error('extract-variants-from-url error:', e);
     res.status(502).json({ error: friendlyAiError(e) });
@@ -1006,26 +1116,18 @@ app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res
     const text = stripHtmlForGemini(page.html);
     if (!text) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
     const product = await callGeminiText(buildGeminiProductPrompt(text, page.finalUrl));
-    // نمودارِ Ratings (رایحه/ماندگاری/پخش بو) و بخشِ «Main accords» را با چهار لایه‌ی جست‌وجو
-    // (متنِ صفحه، JSONِ تعبیه‌شده در صفحه، متنِ iframeها، JSONِ تعبیه‌شده در iframeها) پیدا
-    // می‌کنیم؛ این مقادیر — چون مستقیماً از خودِ منبع خوانده شده‌اند — جایگزینِ حدسِ Gemini می‌شوند.
     const { bars, mainAccords: mainAccordsFound } = await analyzeFragranceWidget(page.html, text, page.finalUrl);
     applyRatingBarsToProduct(product, bars);
     if (mainAccordsFound) product.mainAccords = mainAccordsFound;
-    // طیف‌های رنگ (variants) که Gemini از روی نشانه‌های [IMG] صفحه تشخیص داده را — اگر عکسِ
-    // مجزایی برایشان پیدا شده — دانلود و روی Cloudinary آپلود می‌کنیم.
-    product.variants = await mirrorVariantImages(product.variants, page.finalUrl);
-    // اگر صفحه‌ی محصول یک عکسِ اصلی (og:image/twitter:image) داشته باشد، همان عکس را دانلود و
-    // مستقیماً روی Cloudinary خودمان آپلود می‌کنیم (نه یک لینکِ خارجیِ خام) تا در «تصویر واقعی
-    // محصول» فرم مدیریت جایگزین شود؛ اگر مرورش با شکست مواجه شد (non-fatal)، بدون عکس ادامه می‌دهیم.
+    const refererOriginForMain = (() => { try { return new URL(page.finalUrl).origin; } catch (e) { return page.finalUrl; } })();
+    const variantResult = await mirrorVariantImages(product.variants, page.finalUrl);
+    product.variants = variantResult.variants;
     const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
-    let mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
-    // اگر og:image پیدا نشد یا آپلودش شکست خورد، به‌عنوانِ راهِ دوم سراغِ mainImageUrl‌ای که خودِ
-    // Gemini از روی نشانه‌های [IMG] متنِ صفحه پیشنهاد داده می‌رویم.
+    let mirroredImageUrl = rawImageUrl ? (await mirrorRemoteImageToCloudinary(rawImageUrl, { referer: refererOriginForMain })).url : null;
     if (!mirroredImageUrl && product.mainImageUrl) {
       try {
         const resolved = new URL(product.mainImageUrl, page.finalUrl).toString();
-        mirroredImageUrl = await mirrorRemoteImageToCloudinary(resolved);
+        mirroredImageUrl = (await mirrorRemoteImageToCloudinary(resolved, { referer: refererOriginForMain })).url;
       } catch (e) { /* لینکِ پیشنهادیِ Gemini معتبر نبود — بدون عکس ادامه می‌دهیم */ }
     }
     delete product.mainImageUrl;
@@ -1078,23 +1180,18 @@ app.post('/api/ai/import-product-url', auth, requireAdmin, async (req, res) => {
     const sourceText = stripHtmlForGemini(page.html);
     if (!sourceText) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
     const product = await callGeminiText(buildGeminiProductPrompt(sourceText, page.finalUrl));
-    // نمودارِ Ratings (رایحه/ماندگاری/پخش بو) و بخشِ «Main accords» را با چهار لایه‌ی جست‌وجو
-    // (متنِ صفحه، JSONِ تعبیه‌شده در صفحه، متنِ iframeها، JSONِ تعبیه‌شده در iframeها) پیدا
-    // می‌کنیم؛ این مقادیر — چون مستقیماً از خودِ منبع خوانده شده‌اند — جایگزینِ حدسِ Gemini می‌شوند.
     const { bars, mainAccords: mainAccordsFound } = await analyzeFragranceWidget(page.html, sourceText, page.finalUrl);
     applyRatingBarsToProduct(product, bars);
     if (mainAccordsFound) product.mainAccords = mainAccordsFound;
-    // طیف‌های رنگ (variants) که Gemini از روی نشانه‌های [IMG] صفحه تشخیص داده را — اگر عکسِ
-    // مجزایی برایشان پیدا شده — دانلود و روی Cloudinary آپلود می‌کنیم.
-    product.variants = await mirrorVariantImages(product.variants, page.finalUrl);
-    // همان منطقِ mirror کردنِ عکسِ اصلیِ صفحه (og:image/twitter:image) روی Cloudinary — این
-    // endpoint همان چیزی است که فرانت‌اند برای «ورود محصول با لینک» واقعاً صدا می‌زند.
+    const refererOriginForMain2 = (() => { try { return new URL(page.finalUrl).origin; } catch (e) { return page.finalUrl; } })();
+    const variantResult2 = await mirrorVariantImages(product.variants, page.finalUrl);
+    product.variants = variantResult2.variants;
     const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
-    let mirroredImageUrl = rawImageUrl ? await mirrorRemoteImageToCloudinary(rawImageUrl) : null;
+    let mirroredImageUrl = rawImageUrl ? (await mirrorRemoteImageToCloudinary(rawImageUrl, { referer: refererOriginForMain2 })).url : null;
     if (!mirroredImageUrl && product.mainImageUrl) {
       try {
         const resolved = new URL(product.mainImageUrl, page.finalUrl).toString();
-        mirroredImageUrl = await mirrorRemoteImageToCloudinary(resolved);
+        mirroredImageUrl = (await mirrorRemoteImageToCloudinary(resolved, { referer: refererOriginForMain2 })).url;
       } catch (e) { /* لینکِ پیشنهادیِ Gemini معتبر نبود — بدون عکس ادامه می‌دهیم */ }
     }
     delete product.mainImageUrl;
