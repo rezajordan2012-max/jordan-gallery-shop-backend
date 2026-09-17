@@ -6,6 +6,28 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
 
+// ============================================================
+// مرورگر هدلس (Headless Browser) — برای صفحاتی مثل دیور که رنگ‌ها/عکس‌ها را فقط با اجرای
+// واقعیِ جاوااسکریپت در صفحه می‌سازند (نه در HTMLِ خامی که یک fetch ساده برمی‌گرداند).
+// بارِ نصب روی سرور (این دو پکیج باید در package.json/npm install اضافه شوند):
+//   npm install puppeteer-core @sparticuz/chromium
+// چرا این ترکیب و نه پکیجِ کاملِ puppeteer؟ چون @sparticuz/chromium یک باینریِ Chromium
+// فشرده و تا حدِ زیادی self-contained ارائه می‌دهد که روی هاست‌های محدود مثل Render (بدونِ نیاز
+// به نصبِ دستیِ کتابخانه‌های سیستمیِ اضافه) هم معمولاً بالا می‌آید؛ پکیجِ کاملِ puppeteer اغلب
+// روی چنین هاست‌هایی به خطای «missing shared libraries» می‌خورد.
+// اگر این دو پکیج نصب نشده باشند (یا نتوانند روی هاستِ فعلی بالا بیایند)، کلِ سایت همچنان کار
+// می‌کند — فقط ابزارهای «ورود محصول با لینک» و «استخراج طیف رنگ از لینک» به همان روشِ قدیمی
+// (fetch سبک، بدون اجرای جاوااسکریپت) برمی‌گردند؛ یعنی این قابلیت هرگز چیزی را خراب نمی‌کند.
+let puppeteerCore = null;
+let chromiumPkg = null;
+try {
+  puppeteerCore = require('puppeteer-core');
+  chromiumPkg = require('@sparticuz/chromium');
+} catch (e) {
+  console.warn('⚠️ puppeteer-core یا @sparticuz/chromium نصب نشده — مرورگر هدلس غیرفعال می‌ماند و صفحاتِ JS-محور (مثل دیور) فقط با HTMLِ خام پردازش می‌شوند. برای فعال‌سازیِ کامل: npm install puppeteer-core @sparticuz/chromium');
+}
+const HEADLESS_BROWSER_ENABLED = !!(puppeteerCore && chromiumPkg) && process.env.DISABLE_HEADLESS_BROWSER !== '1';
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -1011,7 +1033,105 @@ async function mirrorVariantImages(variants, baseUrl) {
   return { variants: variantsOut, attempted, uploaded };
 }
 
+// ============================================================
+// مدیریتِ چرخه‌ی عمرِ مرورگرِ هدلس — یک نمونه‌ی مرورگر به‌صورت مشترک بینِ درخواست‌ها نگه داشته
+// می‌شود (نه یک مرورگرِ تازه برای هر درخواست، چون بالا آمدنِ Chromium خودش ۱ تا ۲ ثانیه طول
+// می‌کشد)؛ برای هر درخواست فقط یک تبِ (page) جدید باز و در پایان بسته می‌شود. اگر مرورگر قطع
+// شود (کرش کند)، دفعه‌ی بعد خودش را از نو بالا می‌آورد.
+let browserInstancePromise = null;
+async function getBrowserInstance() {
+  if (!HEADLESS_BROWSER_ENABLED) return null;
+  if (browserInstancePromise) {
+    const existing = await browserInstancePromise.catch(() => null);
+    if (existing && existing.isConnected && existing.isConnected()) return existing;
+    browserInstancePromise = null; // مرورگرِ قبلی قطع شده — دوباره راه‌اندازی می‌کنیم
+  }
+  browserInstancePromise = (async () => {
+    const executablePath = await chromiumPkg.executablePath();
+    return puppeteerCore.launch({
+      args: [...chromiumPkg.args, '--disable-dev-shm-usage', '--no-sandbox'],
+      defaultViewport: { width: 1280, height: 1800 },
+      executablePath,
+      headless: chromiumPkg.headless !== undefined ? chromiumPkg.headless : true,
+    });
+  })().catch((e) => {
+    console.error('راه‌اندازیِ مرورگرِ هدلس ناموفق بود — به روشِ fetch سبک برمی‌گردیم:', e.message);
+    browserInstancePromise = null;
+    return null;
+  });
+  return browserInstancePromise;
+}
+
+// خیلی از فروشگاه‌های مدرن (ازجمله دیور) عکسِ اصلی/رنگ‌ها را فقط وقتی صفحه به آن ناحیه اسکرول
+// شود بارگذاری می‌کنند (lazy-load مبتنی بر IntersectionObserver). این تابع صفحه را چند مرحله‌ای
+// تا انتها اسکرول می‌کند تا این‌جور محتوای «فقط-با-اسکرول» هم فرصتِ بارگذاری پیدا کند.
+async function autoScrollPage(page) {
+  try {
+    await page.evaluate(async () => {
+      await new Promise((resolve) => {
+        let totalHeight = 0;
+        const distance = 500;
+        const timer = setInterval(() => {
+          const scrollHeight = document.body ? document.body.scrollHeight : 0;
+          window.scrollBy(0, distance);
+          totalHeight += distance;
+          if (totalHeight >= scrollHeight || totalHeight > 24000) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, 180);
+      });
+    });
+  } catch (e) { /* اگر اسکرول شکست خورد، بدونِ توقفِ کل فرآیند ادامه می‌دهیم */ }
+}
+
+// صفحه را با یک مرورگرِ واقعی (هدلس) باز می‌کند، منتظرِ آرام‌شدنِ شبکه می‌ماند، صفحه را اسکرول
+// می‌کند تا محتوای lazy-load هم بیاید، و در پایان HTMLِ کاملاً رندرشده (بعد از اجرای جاوااسکریپت
+// و هیدریشن) را برمی‌گرداند — دقیقاً همان چیزی که در مرورگرِ واقعیِ یک بازدیدکننده دیده می‌شود.
+async function fetchProductPageWithBrowser(url) {
+  const browser = await getBrowserInstance();
+  if (!browser) throw new Error('مرورگر هدلس در دسترس نیست');
+  const page = await browser.newPage();
+  try {
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+    await page.goto(url.toString(), { waitUntil: 'networkidle2', timeout: 25000 });
+    await autoScrollPage(page);
+    // کمی صبرِ اضافه تا درخواست‌های XHR/fetchِ ناشی از اسکرول هم تمام شوند
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const html = await page.content();
+    const finalUrl = page.url();
+    return { html, finalUrl };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+// بستنِ مرورگرِ هدلس هنگامِ خاموش‌شدنِ سرور (مثلاً موقعِ ری‌استارت/دیپلویِ Render) — تا پردازه‌ی
+// Chromium یتیم روی سرور باقی نماند.
+async function closeHeadlessBrowser() {
+  if (!browserInstancePromise) return;
+  try {
+    const b = await browserInstancePromise;
+    if (b) await b.close();
+  } catch (e) { /* بی‌اهمیت — سرور دارد خاموش می‌شود */ }
+}
+process.on('SIGTERM', closeHeadlessBrowser);
+process.on('SIGINT', closeHeadlessBrowser);
+
+// نکته‌ی مهم: قبلاً این تابع فقط یک fetch سبک انجام می‌داد که برای سایت‌های JS-سنگین (مثل دیور،
+// که رنگ‌ها/عکس‌ها را فقط بعد از اجرای جاوااسکریپت می‌سازد) کافی نبود. حالا اول مرورگرِ هدلسِ
+// واقعی را امتحان می‌کند؛ اگر آن در دسترس نبود یا با خطا مواجه شد (مثلاً محیطِ سرور منابعِ کافی
+// نداشت یا پکیج‌هایش نصب نشده بودند)، بدونِ توقفِ کل قابلیت، به همان fetchِ سبکِ قبلی برمی‌گردد.
 async function fetchProductPage(url) {
+  if (HEADLESS_BROWSER_ENABLED) {
+    try {
+      const rendered = await fetchProductPageWithBrowser(url);
+      if (rendered && rendered.html && rendered.html.length > 200) return rendered;
+    } catch (e) {
+      console.error('fetchProductPageWithBrowser ناموفق بود — با fetchِ سبک ادامه می‌دهیم:', e.message);
+    }
+  }
   const r = await fetch(url.toString(), {
     method: 'GET',
     redirect: 'follow',
@@ -1230,6 +1350,21 @@ app.post('/api/ai/analyze-perfume-image', auth, requireAdmin, async (req, res) =
   } catch (e) {
     console.error('Gemini perfume image error:', e);
     res.status(502).json({ error: friendlyAiError(e) });
+  }
+});
+
+// ابزارِ تشخیصی برای مدیر — بعد از دیپلویِ روی Render می‌توانی با یک درخواستِ GET (همراه با
+// توکنِ ادمین) ببینی مرورگرِ هدلس واقعاً بالا آمده یا نه، بدونِ نیاز به گشتنِ لاگ‌های سرور.
+app.get('/api/ai/headless-status', auth, requireAdmin, async (req, res) => {
+  if (!HEADLESS_BROWSER_ENABLED) {
+    return res.json({ enabled: false, connected: false, note: 'پکیج‌های puppeteer-core و @sparticuz/chromium نصب نشده‌اند یا DISABLE_HEADLESS_BROWSER=1 تنظیم شده است.' });
+  }
+  try {
+    const browser = await getBrowserInstance();
+    const connected = !!(browser && browser.isConnected && browser.isConnected());
+    res.json({ enabled: true, connected, note: connected ? 'مرورگرِ هدلس فعال و آماده است.' : 'راه‌اندازیِ مرورگر ناموفق بود — لاگ‌های سرور را ببین.' });
+  } catch (e) {
+    res.json({ enabled: true, connected: false, note: e.message || 'خطای نامشخص هنگامِ بررسیِ مرورگرِ هدلس' });
   }
 });
 
