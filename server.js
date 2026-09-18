@@ -1252,9 +1252,10 @@ async function extractSwatchesViaDom(page) {
   try {
     const raw = await page.evaluate(() => {
       function rgbToHex(rgbStr) {
-        const m = String(rgbStr || '').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+        const m = String(rgbStr || '').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\)/i);
         if (!m) return '';
-        const toHex = (n) => Number(n).toString(16).padStart(2, '0');
+        if (m[4] !== undefined && Number(m[4]) === 0) return ''; // کاملاً شفاف — رنگِ واقعی نیست
+        const toHex = (n) => Math.max(0, Math.min(255, Number(n))).toString(16).padStart(2, '0');
         return `#${toHex(m[1])}${toHex(m[2])}${toHex(m[3])}`.toUpperCase();
       }
       function bgImageUrl(el) {
@@ -1268,42 +1269,106 @@ async function extractSwatchesViaDom(page) {
         // محصول — این‌ها را کنار می‌گذاریم تا نتیجه با موارد بی‌ربط شلوغ نشود.
         return !!hex && hex !== '#000000' && hex !== '#FFFFFF';
       }
+      function labelFor(el) {
+        if (!el || !el.getAttribute) return '';
+        return (
+          el.getAttribute('aria-label') ||
+          el.getAttribute('title') ||
+          el.getAttribute('data-value') ||
+          el.getAttribute('data-color-name') ||
+          el.getAttribute('data-color') ||
+          el.getAttribute('alt') ||
+          ''
+        ).trim();
+      }
 
       const nameOrLabelLooksLikeColor = /colou?r|shade|رنگ/i;
-      const candidateNodes = [];
 
-      // الگویِ ۱ (رایج‌ترین در Shopify): چند input[type=radio] که name‌شان اشاره به رنگ دارد.
+      // --------- روش ۱: الگوهای دقیق و معنادار (اگر پیدا شوند، همیشه اولویت دارند) ---------
+      let structured = [];
       const radios = Array.from(document.querySelectorAll('input[type="radio"]')).filter((r) => nameOrLabelLooksLikeColor.test(r.name || ''));
       if (radios.length >= 2) {
-        radios.forEach((r) => {
+        structured = radios.map((r) => {
           const label = (r.id && document.querySelector(`label[for="${CSS && CSS.escape ? CSS.escape(r.id) : r.id}"]`)) || r.closest('label');
-          candidateNodes.push({ visual: label || r, textSource: label || r, input: r });
+          const visual = label || r;
+          return { visual, label: labelFor(visual) || (visual.textContent && visual.textContent.trim()) || r.value || '' };
         });
       }
 
-      // الگویِ ۲: یک گروهِ رادیویی/سوآچِ عمومی زیرِ عنوانی که کلمه‌ی رنگ در آن است.
-      if (candidateNodes.length === 0) {
-        const groups = Array.from(document.querySelectorAll('fieldset, [role="radiogroup"], .product-form__input, .variant-picker__option, [class*="swatch-list" i], [class*="color-swatch" i], [class*="colour-swatch" i]'));
-        for (const group of groups) {
-          const legend = group.querySelector('legend, label, .form__label, .variant-picker__label') || group;
-          if (!nameOrLabelLooksLikeColor.test(legend.textContent || '') && !nameOrLabelLooksLikeColor.test(group.className || '')) continue;
-          const items = group.querySelectorAll('input[type="radio"], button, [role="radio"], li, a, span');
-          items.forEach((it) => {
-            if (it.querySelector('input, button, [role="radio"], li, a')) return; // فقط کوچک‌ترین عنصرِ قابل‌کلیک
-            candidateNodes.push({ visual: it, textSource: it, input: it.matches('input') ? it : null });
-          });
-          if (candidateNodes.length > 0) break;
+      // --------- روش ۲: خوشه‌بندیِ بصری/ساختاری — کاملاً مستقل از نامِ کلاس‌ها ---------
+      // این دقیقاً همان چیزی است که برایِ سایت‌های ری‌اکتیِ سفارشی (مثلِ SHEGLAM، با کلاس‌های
+      // هش‌شده و بی‌معنی مثلِ "css-a1b2c3") لازم است، چون هیچ الگوی معناداری در نامِ کلاس‌ها
+      // وجود ندارد تا رویش تطبیق بدهیم. منطق: یک ردیفِ سوآچِ رنگ معمولاً چند عنصرِ کوچک، تقریباً
+      // مربعی/دایره‌ای، هم‌اندازه، و هم‌والد است که هرکدام یا رنگِ پس‌زمینه‌ی متفاوتی دارند یا
+      // یک عکسِ کوچکِ متفاوت. این الگو صرفاً بر پایه‌ی ابعاد و رنگِ واقعاً رندرشده تشخیص داده
+      // می‌شود، نه نامِ هیچ کلاس یا تگی.
+      function findSwatchCluster() {
+        const all = Array.from(document.querySelectorAll('body *'));
+        const small = all.filter((el) => {
+          if (el.children.length > 2) return false; // فقط عناصرِ برگ یا نزدیک‌به‌برگ
+          const r = el.getBoundingClientRect();
+          if (r.width < 14 || r.width > 72 || r.height < 14 || r.height > 72) return false;
+          const ratio = r.width / r.height;
+          if (ratio < 0.55 || ratio > 1.8) return false; // تقریباً مربعی/دایره‌ای، نه یک آیکونِ کشیده
+          return true;
+        });
+        const groups = new Map();
+        small.forEach((el) => {
+          const parent = el.parentElement;
+          if (!parent) return;
+          if (!groups.has(parent)) groups.set(parent, []);
+          groups.get(parent).push(el);
+        });
+        // برای هر گروه بررسی می‌کنیم آیا نزدیکِ یک متنِ «Color/رنگ» است یا نه — این یک امتیازِ
+        // اضافه می‌دهد تا بینِ چند گروهِ هم‌اندازه (مثلاً ردیفِ رنگ‌ها در برابرِ چند آیکونِ
+        // اشتراک‌گذاریِ اجتماعی که تصادفاً هم‌اندازه‌اند)، همیشه گروهِ واقعاً مرتبط با رنگ برنده شود.
+        function nearbyTextMentionsColor(parent) {
+          let node = parent;
+          for (let depth = 0; depth < 4 && node; depth++) {
+            const prevText = node.previousElementSibling && node.previousElementSibling.textContent;
+            if (prevText && nameOrLabelLooksLikeColor.test(prevText) && prevText.length < 60) return true;
+            const ownText = Array.from(node.childNodes)
+              .filter((n) => n.nodeType === Node.TEXT_NODE)
+              .map((n) => n.textContent)
+              .join(' ');
+            if (ownText && nameOrLabelLooksLikeColor.test(ownText) && ownText.length < 60) return true;
+            node = node.parentElement;
+          }
+          return false;
         }
+        let bestItems = [];
+        let bestIsColorScoped = false;
+        groups.forEach((items, parent) => {
+          if (items.length < 2 || items.length > 80) return;
+          // فقط گروه‌هایی که واقعاً چند رنگ/عکسِ متفاوت دارند را در نظر می‌گیریم — نه مثلاً چند
+          // دکمه‌ی ناوبریِ هم‌شکل یا چند آیتمِ منو که تصادفاً هم‌اندازه‌اند.
+          const distinctVisuals = new Set(
+            items.map((el2) => {
+              const img2 = el2.querySelector && el2.querySelector('img');
+              const imgSrc = img2 ? img2.currentSrc || img2.src : '';
+              return getComputedStyle(el2).backgroundColor + '|' + (bgImageUrl(el2) || imgSrc);
+            })
+          );
+          if (distinctVisuals.size < 2) return;
+          const isColorScoped = nearbyTextMentionsColor(parent);
+          // اولویت: هر گروهِ نزدیک‌به‌متنِ‌رنگ، حتی اگر کوچک‌تر باشد، بر هر گروهِ بدونِ این متن
+          // برتری دارد؛ در میانِ گروه‌های هم‌سطح (هر دو color-scoped یا هر دو نه)، بزرگ‌تر برنده است.
+          if (isColorScoped && !bestIsColorScoped) {
+            bestItems = items; bestIsColorScoped = true;
+          } else if (isColorScoped === bestIsColorScoped && items.length > bestItems.length) {
+            bestItems = items;
+          }
+        });
+        return bestItems;
       }
 
-      // الگویِ ۳ (fallback عمومی): هر عنصری با کلاس/attributeِ شبیهِ سوآچِ رنگ، در کلِ صفحه.
-      if (candidateNodes.length === 0) {
-        const generic = document.querySelectorAll('[class*="swatch" i], [class*="color-option" i], [class*="colour-option" i], [data-color-swatch], [data-swatch]');
-        generic.forEach((el) => {
-          if (el.querySelector('[class*="swatch" i], [class*="color-option" i]')) return;
-          candidateNodes.push({ visual: el, textSource: el, input: null });
-        });
+      let clustered = [];
+      if (structured.length < 2) {
+        const items = findSwatchCluster();
+        clustered = items.map((el, i) => ({ visual: el, label: labelFor(el) || `رنگ ${i + 1}` }));
       }
+
+      const candidateNodes = structured.length >= 2 ? structured : clustered;
 
       const results = [];
       const seen = new Set();
@@ -1313,13 +1378,13 @@ async function extractSwatchesViaDom(page) {
         const rect = visual.getBoundingClientRect();
         if (rect.width < 4 || rect.height < 4) return; // عنصرهای پنهان/صفرپیکسلی رد می‌شوند
 
-        const label =
-          (visual.getAttribute && (visual.getAttribute('aria-label') || visual.getAttribute('title') || visual.getAttribute('data-value') || visual.getAttribute('data-color-name'))) ||
-          (node.input && (node.input.value || node.input.getAttribute('value'))) ||
-          (node.textSource && node.textSource.textContent && node.textSource.textContent.trim()) ||
-          '';
-        const cleanLabel = String(label || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-        if (!cleanLabel || seen.has(cleanLabel.toLowerCase())) return;
+        const cleanLabel = String(node.label || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+        // اگر اسمِ رنگ جایی در DOM ثبت نشده بود (مثلاً فقط با هاور/کلیک نمایان می‌شود)، به‌جایِ
+        // رد کردنِ کاملِ آن رنگ، با یک لیبلِ موقتیِ «رنگ N» نگهش می‌داریم — بهتر است مدیر یک رنگ
+        // را دستی نام‌گذاری کند تا اینکه اصلاً آن رنگ گم شود.
+        const finalLabel = cleanLabel || `رنگ ${results.length + 1}`;
+        const dedupeKey = cleanLabel ? cleanLabel.toLowerCase() : `pos-${results.length}`;
+        if (seen.has(dedupeKey)) return;
 
         // عکس: یا از یک <img> داخلِ همان سوآچ، یا از پس‌زمینه‌ی محاسبه‌شده‌ی خودش/فرزندش.
         let imageUrl = '';
@@ -1342,8 +1407,8 @@ async function extractSwatchesViaDom(page) {
 
         if (!imageUrl && !hex) return; // نه عکس دارد نه رنگِ قابل‌تشخیص — احتمالاً سوآچِ واقعی نیست
 
-        seen.add(cleanLabel.toLowerCase());
-        results.push({ label: cleanLabel, hex, imageUrl });
+        seen.add(dedupeKey);
+        results.push({ label: finalLabel, hex, imageUrl });
       });
 
       return results;
@@ -1504,17 +1569,23 @@ app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, re
       rawVariants = Array.isArray(parsed && parsed.variants) ? parsed.variants : [];
     }
     const { variants, attempted, uploaded } = await mirrorVariantImages(rawVariants, page.finalUrl);
+    // اگر بعضی از لیبل‌ها به‌صورتِ «رنگ ۱»، «رنگ ۲» و... هستند، یعنی روشِ ساختاری رنگ را پیدا
+    // کرده ولی اسمِ واقعی‌اش جایی در DOM نبوده (مثلاً فقط با هاور نمایان می‌شود) — مدیر باید این
+    // چندتا را دستی نام‌گذاری کند.
+    const positionalCount = variants.filter((v) => /^رنگ \d+$/.test(v.label || '')).length;
     // پیامِ تشخیصی: هم می‌گوید از کدام روش استفاده شد، هم اینکه از چند عکسِ پیشنهادی چندتا واقعاً
     // دانلود/آپلود شد — این‌طور مدیر همیشه می‌داند دقیقاً چه اتفاقی افتاده، نه فقط یک نتیجه‌ی خام.
     let imageNote = null;
+    const methodLabel = method === 'dom' ? 'مستقیم از ساختارِ صفحه' : 'با هوش مصنوعی از متنِ صفحه';
+    const positionalNote = positionalCount > 0 ? ` (توجه: اسمِ ${positionalCount.toLocaleString('fa-IR')} موردشان جایی در صفحه پیدا نشد و به‌طورِ موقت «رنگ ۱، رنگ ۲...» گذاشته شد — لطفاً دستی نام‌گذاری‌شان کن)` : '';
     if (variants.length === 0) {
       imageNote = 'هیچ رنگی روی این صفحه پیدا نشد — می‌تونی رنگ‌ها رو دستی از پایین اضافه کنی.';
     } else if (attempted > 0 && uploaded === 0) {
-      imageNote = `${variants.length} رنگ (${method === 'dom' ? 'مستقیم از ساختارِ صفحه' : 'با هوش مصنوعی از متنِ صفحه'}) پیدا شد، اما هیچ‌کدام از عکس‌هایشان دانلود نشد — احتمالاً سایتِ مبدأ دانلودِ خودکارِ عکس را مسدود می‌کند. لینکِ خامِ عکس (در صورت وجود) در همان ردیف نگه داشته شده؛ می‌توانی با «افزودن عکس این رنگ» دستی آپلود کنی.`;
+      imageNote = `${variants.length} رنگ (${methodLabel}) پیدا شد، اما هیچ‌کدام از عکس‌هایشان دانلود نشد — احتمالاً سایتِ مبدأ دانلودِ خودکارِ عکس را مسدود می‌کند. لینکِ خامِ عکس (در صورت وجود) در همان ردیف نگه داشته شده؛ می‌توانی با «افزودن عکس این رنگ» دستی آپلود کنی.${positionalNote}`;
     } else if (attempted > uploaded) {
-      imageNote = `${variants.length} رنگ (${method === 'dom' ? 'مستقیم از ساختارِ صفحه' : 'با هوش مصنوعی از متنِ صفحه'}) پیدا شد؛ از ${attempted} عکسِ پیشنهادی، ${uploaded} مورد با موفقیت دانلود و آپلود شد — بقیه را دستی تکمیل کن.`;
+      imageNote = `${variants.length} رنگ (${methodLabel}) پیدا شد؛ از ${attempted} عکسِ پیشنهادی، ${uploaded} مورد با موفقیت دانلود و آپلود شد — بقیه را دستی تکمیل کن.${positionalNote}`;
     } else {
-      imageNote = `${variants.length} رنگ (${method === 'dom' ? 'مستقیم از ساختارِ صفحه' : 'با هوش مصنوعی از متنِ صفحه'}) پیدا و کامل پردازش شد.`;
+      imageNote = `${variants.length} رنگ (${methodLabel}) پیدا و کامل پردازش شد.${positionalNote}`;
     }
     res.json({ variants, imageNote });
   } catch (e) {
