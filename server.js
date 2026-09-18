@@ -1725,4 +1725,46 @@ app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
 
 app.delete('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
   const db = await readDB(); const before = db.products.length; db.products = db.products.filter((x) => x.id !== req.params.id);
-  if (db.products.length === before) retur
+  if (db.products.length === before) return res.status(404).json({ error: 'محصول یافت نشد' });
+  await writeDB(db); res.json({ ok: true });
+}));
+
+app.get('/api/orders', auth, noCache, withDb(async (req, res) => {
+  const db = await readDB();
+  res.json(db.orders.filter((o) => o.user_id === req.user.id).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
+}));
+
+app.post('/api/payment/request', auth, withDb(async (req, res) => {
+  const { items, amount, description } = req.body || {};
+  if (!amount || amount < 1000) return res.status(400).json({ error: 'مبلغ نامعتبر است' });
+  if (!ZARINPAL_MERCHANT_ID) return res.status(500).json({ error: 'ZARINPAL_MERCHANT_ID تنظیم نشده است' });
+  try {
+    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/request.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount, callback_url: CALLBACK_URL, description: description || 'خرید از فروشگاه' }) });
+    const data = await zRes.json();
+    if (data.data && data.data.code === 100) {
+      const authority = data.data.authority; const db = await readDB();
+      db.orders.push({ id: db.nextOrderId++, user_id: req.user.id, items: items || [], amount, authority, ref_id: null, status: 'pending', created_at: new Date().toISOString() });
+      await writeDB(db); return res.json({ paymentUrl: `https://www.zarinpal.com/pg/StartPay/${authority}` });
+    }
+    res.status(400).json({ error: 'خطا در اتصال به درگاه پرداخت', detail: data });
+  } catch (e) { res.status(500).json({ error: 'خطای سرور در ارتباط با درگاه' }); }
+}));
+
+app.get('/payment/callback', async (req, res) => {
+  const { Authority, Status } = req.query; let db;
+  try { db = await readDB(); } catch { return res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
+  const order = db.orders.find((o) => o.authority === Authority);
+  if (!order) return res.redirect(`${FRONTEND_URL}/payment/result?status=notfound`);
+  if (Status !== 'OK') { order.status = 'canceled'; await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=canceled`); }
+  try {
+    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/verify.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount: order.amount, authority: Authority }) });
+    const data = await zRes.json();
+    if (data.data && (data.data.code === 100 || data.data.code === 101)) { order.status = 'paid'; order.ref_id = String(data.data.ref_id); await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=success&ref=${data.data.ref_id}`); }
+    order.status = 'failed'; await writeDB(db); res.redirect(`${FRONTEND_URL}/payment/result?status=failed`);
+  } catch { res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
+});
+
+app.get('/', (req, res) => res.send('Store API is running'));
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
