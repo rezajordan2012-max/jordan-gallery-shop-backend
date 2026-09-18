@@ -247,12 +247,16 @@ async function uploadDataUriToCloudinary(dataUri) {
 //      شد پیام روشنی به مدیر نشان دهد.
 async function mirrorRemoteImageToCloudinary(remoteUrl, options = {}) {
   const referer = options && options.referer;
+  // برای سوآچ‌های رنگ (دایره/مربعِ تخت‌رنگِ کوچک)، حذفِ پس‌زمینه نه لازم است و نه مفید — این
+  // عکس‌ها اصلاً پس‌زمینه‌ی جداگانه‌ای برای حذف ندارند؛ رد کردنِ این مرحله هم سریع‌تر است و هم
+  // سهمیه‌ی remove.bg را برای دفعاتِ بعدی (که واقعاً لازم است، مثلِ عکسِ اصلیِ محصول) نگه می‌دارد.
+  const skipBackgroundRemoval = !!(options && options.skipBackgroundRemoval);
   try {
     if (!remoteUrl || typeof remoteUrl !== 'string') return { url: null, reason: 'آدرس عکس خالی است' };
 
     // حالت data: URI — عکس از قبل داخلِ خودِ صفحه به‌صورت base64 آمده، نیازی به دانلود نیست.
     if (/^data:image\//i.test(remoteUrl)) {
-      const cleanedDirect = await removeBackgroundFromDataUri(remoteUrl);
+      const cleanedDirect = skipBackgroundRemoval ? remoteUrl : await removeBackgroundFromDataUri(remoteUrl);
       const uploadedDirect = await uploadDataUriToCloudinary(cleanedDirect);
       return { url: uploadedDirect.url, reason: null };
     }
@@ -275,7 +279,7 @@ async function mirrorRemoteImageToCloudinary(remoteUrl, options = {}) {
     const supported = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
     if (!supported.includes(mimeForDataUri)) return { url: null, reason: `فرمتِ عکس (${mimeForDataUri}) پشتیبانی نمی‌شود` };
     const dataUri = `data:${mimeForDataUri};base64,${buffer.toString('base64')}`;
-    const cleaned = await removeBackgroundFromDataUri(dataUri);
+    const cleaned = skipBackgroundRemoval ? dataUri : await removeBackgroundFromDataUri(dataUri);
     const uploaded = await uploadDataUriToCloudinary(cleaned);
     return { url: uploaded.url, reason: null };
   } catch (e) {
@@ -665,7 +669,10 @@ function extractSwatchDataFromScripts(html) {
 
 function stripHtmlForGemini(html) {
   let imgCount = 0;
-  const IMG_LIMIT = 80;
+  // این سقف را بالا بردیم چون محصولاتی مثل کرم‌پودرهای رنگ‌بندیِ گسترده (مثلاً ۳۷ شماره‌ی
+  // کلارینس) به‌تنهایی ده‌ها [IMG]/[COLOR] فقط برای سوآچ‌های رنگ لازم دارند؛ سقفِ قبلی (۸۰) قبل
+  // از رسیدن به همه‌ی رنگ‌ها متن را قطع می‌کرد.
+  const IMG_LIMIT = 220;
   const rawHtml = String(html || '');
 
   // نکته‌ی مهم: این استخراج باید پیش از حذفِ <script> انجام شود، چون دقیقاً همان بلوک‌هایی که
@@ -747,7 +754,9 @@ function stripHtmlForGemini(html) {
   // در محدوده‌ی ۱۲۰هزار کاراکترِ نهایی باقی می‌مانند (نه این‌که وسطِ متنِ اصلی گم شوند)، و Gemini
   // آن‌ها را دقیقاً مثلِ بقیه‌ی نشانه‌های [IMG]/[COLOR] می‌خواند.
   const combined = swatchTokensFromScripts ? `${cleaned} ${swatchTokensFromScripts}` : cleaned;
-  return combined.slice(0, 120000);
+  // این سقف را هم بالا بردیم — صفحاتِ پرمحتوا (مثلِ کلارینس با ده‌ها رنگ که معمولاً پایین‌ترِ
+  // صفحه‌اند) با سقفِ قبلی (۱۲۰هزار کاراکتر) گاهی دقیقاً همان بخشِ رنگ‌بندی را از دست می‌دادند.
+  return combined.slice(0, 200000);
 }
 
 // از روی HTML خام صفحه (پیش از حذف تگ‌ها)، محتمل‌ترین عکسِ اصلیِ محصول را با گشتن در متاتگ‌های
@@ -997,7 +1006,10 @@ function applyRatingBarsToProduct(product, bars) {
 //      (attempted/uploaded) هم برمی‌گرداند تا پیامِ روشنی به مدیر نشان داده شود.
 async function mirrorVariantImages(variants, baseUrl) {
   if (!Array.isArray(variants) || variants.length === 0) return { variants: [], attempted: 0, uploaded: 0 };
-  const LIMIT = 16;
+  // محصولاتی مثل کرم‌پودرهای رنگ‌بندیِ گسترده (مثلاً کلارینس با ۳۷ شماره) می‌توانند دهها رنگ
+  // داشته باشند — سقفِ قبلی (۱۶) خیلی از آن‌ها را کلاً حذف می‌کرد. این سقف را بالا بردیم تا
+  // «تمامِ رنگ‌ها» — نه فقط چند تای اول — فرصتِ دانلود/آپلود پیدا کنند.
+  const LIMIT = 60;
   const toProcess = variants.slice(0, LIMIT);
   const rest = variants.slice(LIMIT);
   let attempted = 0;
@@ -1006,29 +1018,41 @@ async function mirrorVariantImages(variants, baseUrl) {
     try { return new URL(baseUrl).origin; } catch (e) { return baseUrl; }
   })();
 
-  const mirrored = await Promise.all(
-    toProcess.map(async (v) => {
-      const label = (v && v.label) || '';
-      const hex = (v && v.hex) || '';
-      const rawUrl = v && v.imageUrl;
-      if (!rawUrl) return { label, hex, image: '' };
-      attempted += 1;
-      try {
-        const resolved = /^data:/i.test(rawUrl) ? rawUrl : new URL(rawUrl, baseUrl).toString();
-        const { url: uploadedUrl, reason } = await mirrorRemoteImageToCloudinary(resolved, { referer: refererOrigin });
-        if (uploadedUrl) {
-          uploaded += 1;
-          return { label, hex, image: uploadedUrl };
+  // دانلودِ همه‌ی رنگ‌ها را هم‌زمان (Promise.all بدونِ محدودیت) شلیک نمی‌کنیم — با ۳۷ تا ۶۰ عکس،
+  // این کار می‌تواند سرورِ مبدأ را نگران‌کننده به نظر برساند (شبیهِ حمله) یا حافظه‌ی سرورِ خودمان
+  // را فشار بیاورد. به‌جایش، دسته‌های کوچک (هر بار ۶ تا) پردازش می‌شوند.
+  const BATCH_SIZE = 6;
+  const mirrored = [];
+  for (let i = 0; i < toProcess.length; i += BATCH_SIZE) {
+    const batch = toProcess.slice(i, i + BATCH_SIZE);
+    const batchResults = await Promise.all(
+      batch.map(async (v) => {
+        const label = (v && v.label) || '';
+        const hex = (v && v.hex) || '';
+        const rawUrl = v && v.imageUrl;
+        if (!rawUrl) return { label, hex, image: '' };
+        attempted += 1;
+        try {
+          const resolved = /^data:/i.test(rawUrl) ? rawUrl : new URL(rawUrl, baseUrl).toString();
+          // skipBackgroundRemoval: true — سوآچِ رنگ یک دایره/مربعِ تخت‌رنگِ ساده است، پس‌زمینه‌ی
+          // جداگانه‌ای برای حذف ندارد؛ رد کردنِ این مرحله هم سریع‌تر است هم سهمیه‌ی remove.bg را
+          // برای جایی که واقعاً لازم است (عکسِ اصلیِ محصول) نگه می‌دارد.
+          const { url: uploadedUrl, reason } = await mirrorRemoteImageToCloudinary(resolved, { referer: refererOrigin, skipBackgroundRemoval: true });
+          if (uploadedUrl) {
+            uploaded += 1;
+            return { label, hex, image: uploadedUrl };
+          }
+          if (reason) console.warn(`mirrorVariantImages: عکسِ رنگِ «${label}» آپلود نشد — ${reason}`);
+          // آپلودِ خودکار شکست خورد؛ به‌جای رها کردنِ کاملِ عکس، همان لینکِ خامِ اصلی را نگه می‌داریم
+          // تا مدیر بتواند بعداً دستی از همان لینک استفاده کند.
+          return { label, hex, image: resolved };
+        } catch (e) {
+          return { label, hex, image: '' };
         }
-        if (reason) console.warn(`mirrorVariantImages: عکسِ رنگِ «${label}» آپلود نشد — ${reason}`);
-        // آپلودِ خودکار شکست خورد؛ به‌جای رها کردنِ کاملِ عکس، همان لینکِ خامِ اصلی را نگه می‌داریم
-        // تا مدیر بتواند بعداً دستی از همان لینک استفاده کند.
-        return { label, hex, image: resolved };
-      } catch (e) {
-        return { label, hex, image: '' };
-      }
-    })
-  );
+      })
+    );
+    mirrored.push(...batchResults);
+  }
   const variantsOut = [...mirrored, ...rest.map((v) => ({ label: (v && v.label) || '', hex: (v && v.hex) || '', image: '' }))];
   return { variants: variantsOut, attempted, uploaded };
 }
@@ -1085,9 +1109,63 @@ async function autoScrollPage(page) {
   } catch (e) { /* اگر اسکرول شکست خورد، بدونِ توقفِ کل فرآیند ادامه می‌دهیم */ }
 }
 
+// بسیاری از صفحاتِ محصول (دقیقاً مثلِ دو نمونه‌ای که مدیر فرستاد: کلارینس با دکمه‌ی «+32» و
+// شیگلم با لینکِ «Select Color») فقط چند رنگِ اول را از ابتدا در صفحه می‌گذارند و بقیه‌ی
+// رنگ‌ها را پشتِ یک دکمه/لینکِ «نمایشِ بیشتر» (یا یک مودالِ جداگانه) پنهان می‌کنند — این‌ها اصلاً
+// در HTMLِ اولیه نیستند تا حتی مرورگرِ هدلس هم بدونِ کلیک کردن ببینتشان. این تابع دنبالِ چنین
+// دکمه/لینک‌هایی می‌گردد (با تطبیقِ متن‌های رایج مثل «+عدد»، «Select Color»، «Show all»،
+// «See all shades» و مشابه‌های فارسی) و رویشان کلیک می‌کند تا فهرستِ کاملِ رنگ‌ها باز/رندر شود.
+async function expandColorSwatches(page) {
+  try {
+    const clickedCount = await page.evaluate(() => {
+      const textPatterns = [
+        /^\+\s*\d+$/, // «+32»، «+ ۵» و مشابه
+        /select\s*colou?r/i,
+        /show\s*all/i,
+        /view\s*all/i,
+        /see\s*all/i,
+        /more\s*(colou?rs|shades)/i,
+        /all\s*(colou?rs|shades)/i,
+        /shade\s*finder/i,
+        /رنگ‌بندی/,
+        /همه‌?ی?\s*رنگ/,
+        /مشاهده‌?ی?\s*همه/,
+        /رنگ‌های\s*بیشتر/,
+      ];
+      const clickable = Array.from(document.querySelectorAll('button, a, [role="button"], span, div'));
+      const targets = clickable.filter((el) => {
+        if (el.querySelector('button, a, [role="button"]')) return false; // فقط کوچک‌ترین/دقیق‌ترین عنصرِ قابل‌کلیک، نه یک والدِ بزرگ
+        const text = (el.textContent || '').trim();
+        if (!text || text.length > 30) return false;
+        return textPatterns.some((re) => re.test(text));
+      });
+      let clicked = 0;
+      for (const el of targets.slice(0, 6)) {
+        try {
+          el.scrollIntoView({ block: 'center' });
+          el.click();
+          clicked += 1;
+        } catch (e) { /* این المان کلیک‌پذیر نبود — رد شو */ }
+      }
+      return clicked;
+    });
+    if (clickedCount > 0) {
+      // فرصتِ کافی برای رندرشدنِ محتوای تازه‌بازشده (مودال یا فهرستِ گسترش‌یافته‌ی رنگ‌ها)، و یک
+      // اسکرولِ دوباره چون این محتوای تازه ممکن است خودش هم عکس‌های lazy-load داشته باشد.
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      await autoScrollPage(page);
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    }
+    return clickedCount;
+  } catch (e) {
+    return 0; // اگر این مرحله شکست خورد، بدونِ توقفِ کل فرآیند با همان HTMLِ اولیه ادامه می‌دهیم
+  }
+}
+
 // صفحه را با یک مرورگرِ واقعی (هدلس) باز می‌کند، منتظرِ آرام‌شدنِ شبکه می‌ماند، صفحه را اسکرول
-// می‌کند تا محتوای lazy-load هم بیاید، و در پایان HTMLِ کاملاً رندرشده (بعد از اجرای جاوااسکریپت
-// و هیدریشن) را برمی‌گرداند — دقیقاً همان چیزی که در مرورگرِ واقعیِ یک بازدیدکننده دیده می‌شود.
+// می‌کند تا محتوای lazy-load هم بیاید، سعی می‌کند دکمه‌های «نمایشِ همه‌ی رنگ‌ها» را هم پیدا و
+// کلیک کند، و در پایان HTMLِ کاملاً رندرشده (بعد از اجرای جاوااسکریپت و هیدریشن) را برمی‌گرداند —
+// دقیقاً همان چیزی که در مرورگرِ واقعیِ یک بازدیدکننده دیده می‌شود.
 async function fetchProductPageWithBrowser(url) {
   const browser = await getBrowserInstance();
   if (!browser) throw new Error('مرورگر هدلس در دسترس نیست');
@@ -1099,6 +1177,7 @@ async function fetchProductPageWithBrowser(url) {
     await autoScrollPage(page);
     // کمی صبرِ اضافه تا درخواست‌های XHR/fetchِ ناشی از اسکرول هم تمام شوند
     await new Promise((resolve) => setTimeout(resolve, 1500));
+    await expandColorSwatches(page);
     const html = await page.content();
     const finalUrl = page.url();
     return { html, finalUrl };
@@ -1188,14 +1267,22 @@ ${sourceText}`;
 }
 
 function buildVariantExtractionPrompt(sourceText, sourceUrl) {
-  return `تو فقط و فقط مسئولِ یک کار هستی: پیدا کردنِ «طیف رنگِ» این محصول از صفحه‌ی زیر. هیچ فیلدِ دیگری (نام، قیمت، توضیح، عکسِ اصلیِ محصول، نت، آکورد و غیره) نمی‌خواهیم — رویشان وقت نگذار.
+  return `تو فقط و فقط مسئولِ یک کار هستی: پیدا کردنِ «طیف رنگِ» این محصول از صفحه‌ی زیر.
+
+⛔️ محدوده‌ی کار — این‌ها را به‌کل نادیده بگیر:
+هیچ کاری به شکلِ ظاهریِ محصول، عکسِ اصلیِ محصول (بطری/جعبه/بسته‌بندی)، توضیحاتِ محصول، ترکیبات/Ingredients، ویژگی‌ها و خواص، نت‌های عطر، آکوردها، امتیازها، قیمت یا هر بخشِ دیگرِ صفحه نداشته باش — حتی اگر این‌ها را هم در متنِ زیر ببینی. فقط و فقط روی همان بخشِ مشخصِ «انتخابِ رنگ/شماره» تمرکز کن — همان ناحیه‌ای از صفحه که زیرِ عنوانی مثل «Color»، «Select Color»، «Shade»، «Shade Finder» یا معادلِ فارسی‌اش («انتخاب رنگ»، «رنگ‌بندی») می‌آید و شاملِ چند دایره یا مربعِ کوچکِ رنگی/شماره‌دار است.
+
+🎯 مهم‌ترین قانون — همه‌ی رنگ‌ها را بده، نه فقط رنگِ پیش‌فرض/انتخاب‌شده:
+اکثرِ صفحاتِ محصول یک رنگ را به‌صورتِ پیش‌فرض «انتخاب‌شده» نشان می‌دهند (مثلاً یک دایره با حاشیه‌ی پررنگ‌تر یا یک برچسبِ «Color: Bliss»)، ولی این فقط یکی از چندین/دهها رنگِ موجود است. باید هر رنگی که در ناحیه‌ی سوآچ دیده می‌شود را جدا استخراج کنی — چه رنگِ پیش‌فرض باشد چه نباشد. اگر صفحه نشانه‌ای مثلِ «+۳۲»، «+more»، «View all shades» یا «See all colors» دارد، یعنی رنگ‌های بیشتری فراتر از آن چند نمونه‌ی اولیه وجود دارد — بگرد و همه را (نه فقط چندتای نمایش‌دادهٔ اول) در متنِ زیر پیدا کن؛ اگر واقعاً چیزی فراتر از آنچه در متن آمده نبود، همان‌ها را کامل بده و حدس نزن.
+
+🏷️ برای هر رنگ دقیقاً همین سه فیلد را بساز:
+- label: نام/کد/شماره‌ی دقیقِ همان رنگ، عیناً همان‌طور که روی صفحه نوشته شده (مثلاً «M1C»، «107N»، «Bliss»، یک کدِ عددیِ ساده). اگر انگلیسی/عددی بود همان را بده، ترجمه نکن، خلاصه نکن، از خودت اسم نساز و دو رنگِ مختلف را هرگز زیرِ یک لیبل ادغام نکن.
+- hex: کدِ رنگِ آن، فقط اگر در متن آمده (از یک [COLOR] یا هر نشانه‌ی دیگری)؛ اگر پیدا نکردی، رشته‌ی خالی بگذار — هرگز حدس نزن.
+- imageUrl: اگر همان رنگ عکسِ مجزای خودش را دارد (از نزدیک‌ترین [IMG] که alt یا متنِ اطرافش دقیقاً با نامِ همان رنگ می‌خواند)، همان src را بده؛ اگر مطمئن نیستی کدام عکس مالِ کدام رنگ است، خالی بگذار — هرگز عکسِ یک رنگِ دیگر یا عکسِ اصلیِ محصول را به‌اشتباه به یک رنگ نسبت نده.
+
+نشانه‌های موجود در متن: [IMG src="..." alt="..."] یعنی یک عکس بوده (alt معمولاً اسمِ همان رنگ است). [COLOR hex="..." alt="..."] یعنی یک سوآچِ رنگِ ساده (بدونِ عکس، فقط یک دایره‌ی تخت‌رنگ) بوده که alt اسمِ رنگ و hex کدِ آن است.
+
 منبع: ${sourceUrl}
-هرجا نشانه‌ی [IMG src="..." alt="..."] دیدی، یعنی یک عکس بوده (alt معمولاً اسمِ همان رنگ است). هرجا نشانه‌ی [COLOR hex="..." alt="..."] دیدی، یعنی یک سوآچِ رنگِ ساده (بدونِ عکس) بوده که alt اسمِ رنگ و hex کدِ آن است.
-معمولاً این بخش زیرِ عنوانی مثل «Color»، «Select Color»، «Shade» یا فارسی‌اش «انتخاب رنگ»/«رنگ‌بندی» می‌آید و شاملِ چند دایره یا مربعِ کوچکِ رنگی پشتِ‌سرهم است. تمامِ رنگ‌های موجودِ همان محصول (نه محصولاتِ مرتبطِ دیگر، نه رنگِ عناصرِ تزئینیِ صفحه) را پیدا کن.
-برای هر رنگ یک آیتم بساز:
-- label: نامِ دقیقِ همان رنگ، عیناً همان‌طور که روی صفحه نوشته شده (اگر انگلیسی بود انگلیسی بده، ترجمه نکن و از خودت اسم نساز)
-- hex: کدِ رنگِ آن (از یک [COLOR] یا هر نشانه‌ی دیگری از کدِ رنگ در متن)؛ اگر پیدا نکردی، خالی بگذار
-- imageUrl: اگر همان رنگ عکسِ مجزای خودش را دارد (از نزدیک‌ترین [IMG] که alt‌اش با نامِ همان رنگ می‌خواند)، همان src را بده؛ اگر مطمئن نیستی کدام عکس مالِ کدام رنگ است، imageUrl را خالی بگذار — هرگز حدسی به یک رنگ نسبت نده.
 اگر اصلاً طیفِ رنگی روی صفحه پیدا نکردی، آرایه‌ی variants را خالی برگردان.
 فقط یک JSON معتبر و بدون Markdown برگردان، دقیقاً با این ساختار: {"variants":[{"label":"","hex":"","imageUrl":""}]}
 
