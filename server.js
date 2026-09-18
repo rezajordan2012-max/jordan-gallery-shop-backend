@@ -360,6 +360,12 @@ function parseJsonObject(text) {
 // کوتاه و از قبل فارسی/قابل‌فهم را دست‌نخورده برمی‌گرداند.
 function friendlyAiError(err) {
   const raw = (err && err.message) || String(err || '');
+  // خطای «شلوغیِ موقتِ مدل» — callGeminiText قبل از رسیدن به این‌جا خودش چند بار دوباره تلاش
+  // کرده؛ اگر بازهم همین خطا برگشته، یعنی سرویسِ Google برای این مدلِ خاص واقعاً برای چند
+  // دقیقه شلوغ است، نه اینکه مشکلی در تنظیماتِ خودمان باشد.
+  if (isTransientGeminiError(raw)) {
+    return `سرویسِ هوش مصنوعی (مدلِ ${GEMINI_MODEL}) موقتاً شلوغ است — چند بار خودکار دوباره تلاش شد ولی بازهم جواب نداد. چند دقیقه صبر کن و دوباره امتحان کن؛ اگر این خطا مدام تکرار شد، در Google AI Studio بررسی کن که این مدل روی حسابت واقعاً فعال و پایدار (نه یک نسخه‌ی آزمایشیِ کم‌ظرفیت) باشد.`;
+  }
   if (/quota|rate.?limit|429/i.test(raw)) {
     return 'سهمیه یا محدودیتِ استفاده‌ی سرویسِ هوش مصنوعی برای این مدل تمام شده — چند دقیقه صبر کن، یا در تنظیماتِ Render مقدارِ GEMINI_MODEL را بررسی کن (نباید روی یک مدلِ «تولیدِ عکس» مثل gemini-…-image تنظیم شده باشد؛ این ابزارها به یک مدلِ متنی/بینایی مثل gemini-2.5-flash نیاز دارند).';
   }
@@ -1383,22 +1389,52 @@ async function fetchProductPageAndSwatches(url) {
   return { ...fallback, domSwatches: [] };
 }
 
-async function callGeminiText(prompt) {
+// خطای «This model is currently experiencing high demand» (یا معادل‌های مشابه مثل overloaded/
+// UNAVAILABLE/503) خطای موقتیِ سمتِ خودِ Google است — یعنی مدلِ انتخاب‌شده الان شلوغ است، نه
+// اینکه چیزی در کدِ ما خراب باشد. این‌جور خطاها معمولاً با چند بار تلاشِ دوباره (با کمی فاصله)
+// برطرف می‌شوند؛ برای همین callGeminiText قبل از تسلیم‌شدن، خودش چند بار دوباره امتحان می‌کند.
+function isTransientGeminiError(message) {
+  return /high demand|overloaded|unavailable|503|try again later/i.test(String(message || ''));
+}
+
+async function callGeminiText(prompt, { retries = 3, baseDelayMs = 1500 } = {}) {
   if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
   const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-  const r = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: prompt }] }],
-      generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
-    }),
-  });
-  const data = await r.json();
-  if (!r.ok) throw new Error((data && data.error && data.error.message) || 'خطا در ارتباط با Gemini');
-  const text = (data.candidates || []).flatMap((c) => c.content && c.content.parts || []).map((p) => p.text || '').join('').trim();
-  if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
-  return parseJsonObject(text);
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const r = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+        }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const message = (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini';
+        const err = new Error(message);
+        if (attempt < retries && isTransientGeminiError(message)) {
+          lastErr = err;
+          await new Promise((resolve) => setTimeout(resolve, baseDelayMs * Math.pow(2, attempt)));
+          continue; // یک بارِ دیگر امتحان کن
+        }
+        throw err;
+      }
+      const text = (data.candidates || []).flatMap((c) => c.content && c.content.parts || []).map((p) => p.text || '').join('').trim();
+      if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
+      return parseJsonObject(text);
+    } catch (e) {
+      if (attempt < retries && isTransientGeminiError(e.message)) {
+        lastErr = e;
+        await new Promise((resolve) => setTimeout(resolve, baseDelayMs * Math.pow(2, attempt)));
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr || new Error('خطا در ارتباط با Gemini');
 }
 
 function buildGeminiProductPrompt(sourceText, sourceUrl) {
@@ -1689,33 +1725,4 @@ app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
 
 app.delete('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
   const db = await readDB(); const before = db.products.length; db.products = db.products.filter((x) => x.id !== req.params.id);
-  if (db.products.length === before) return res.status(404).json({ error: 'محصول یافت نشد' });
-  await writeDB(db); res.json({ ok: true });
-}));
-
-app.get('/api/orders', auth, noCache, withDb(async (req, res) => {
-  const db = await readDB();
-  res.json(db.orders.filter((o) => o.user_id === req.user.id).sort((a, b) => new Date(b.created_at) - new Date(a.created_at)));
-}));
-
-app.post('/api/payment/request', auth, withDb(async (req, res) => {
-  const { items, amount, description } = req.body || {};
-  if (!amount || amount < 1000) return res.status(400).json({ error: 'مبلغ نامعتبر است' });
-  if (!ZARINPAL_MERCHANT_ID) return res.status(500).json({ error: 'ZARINPAL_MERCHANT_ID تنظیم نشده است' });
-  try {
-    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/request.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount, callback_url: CALLBACK_URL, description: description || 'خرید از فروشگاه' }) });
-    const data = await zRes.json();
-    if (data.data && data.data.code === 100) {
-      const authority = data.data.authority; const db = await readDB();
-      db.orders.push({ id: db.nextOrderId++, user_id: req.user.id, items: items || [], amount, authority, ref_id: null, status: 'pending', created_at: new Date().toISOString() });
-      await writeDB(db); return res.json({ paymentUrl: `https://www.zarinpal.com/pg/StartPay/${authority}` });
-    }
-    res.status(400).json({ error: 'خطا در اتصال به درگاه پرداخت', detail: data });
-  } catch (e) { res.status(500).json({ error: 'خطای سرور در ارتباط با درگاه' }); }
-}));
-
-app.get('/payment/callback', async (req, res) => {
-  const { Authority, Status } = req.query; let db;
-  try { db = await readDB(); } catch { return res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
-  const order = db.orders.find((o) => o.authority === Authority);
-  if (!order) return res.redirect(`${FRONTEND_URL}/payment/result?status
+  if (db.products.length === before) retur
