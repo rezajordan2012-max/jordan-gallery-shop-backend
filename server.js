@@ -1198,19 +1198,10 @@ async function closeHeadlessBrowser() {
 process.on('SIGTERM', closeHeadlessBrowser);
 process.on('SIGINT', closeHeadlessBrowser);
 
-// نکته‌ی مهم: قبلاً این تابع فقط یک fetch سبک انجام می‌داد که برای سایت‌های JS-سنگین (مثل دیور،
-// که رنگ‌ها/عکس‌ها را فقط بعد از اجرای جاوااسکریپت می‌سازد) کافی نبود. حالا اول مرورگرِ هدلسِ
-// واقعی را امتحان می‌کند؛ اگر آن در دسترس نبود یا با خطا مواجه شد (مثلاً محیطِ سرور منابعِ کافی
-// نداشت یا پکیج‌هایش نصب نشده بودند)، بدونِ توقفِ کل قابلیت، به همان fetchِ سبکِ قبلی برمی‌گردد.
-async function fetchProductPage(url) {
-  if (HEADLESS_BROWSER_ENABLED) {
-    try {
-      const rendered = await fetchProductPageWithBrowser(url);
-      if (rendered && rendered.html && rendered.html.length > 200) return rendered;
-    } catch (e) {
-      console.error('fetchProductPageWithBrowser ناموفق بود — با fetchِ سبک ادامه می‌دهیم:', e.message);
-    }
-  }
+// بخشِ fetchِ سبک (بدونِ مرورگر) — به یک تابعِ جدا منتقل شد تا هم fetchProductPage (برایِ
+// «ورود محصول با لینک») و هم fetchProductPageAndSwatches (برایِ «استخراج طیف رنگ») بتوانند
+// از همین یک نسخه به‌عنوانِ راهِ جایگزین/fallback استفاده کنند، بدونِ تکرارِ کد.
+async function plainFetchProductPage(url) {
   const r = await fetch(url.toString(), {
     method: 'GET',
     redirect: 'follow',
@@ -1224,6 +1215,172 @@ async function fetchProductPage(url) {
   if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) throw new Error('لینک واردشده صفحه HTML محصول نیست');
   const html = await r.text();
   return { html, finalUrl: r.url || url.toString() };
+}
+
+// نکته‌ی مهم: قبلاً این تابع فقط یک fetch سبک انجام می‌داد که برای سایت‌های JS-سنگین (مثل دیور،
+// که رنگ‌ها/عکس‌ها را فقط بعد از اجرای جاوااسکریپت می‌سازد) کافی نبود. حالا اول مرورگرِ هدلسِ
+// واقعی را امتحان می‌کند؛ اگر آن در دسترس نبود یا با خطا مواجه شد (مثلاً محیطِ سرور منابعِ کافی
+// نداشت یا پکیج‌هایش نصب نشده بودند)، بدونِ توقفِ کل قابلیت، به همان fetchِ سبکِ قبلی برمی‌گردد.
+async function fetchProductPage(url) {
+  if (HEADLESS_BROWSER_ENABLED) {
+    try {
+      const rendered = await fetchProductPageWithBrowser(url);
+      if (rendered && rendered.html && rendered.html.length > 200) return rendered;
+    } catch (e) {
+      console.error('fetchProductPageWithBrowser ناموفق بود — با fetchِ سبک ادامه می‌دهیم:', e.message);
+    }
+  }
+  return plainFetchProductPage(url);
+}
+
+// ============================================================
+// استخراجِ مستقیمِ سوآچ‌های رنگ از خودِ صفحه‌ی رندرشده (نه از حدسِ هوش مصنوعی روی متنِ خام)
+// ============================================================
+// چرا این روش لازم است؟ خیلی از فروشگاه‌ها (ازجمله دقیقاً همین SHEGLAM که روی Shopify ساخته
+// شده) رنگِ هر سوآچ را با یک کلاسِ CSS یا یک استایل‌شیتِ خارجی تنظیم می‌کنند، نه با یک attributeِ
+// متنیِ قابل‌خواندن مثلِ style="background-color:...". یعنی هیچ رشته‌ی متنیِ قابل‌مشاهده‌ای از
+// خودِ رنگ در HTML نیست تا هوش مصنوعی از رویش حدس بزند — تنها راهِ مطمئن این است که مرورگر
+// خودش CSS را اجرا کند و رنگِ نهاییِ واقعاً رندرشده را با getComputedStyle بخوانیم؛ این روش
+// کاملاً مستقل از این‌که رنگ از کجا آمده (inline، کلاس، متغیرِ CSS) است.
+async function extractSwatchesViaDom(page) {
+  try {
+    const raw = await page.evaluate(() => {
+      function rgbToHex(rgbStr) {
+        const m = String(rgbStr || '').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+        if (!m) return '';
+        const toHex = (n) => Number(n).toString(16).padStart(2, '0');
+        return `#${toHex(m[1])}${toHex(m[2])}${toHex(m[3])}`.toUpperCase();
+      }
+      function bgImageUrl(el) {
+        if (!el) return '';
+        const bg = getComputedStyle(el).backgroundImage;
+        const m = bg && bg.match(/url\((['"]?)(.*?)\1\)/);
+        return m ? m[2] : '';
+      }
+      function isRealSwatchColor(hex) {
+        // سفیدِ کامل یا مشکیِ کامل معمولاً یعنی پس‌زمینه‌ی پیش‌فرضِ خودِ دکمه است، نه رنگِ واقعیِ
+        // محصول — این‌ها را کنار می‌گذاریم تا نتیجه با موارد بی‌ربط شلوغ نشود.
+        return !!hex && hex !== '#000000' && hex !== '#FFFFFF';
+      }
+
+      const nameOrLabelLooksLikeColor = /colou?r|shade|رنگ/i;
+      const candidateNodes = [];
+
+      // الگویِ ۱ (رایج‌ترین در Shopify): چند input[type=radio] که name‌شان اشاره به رنگ دارد.
+      const radios = Array.from(document.querySelectorAll('input[type="radio"]')).filter((r) => nameOrLabelLooksLikeColor.test(r.name || ''));
+      if (radios.length >= 2) {
+        radios.forEach((r) => {
+          const label = (r.id && document.querySelector(`label[for="${CSS && CSS.escape ? CSS.escape(r.id) : r.id}"]`)) || r.closest('label');
+          candidateNodes.push({ visual: label || r, textSource: label || r, input: r });
+        });
+      }
+
+      // الگویِ ۲: یک گروهِ رادیویی/سوآچِ عمومی زیرِ عنوانی که کلمه‌ی رنگ در آن است.
+      if (candidateNodes.length === 0) {
+        const groups = Array.from(document.querySelectorAll('fieldset, [role="radiogroup"], .product-form__input, .variant-picker__option, [class*="swatch-list" i], [class*="color-swatch" i], [class*="colour-swatch" i]'));
+        for (const group of groups) {
+          const legend = group.querySelector('legend, label, .form__label, .variant-picker__label') || group;
+          if (!nameOrLabelLooksLikeColor.test(legend.textContent || '') && !nameOrLabelLooksLikeColor.test(group.className || '')) continue;
+          const items = group.querySelectorAll('input[type="radio"], button, [role="radio"], li, a, span');
+          items.forEach((it) => {
+            if (it.querySelector('input, button, [role="radio"], li, a')) return; // فقط کوچک‌ترین عنصرِ قابل‌کلیک
+            candidateNodes.push({ visual: it, textSource: it, input: it.matches('input') ? it : null });
+          });
+          if (candidateNodes.length > 0) break;
+        }
+      }
+
+      // الگویِ ۳ (fallback عمومی): هر عنصری با کلاس/attributeِ شبیهِ سوآچِ رنگ، در کلِ صفحه.
+      if (candidateNodes.length === 0) {
+        const generic = document.querySelectorAll('[class*="swatch" i], [class*="color-option" i], [class*="colour-option" i], [data-color-swatch], [data-swatch]');
+        generic.forEach((el) => {
+          if (el.querySelector('[class*="swatch" i], [class*="color-option" i]')) return;
+          candidateNodes.push({ visual: el, textSource: el, input: null });
+        });
+      }
+
+      const results = [];
+      const seen = new Set();
+      candidateNodes.forEach((node) => {
+        const visual = node.visual;
+        if (!visual || !visual.getBoundingClientRect) return;
+        const rect = visual.getBoundingClientRect();
+        if (rect.width < 4 || rect.height < 4) return; // عنصرهای پنهان/صفرپیکسلی رد می‌شوند
+
+        const label =
+          (visual.getAttribute && (visual.getAttribute('aria-label') || visual.getAttribute('title') || visual.getAttribute('data-value') || visual.getAttribute('data-color-name'))) ||
+          (node.input && (node.input.value || node.input.getAttribute('value'))) ||
+          (node.textSource && node.textSource.textContent && node.textSource.textContent.trim()) ||
+          '';
+        const cleanLabel = String(label || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+        if (!cleanLabel || seen.has(cleanLabel.toLowerCase())) return;
+
+        // عکس: یا از یک <img> داخلِ همان سوآچ، یا از پس‌زمینه‌ی محاسبه‌شده‌ی خودش/فرزندش.
+        let imageUrl = '';
+        const img = visual.querySelector && visual.querySelector('img');
+        if (img && (img.currentSrc || img.src)) imageUrl = img.currentSrc || img.src;
+        if (!imageUrl) imageUrl = bgImageUrl(visual);
+        if (!imageUrl) {
+          const innerNode = visual.querySelector && visual.querySelector('span, div, i');
+          if (innerNode) imageUrl = bgImageUrl(innerNode);
+        }
+
+        // رنگ: computed background-color خودِ عنصر یا نزدیک‌ترین فرزندِ رنگی‌اش — این خط دقیقاً
+        // همان چیزی است که مشکلِ اصلی را حل می‌کند (رنگ از هرجا که آمده باشد، همینجا رندر شده).
+        let hex = '';
+        const bgSources = [visual, visual.querySelector && visual.querySelector('span, div, i')].filter(Boolean);
+        for (const src of bgSources) {
+          const asHex = rgbToHex(getComputedStyle(src).backgroundColor);
+          if (isRealSwatchColor(asHex)) { hex = asHex; break; }
+        }
+
+        if (!imageUrl && !hex) return; // نه عکس دارد نه رنگِ قابل‌تشخیص — احتمالاً سوآچِ واقعی نیست
+
+        seen.add(cleanLabel.toLowerCase());
+        results.push({ label: cleanLabel, hex, imageUrl });
+      });
+
+      return results;
+    });
+    return Array.isArray(raw) ? raw : [];
+  } catch (e) {
+    console.error('extractSwatchesViaDom failed:', e.message);
+    return [];
+  }
+}
+
+// نسخه‌ی مخصوصِ ابزارِ «استخراج طیف رنگ» — برخلافِ fetchProductPage (که فقط HTML برمی‌گرداند)،
+// این تابع صفحه را باز نگه می‌دارد تا هم extractSwatchesViaDom (روشِ اصلی و دقیق) رویش اجرا شود
+// و هم، برای مواقعی که آن روش چیزی پیدا نکرد، متنِ HTML برای مسیرِ قدیمیِ مبتنی‌بر Gemini آماده
+// بماند. اگر مرورگرِ هدلس در دسترس نبود، دقیقاً مثلِ قبل با fetchِ سبک ادامه می‌دهد (domSwatches
+// در آن حالت همیشه خالی است، چون بدونِ اجرای جاوااسکریپت امکانِ خواندنِ computed style نیست).
+async function fetchProductPageAndSwatches(url) {
+  if (HEADLESS_BROWSER_ENABLED) {
+    try {
+      const browser = await getBrowserInstance();
+      if (browser) {
+        const page = await browser.newPage();
+        try {
+          await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+          await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+          await page.goto(url.toString(), { waitUntil: 'networkidle2', timeout: 25000 });
+          await autoScrollPage(page);
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          await expandColorSwatches(page);
+          const domSwatches = await extractSwatchesViaDom(page);
+          const html = await page.content();
+          const finalUrl = page.url();
+          return { html, finalUrl, domSwatches };
+        } finally {
+          await page.close().catch(() => {});
+        }
+      }
+    } catch (e) {
+      console.error('fetchProductPageAndSwatches (headless) ناموفق بود — با fetchِ سبک ادامه می‌دهیم:', e.message);
+    }
+  }
+  const fallback = await plainFetchProductPage(url);
+  return { ...fallback, domSwatches: [] };
 }
 
 async function callGeminiText(prompt) {
@@ -1294,19 +1451,34 @@ app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, re
   const url = validateProductUrl(req.body && req.body.url);
   if (!url) return res.status(400).json({ error: 'لینک محصول معتبر نیست' });
   try {
-    const page = await fetchProductPage(url);
-    const text = stripHtmlForGemini(page.html);
-    if (!text) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
-    const parsed = await callGeminiText(buildVariantExtractionPrompt(text, page.finalUrl));
-    const rawVariants = Array.isArray(parsed && parsed.variants) ? parsed.variants : [];
+    const page = await fetchProductPageAndSwatches(url);
+    let rawVariants = [];
+    let method = 'dom';
+    // روشِ اصلی و دقیق‌تر: خواندنِ مستقیمِ رنگ‌های واقعاً رندرشده از خودِ صفحه (کارِ درست برایِ
+    // سایت‌هایی مثلِ SHEGLAM/Shopify که رنگِ سوآچ فقط با CSS تنظیم می‌شود، نه متن). اگر این روش
+    // چیزی پیدا نکرد (مثلاً ساختارِ سایت خیلی غیرِمعمول بود)، به‌جای دست خالی برگرداندن، به روشِ
+    // قدیمی (خواندنِ متنِ صفحه با Gemini) برمی‌گردیم.
+    if (page.domSwatches && page.domSwatches.length >= 2) {
+      rawVariants = page.domSwatches;
+    } else {
+      method = 'ai';
+      const text = stripHtmlForGemini(page.html);
+      if (!text) return res.status(422).json({ error: 'متن قابل استفاده‌ای از صفحه محصول پیدا نشد' });
+      const parsed = await callGeminiText(buildVariantExtractionPrompt(text, page.finalUrl));
+      rawVariants = Array.isArray(parsed && parsed.variants) ? parsed.variants : [];
+    }
     const { variants, attempted, uploaded } = await mirrorVariantImages(rawVariants, page.finalUrl);
-    // پیامِ تشخیصی: اگر تعدادی از عکس‌ها پیدا شدند ولی هیچ‌کدام آپلود نشدند (مثلاً چون سایتِ
-    // مبدأ دانلودِ خودکار را مسدود می‌کند)، مدیر به‌جای سکوت، دلیلِ واقعی را می‌بیند.
+    // پیامِ تشخیصی: هم می‌گوید از کدام روش استفاده شد، هم اینکه از چند عکسِ پیشنهادی چندتا واقعاً
+    // دانلود/آپلود شد — این‌طور مدیر همیشه می‌داند دقیقاً چه اتفاقی افتاده، نه فقط یک نتیجه‌ی خام.
     let imageNote = null;
-    if (attempted > 0 && uploaded === 0) {
-      imageNote = 'رنگ‌ها پیدا شدند اما هیچ‌کدام از عکس‌هایشان دانلود نشد — احتمالاً سایتِ مبدأ دانلودِ خودکارِ عکس را مسدود می‌کند. لینکِ خامِ عکس (در صورت وجود) در همان ردیف نگه داشته شده؛ می‌توانی با «افزودن عکس این رنگ» دستی آپلود کنی.';
+    if (variants.length === 0) {
+      imageNote = 'هیچ رنگی روی این صفحه پیدا نشد — می‌تونی رنگ‌ها رو دستی از پایین اضافه کنی.';
+    } else if (attempted > 0 && uploaded === 0) {
+      imageNote = `${variants.length} رنگ (${method === 'dom' ? 'مستقیم از ساختارِ صفحه' : 'با هوش مصنوعی از متنِ صفحه'}) پیدا شد، اما هیچ‌کدام از عکس‌هایشان دانلود نشد — احتمالاً سایتِ مبدأ دانلودِ خودکارِ عکس را مسدود می‌کند. لینکِ خامِ عکس (در صورت وجود) در همان ردیف نگه داشته شده؛ می‌توانی با «افزودن عکس این رنگ» دستی آپلود کنی.`;
     } else if (attempted > uploaded) {
-      imageNote = `از ${attempted} عکسِ پیشنهادی، ${uploaded} مورد با موفقیت دانلود و آپلود شد؛ بقیه را دستی تکمیل کن.`;
+      imageNote = `${variants.length} رنگ (${method === 'dom' ? 'مستقیم از ساختارِ صفحه' : 'با هوش مصنوعی از متنِ صفحه'}) پیدا شد؛ از ${attempted} عکسِ پیشنهادی، ${uploaded} مورد با موفقیت دانلود و آپلود شد — بقیه را دستی تکمیل کن.`;
+    } else {
+      imageNote = `${variants.length} رنگ (${method === 'dom' ? 'مستقیم از ساختارِ صفحه' : 'با هوش مصنوعی از متنِ صفحه'}) پیدا و کامل پردازش شد.`;
     }
     res.json({ variants, imageNote });
   } catch (e) {
@@ -1546,17 +1718,4 @@ app.get('/payment/callback', async (req, res) => {
   const { Authority, Status } = req.query; let db;
   try { db = await readDB(); } catch { return res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
   const order = db.orders.find((o) => o.authority === Authority);
-  if (!order) return res.redirect(`${FRONTEND_URL}/payment/result?status=notfound`);
-  if (Status !== 'OK') { order.status = 'canceled'; await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=canceled`); }
-  try {
-    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/verify.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount: order.amount, authority: Authority }) });
-    const data = await zRes.json();
-    if (data.data && (data.data.code === 100 || data.data.code === 101)) { order.status = 'paid'; order.ref_id = String(data.data.ref_id); await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=success&ref=${data.data.ref_id}`); }
-    order.status = 'failed'; await writeDB(db); res.redirect(`${FRONTEND_URL}/payment/result?status=failed`);
-  } catch { res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
-});
-
-app.get('/', (req, res) => res.send('Store API is running'));
-
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  if (!order) return res.redirect(`${FRONTEND_URL}/payment/result?status
