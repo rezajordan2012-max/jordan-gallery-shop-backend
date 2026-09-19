@@ -1264,6 +1264,41 @@ async function extractSwatchesViaDom(page) {
         const m = bg && bg.match(/url\((['"]?)(.*?)\1\)/);
         return m ? m[2] : '';
       }
+      // خیلی از سایت‌های مدرن (دقیقاً همینِ SHEGLAM) برایِ داشتنِ دایره‌های کاملاً صاف و
+      // ضدِمِیخوردگی، رنگِ سوآچ را نه با CSS background، بلکه با یک <svg><circle fill="..."/></svg>
+      // داخلِ همان دکمه رسم می‌کنند. این یعنی همه‌ی دکمه‌ها از نظرِ CSS background دقیقاً یک‌رنگ
+      // (شفاف) به نظر می‌رسند و قبلاً باعث می‌شد کلِ خوشه به‌اشتباه ردّ شود (چون «رنگِ متفاوت»ی
+      // پیدا نمی‌شد) — این تابع رنگِ واقعی را از همان شکلِ SVG داخلی می‌خواند.
+      function svgFillColor(el) {
+        if (!el || !el.querySelector) return '';
+        const shape = el.querySelector('svg circle, svg path, svg rect, svg ellipse, svg polygon, svg use');
+        if (!shape) return '';
+        const computed = getComputedStyle(shape).fill;
+        if (computed && computed !== 'none') return computed;
+        return shape.getAttribute('fill') || '';
+      }
+      // یک راهِ رایجِ دیگر برایِ رنگ‌کردنِ سوآچ‌ها: گذاشتنِ رنگ روی ::before/::after به‌جای خودِ
+      // عنصر — این را هم به‌عنوانِ منبعِ سومِ رنگ (بعد از CSS background و SVG fill) چک می‌کنیم.
+      function pseudoBgColor(el) {
+        if (!el) return '';
+        try {
+          const before = getComputedStyle(el, '::before').backgroundColor;
+          if (before && before !== 'rgba(0, 0, 0, 0)' && before !== 'transparent') return before;
+          const after = getComputedStyle(el, '::after').backgroundColor;
+          if (after && after !== 'rgba(0, 0, 0, 0)' && after !== 'transparent') return after;
+        } catch (e) { /* بعضی مرورگرها روی برخی عناصر خطا می‌دهند — بی‌اهمیت */ }
+        return '';
+      }
+      function normalizeAnyColorToHex(colorStr) {
+        const s = String(colorStr || '').trim();
+        if (!s || s === 'none' || s === 'transparent') return '';
+        if (/^#[0-9a-f]{3}$/i.test(s)) {
+          const r = s[1], g = s[2], b = s[3];
+          return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
+        }
+        if (/^#[0-9a-f]{6}$/i.test(s)) return s.toUpperCase();
+        return rgbToHex(s);
+      }
       function isRealSwatchColor(hex) {
         // سفیدِ کامل یا مشکیِ کامل معمولاً یعنی پس‌زمینه‌ی پیش‌فرضِ خودِ دکمه است، نه رنگِ واقعیِ
         // محصول — این‌ها را کنار می‌گذاریم تا نتیجه با موارد بی‌ربط شلوغ نشود.
@@ -1346,7 +1381,9 @@ async function extractSwatchesViaDom(page) {
             items.map((el2) => {
               const img2 = el2.querySelector && el2.querySelector('img');
               const imgSrc = img2 ? img2.currentSrc || img2.src : '';
-              return getComputedStyle(el2).backgroundColor + '|' + (bgImageUrl(el2) || imgSrc);
+              const svgFill2 = svgFillColor(el2);
+              const pseudo2 = pseudoBgColor(el2);
+              return getComputedStyle(el2).backgroundColor + '|' + (bgImageUrl(el2) || imgSrc) + '|' + svgFill2 + '|' + pseudo2;
             })
           );
           if (distinctVisuals.size < 2) return;
@@ -1396,13 +1433,22 @@ async function extractSwatchesViaDom(page) {
           if (innerNode) imageUrl = bgImageUrl(innerNode);
         }
 
-        // رنگ: computed background-color خودِ عنصر یا نزدیک‌ترین فرزندِ رنگی‌اش — این خط دقیقاً
-        // همان چیزی است که مشکلِ اصلی را حل می‌کند (رنگ از هرجا که آمده باشد، همینجا رندر شده).
+        // رنگ: computed background-color خودِ عنصر یا نزدیک‌ترین فرزندِ رنگی‌اش؛ اگر هیچ‌کدام
+        // رنگی نداشتند، سراغِ fillِ یک شکلِ SVGِ داخلی می‌رویم (دقیقاً همان چیزی که مشکلِ اصلیِ
+        // SHEGLAM را حل می‌کند — رنگ از هرجا که آمده باشد، همینجا پیدا می‌شود).
         let hex = '';
         const bgSources = [visual, visual.querySelector && visual.querySelector('span, div, i')].filter(Boolean);
         for (const src of bgSources) {
-          const asHex = rgbToHex(getComputedStyle(src).backgroundColor);
+          const asHex = normalizeAnyColorToHex(getComputedStyle(src).backgroundColor);
           if (isRealSwatchColor(asHex)) { hex = asHex; break; }
+        }
+        if (!hex) {
+          const svgHex = normalizeAnyColorToHex(svgFillColor(visual));
+          if (isRealSwatchColor(svgHex)) hex = svgHex;
+        }
+        if (!hex) {
+          const pseudoHex = normalizeAnyColorToHex(pseudoBgColor(visual));
+          if (isRealSwatchColor(pseudoHex)) hex = pseudoHex;
         }
 
         if (!imageUrl && !hex) return; // نه عکس دارد نه رنگِ قابل‌تشخیص — احتمالاً سوآچِ واقعی نیست
