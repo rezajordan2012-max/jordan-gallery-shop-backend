@@ -1615,46 +1615,72 @@ ${sourceText}`;
 //      نه برایِ حدسِ خودِ رنگ (چون حدسِ رنگ توسطِ هوش مصنوعی می‌تواند کمی نادرست/تغییریافته باشد).
 //   ۲) با jimp، دقیقاً همان مختصاتِ پیکسلی از خودِ عکسِ اصلیِ آپلودشده نمونه‌برداری می‌شود — یعنی
 //      رنگِ نهایی «بدونِ افت یا تغییر» و دقیقاً همان رنگِ واقعیِ عکس است، نه یک تخمینِ هوش مصنوعی.
-function buildSwatchLocatorPrompt(width, height) {
+function buildSwatchLocatorPrompt() {
   return `این تصویر یک اسکرین‌شات از «لیستِ انتخابِ رنگِ» یک محصول است (مثلاً یک پنجره یا بخش با عنوانِ Color/Shade که برای هر رنگ یک دایره/مربعِ تخت‌رنگ کوچک، در کنارش اسم/کدِ آن رنگ نمایش داده شده).
-ابعادِ دقیقِ این تصویر: عرض=${width} پیکسل، ارتفاع=${height} پیکسل. تمامِ مختصات‌هایی که برمی‌گردانی باید دقیقاً بر همین مقیاس (پیکسلِ واقعیِ تصویر، نه درصد و نه یک مقیاسِ دیگر) باشند.
 
-برایِ هرکدام از ردیف‌های رنگ در تصویر:
-- name: دقیقاً همان متنِ نامِ رنگ که کنارش نوشته شده (مثلاً «Chic»، «Crimson Suede»، یک کدِ عددی). ترجمه نکن، از خودت اسم نساز.
-- x، y: مختصاتِ پیکسلیِ دقیقِ «مرکزِ» همان دایره/مربعِ رنگی (نه متن، نه تیکِ انتخاب‌شده، نه هیچ چیزِ دیگر) — این نقطه باید کاملاً وسطِ ناحیه‌ی تخت‌رنگ باشد، جایی که مطمئنی فقط همان یک رنگ است (نه لبه، نه سایه).
+برایِ هرکدام از ردیف‌های رنگ در تصویر، فقط و فقط خودِ دایره/مربعِ تخت‌رنگ را (نه متن، نه تیکِ انتخاب‌شده، نه کلِ ردیف) مشخص کن:
+- name: دقیقاً همان متنِ نامِ رنگ که کنارش نوشته شده (مثلاً «Chic»، «Crimson Suede»). ترجمه نکن، از خودت اسم نساز، و هر ردیف را جدا برگردان حتی اگر رنگ‌ها به هم شبیه باشند.
+- box_2d: کادرِ محدودکننده‌ی دقیق و تنگِ همان دایره/مربعِ رنگی، به‌صورتِ آرایه‌ی [ymin, xmin, ymax, xmax] — هرکدام عددی صحیح بینِ ۰ تا ۱۰۰۰، نرمالایزشده نسبت به کلِ ابعادِ تصویر (این دقیقاً همان قراردادِ استانداردِ تشخیصِ اشیاء است، نه پیکسلِ خام). کادر باید فقط دورِ خودِ ناحیه‌ی تخت‌رنگ باشد — نه بزرگ‌تر، نه شاملِ متنِ کنارش، نه شاملِ حاشیه/سایه‌ی دورش.
 
 اگر تصویر اصلاً چنین لیستی نداشت، آرایه‌ی خالی برگردان. فقط یک JSON معتبر و بدون Markdown، دقیقاً با این ساختار برگردان:
-{"swatches":[{"name":"","x":0,"y":0}]}`;
+{"swatches":[{"name":"","box_2d":[0,0,0,0]}]}`;
 }
 
-// نمونه‌برداریِ دقیقِ رنگِ پیکسل از خودِ عکسِ اصلی، حولِ نقطه‌ای که Gemini پیشنهاد داده — به‌جایِ
-// یک پیکسلِ تنها (که ممکن است دقیقاً روی نویز یا لبه بیفتد)، میانگینِ یک پنجره‌ی کوچک گرفته
-// می‌شود و پیکسل‌هایی که خیلی با میانگین فرق دارند (احتمالاً لبه/سایه) کنار گذاشته می‌شوند.
-function sampleAverageColorHex(image, cx, cy, radius = 6) {
+// کادرِ نرمالایزشده‌ی [ymin,xmin,ymax,xmax] (مقیاسِ ۰ تا ۱۰۰۰، همان قراردادِ استانداردِ
+// تشخیصِ‌اشیاءِ Gemini) را به یک مستطیلِ پیکسلیِ واقعی — بر اساسِ ابعادِ واقعیِ همین عکس —
+// تبدیل می‌کند.
+function boxToPixelRect(box2d, width, height) {
+  if (!Array.isArray(box2d) || box2d.length !== 4) return null;
+  const nums = box2d.map(Number);
+  if (!nums.every(Number.isFinite)) return null;
+  const [ymin, xmin, ymax, xmax] = nums;
+  const x1 = Math.round((Math.min(xmin, xmax) / 1000) * width);
+  const y1 = Math.round((Math.min(ymin, ymax) / 1000) * height);
+  const x2 = Math.round((Math.max(xmin, xmax) / 1000) * width);
+  const y2 = Math.round((Math.max(ymin, ymax) / 1000) * height);
+  const rx1 = Math.max(0, Math.min(width - 2, x1));
+  const ry1 = Math.max(0, Math.min(height - 2, y1));
+  const rx2 = Math.max(rx1 + 2, Math.min(width, x2));
+  const ry2 = Math.max(ry1 + 2, Math.min(height, y2));
+  return { x: rx1, y: ry1, w: rx2 - rx1, h: ry2 - ry1 };
+}
+
+// نکته‌ی مهم: چون کادرِ پیشنهادیِ Gemini همیشه دقیقاً روی خودِ سوآچ منطبق نیست (ممکن است کمی
+// بزرگ‌تر باشد و لبه/پس‌زمینه‌ی اطراف را هم بگیرد، یا کمی جابه‌جا باشد)، به‌جایِ اعتماد به یک
+// نقطه‌ی تنها، چندین نقطه از داخلِ کادر (با کمی حاشیه‌ی امن از لبه‌ها) نمونه‌برداری می‌شود و
+// «پرتکرارترین رنگ» بینِ آن‌ها انتخاب می‌شود — این‌طور حتی اگر چند نمونه روی لبه/سایه بیفتند،
+// اکثریتِ نمونه‌ها که روی خودِ رنگِ اصلی هستند، نتیجه را تعیین می‌کنند (نه چند نمونه‌ی پرت).
+function sampleModalColorHexFromBox(image, rect) {
   const width = image.bitmap.width;
   const height = image.bitmap.height;
-  const px = Math.max(0, Math.min(width - 1, Math.round(cx)));
-  const py = Math.max(0, Math.min(height - 1, Math.round(cy)));
-  const samples = [];
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dy = -radius; dy <= radius; dy++) {
-      const x = px + dx;
-      const y = py + dy;
-      if (x < 0 || y < 0 || x >= width || y >= height) continue;
+  const marginX = Math.max(1, Math.round(rect.w * 0.22));
+  const marginY = Math.max(1, Math.round(rect.h * 0.22));
+  const x0 = Math.max(0, rect.x + marginX);
+  const y0 = Math.max(0, rect.y + marginY);
+  const x1 = Math.min(width - 1, rect.x + rect.w - marginX);
+  const y1 = Math.min(height - 1, rect.y + rect.h - marginY);
+  if (x1 <= x0 || y1 <= y0) return '';
+
+  const stepX = Math.max(1, Math.round((x1 - x0) / 6));
+  const stepY = Math.max(1, Math.round((y1 - y0) / 6));
+  const buckets = new Map();
+  for (let x = x0; x <= x1; x += stepX) {
+    for (let y = y0; y <= y1; y += stepY) {
       const { r, g, b } = Jimp.intToRGBA(image.getPixelColor(x, y));
-      samples.push([r, g, b]);
+      // کوانتیزه‌کردنِ خشن (گروه‌بندیِ رنگ‌های نزدیک‌به‌هم در یک سطل) تا نویزِ جزئیِ پیکسل‌به‌پیکسل
+      // باعثِ پخش‌شدنِ رأی‌ها بینِ سطل‌های خیلی مشابه نشود.
+      const key = `${Math.round(r / 10) * 10}-${Math.round(g / 10) * 10}-${Math.round(b / 10) * 10}`;
+      const cur = buckets.get(key) || { count: 0, r: 0, g: 0, b: 0 };
+      cur.count += 1;
+      cur.r += r; cur.g += g; cur.b += b;
+      buckets.set(key, cur);
     }
   }
-  if (samples.length === 0) return '';
-  const avg = samples.reduce((acc, s) => [acc[0] + s[0], acc[1] + s[1], acc[2] + s[2]], [0, 0, 0]).map((v) => v / samples.length);
-  // حذفِ نمونه‌هایی که خیلی از میانگینِ اولیه فاصله دارند (لبه/سایه/انعکاس) و محاسبه‌ی دوباره —
-  // این باعث می‌شود رنگِ نهایی دقیقاً همان رنگِ اصلیِ سوآچ باشد، نه یک رنگِ مخلوط‌شده با لبه‌اش.
-  const THRESH = 40;
-  const filtered = samples.filter(([r, g, b]) => Math.abs(r - avg[0]) < THRESH && Math.abs(g - avg[1]) < THRESH && Math.abs(b - avg[2]) < THRESH);
-  const finalSet = filtered.length >= samples.length * 0.4 ? filtered : samples;
-  const finalAvg = finalSet.reduce((acc, s) => [acc[0] + s[0], acc[1] + s[1], acc[2] + s[2]], [0, 0, 0]).map((v) => Math.round(v / finalSet.length));
-  const toHex = (n) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, '0');
-  return `#${toHex(finalAvg[0])}${toHex(finalAvg[1])}${toHex(finalAvg[2])}`.toUpperCase();
+  if (buckets.size === 0) return '';
+  let best = null;
+  buckets.forEach((v) => { if (!best || v.count > best.count) best = v; });
+  const toHex = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
+  return `#${toHex(best.r / best.count)}${toHex(best.g / best.count)}${toHex(best.b / best.count)}`.toUpperCase();
 }
 
 app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, res) => {
@@ -1680,7 +1706,7 @@ app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, 
       body: JSON.stringify({
         contents: [{ role: 'user', parts: [
           { inline_data: { mime_type: match[1], data: match[2] } },
-          { text: buildSwatchLocatorPrompt(width, height) },
+          { text: buildSwatchLocatorPrompt() },
         ] }],
         generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
       }),
@@ -1696,24 +1722,31 @@ app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, 
       return res.json({ variants: [], imageNote: 'هیچ لیستِ رنگی روی این عکس تشخیص داده نشد — مطمئن شو اسکرین‌شات کاملِ ردیف‌های رنگ (دایره + اسمِ کنارش) را شامل می‌شود.' });
     }
 
-    // برایِ هر سوآچِ پیدا‌شده: رنگِ دقیق را مستقیماً از پیکسل‌هایِ خودِ عکس می‌خوانیم (نه از حدسِ
-    // Gemini)، و یک تصویرِ کوچکِ برش‌خورده (crop) از همان ناحیه را هم به‌عنوانِ آواتارِ آن رنگ
-    // در Cloudinary آپلود می‌کنیم — دقیقاً همان چیزی که مدیر روی عکسِ خودش دیده، بدونِ هیچ افتی.
-    const CROP_SIZE = 28;
+    // برایِ هر سوآچِ پیدا‌شده: رنگِ دقیق را با نمونه‌برداریِ چندنقطه‌ای/پرتکرارترین از داخلِ
+    // کادرِ خودِ همان سوآچ می‌خوانیم (نه یک نقطه‌ی تنها)، و یک تصویرِ برش‌خورده از همان کادر را
+    // هم به‌عنوانِ آواتارِ آن رنگ در Cloudinary آپلود می‌کنیم — دقیقاً همان چیزی که مدیر روی
+    // عکسِ خودش دیده، بدونِ هیچ افتی، و با اندازه‌ای متناسب با خودِ کادرِ تشخیص‌داده‌شده.
+    const CROP_MIN = 14;
+    const CROP_MAX = 120;
+    let matchedCount = 0;
     const variants = [];
     for (const sw of rawSwatches.slice(0, 60)) {
       const name = String((sw && sw.name) || '').trim().slice(0, 80);
-      const x = Number(sw && sw.x);
-      const y = Number(sw && sw.y);
-      if (!name || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+      const rect = boxToPixelRect(sw && sw.box_2d, width, height);
+      if (!name || !rect) continue;
+      matchedCount += 1;
 
-      const hex = sampleAverageColorHex(image, x, y, 6);
+      const hex = sampleModalColorHexFromBox(image, rect);
 
       let croppedImageUrl = '';
       try {
-        const cropX = Math.max(0, Math.min(width - CROP_SIZE, Math.round(x - CROP_SIZE / 2)));
-        const cropY = Math.max(0, Math.min(height - CROP_SIZE, Math.round(y - CROP_SIZE / 2)));
-        const cropped = image.clone().crop(cropX, cropY, Math.min(CROP_SIZE, width), Math.min(CROP_SIZE, height));
+        const marginX = Math.max(1, Math.round(rect.w * 0.12));
+        const marginY = Math.max(1, Math.round(rect.h * 0.12));
+        const cropX = Math.max(0, rect.x + marginX);
+        const cropY = Math.max(0, rect.y + marginY);
+        const cropW = Math.max(CROP_MIN, Math.min(CROP_MAX, rect.w - marginX * 2, width - cropX));
+        const cropH = Math.max(CROP_MIN, Math.min(CROP_MAX, rect.h - marginY * 2, height - cropY));
+        const cropped = image.clone().crop(cropX, cropY, cropW, cropH);
         const cropBuffer = await cropped.getBufferAsync(Jimp.MIME_PNG);
         const cropDataUri = `data:image/png;base64,${cropBuffer.toString('base64')}`;
         const uploaded = await uploadDataUriToCloudinary(cropDataUri);
@@ -1725,7 +1758,9 @@ app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, 
       variants.push({ label: name, hex, image: croppedImageUrl });
     }
 
-    const imageNote = `${variants.length.toLocaleString('fa-IR')} رنگ از روی عکس پیدا و رنگشان مستقیماً از پیکسل‌هایِ خودِ عکس (بدونِ حدسِ هوش مصنوعی) خوانده شد — لطفاً قبل از ذخیره یک نگاهِ سریع بینداز.`;
+    const missingCount = rawSwatches.length - matchedCount;
+    const noteExtra = missingCount > 0 ? ` (${missingCount.toLocaleString('fa-IR')} موردِ دیگر به‌خاطرِ کادرِ نامعتبر رد شدند)` : '';
+    const imageNote = `${variants.length.toLocaleString('fa-IR')} رنگ از روی عکس پیدا و رنگشان از پیکسل‌هایِ خودِ عکس خوانده شد${noteExtra} — لطفاً قبل از ذخیره یک نگاهِ سریع بینداز.`;
     res.json({ variants, imageNote });
   } catch (e) {
     console.error('extract-variants-from-image error:', e);
