@@ -7,6 +7,19 @@ const crypto = require('crypto');
 const { MongoClient } = require('mongodb');
 
 // ============================================================
+// jimp — برای نمونه‌برداریِ دقیقِ رنگِ پیکسل از عکسِ آپلودی (اسکرین‌شاتِ لیستِ رنگ‌ها).
+// چرا jimp؟ کاملاً جاوااسکریپتِ خالص است (بدون نیاز به کتابخانه‌های سیستمیِ باینری مثلِ Sharp)،
+// پس روی هاست‌های محدود مثلِ Render بدونِ دردسر نصب می‌شود. اگر نصب نشده باشد، این قابلیتِ
+// خاص (وارد کردنِ طیف رنگ از روی عکس) غیرفعال می‌ماند ولی بقیه‌ی سایت مثلِ همیشه کار می‌کند.
+//   npm install jimp
+let Jimp = null;
+try {
+  Jimp = require('jimp');
+} catch (e) {
+  console.warn('⚠️ پکیجِ jimp نصب نشده — ابزارِ «وارد کردنِ طیف رنگ از روی عکس» غیرفعال می‌ماند. برای فعال‌سازی: npm install jimp');
+}
+
+// ============================================================
 // مرورگر هدلس (Headless Browser) — برای صفحاتی مثل دیور که رنگ‌ها/عکس‌ها را فقط با اجرای
 // واقعیِ جاوااسکریپت در صفحه می‌سازند (نه در HTMLِ خامی که یک fetch ساده برمی‌گرداند).
 // بارِ نصب روی سرور (این دو پکیج باید در package.json/npm install اضافه شوند):
@@ -1593,6 +1606,132 @@ function buildVariantExtractionPrompt(sourceText, sourceUrl) {
 متن صفحه:
 ${sourceText}`;
 }
+
+// ============================================================
+// ابزارِ جدید و مستقل: «وارد کردنِ طیف رنگ از روی عکس» — کاملاً جدا از ابزارِ «استخراج از لینک»
+// (هیچ مسیر/رفتارِ موجودی را تغییر نمی‌دهد). مدیر یک اسکرین‌شات از لیستِ رنگ‌های سایتِ مبدأ
+// (مثلاً همان پنجره‌ی «Color» که SHEGLAM باز می‌کند) آپلود می‌کند؛ سرور با دو مرحله کار می‌کند:
+//   ۱) Gemini Vision فقط برایِ «پیدا کردنِ محل» هر دایره‌ی رنگ و متنِ کنارش استفاده می‌شود —
+//      نه برایِ حدسِ خودِ رنگ (چون حدسِ رنگ توسطِ هوش مصنوعی می‌تواند کمی نادرست/تغییریافته باشد).
+//   ۲) با jimp، دقیقاً همان مختصاتِ پیکسلی از خودِ عکسِ اصلیِ آپلودشده نمونه‌برداری می‌شود — یعنی
+//      رنگِ نهایی «بدونِ افت یا تغییر» و دقیقاً همان رنگِ واقعیِ عکس است، نه یک تخمینِ هوش مصنوعی.
+function buildSwatchLocatorPrompt(width, height) {
+  return `این تصویر یک اسکرین‌شات از «لیستِ انتخابِ رنگِ» یک محصول است (مثلاً یک پنجره یا بخش با عنوانِ Color/Shade که برای هر رنگ یک دایره/مربعِ تخت‌رنگ کوچک، در کنارش اسم/کدِ آن رنگ نمایش داده شده).
+ابعادِ دقیقِ این تصویر: عرض=${width} پیکسل، ارتفاع=${height} پیکسل. تمامِ مختصات‌هایی که برمی‌گردانی باید دقیقاً بر همین مقیاس (پیکسلِ واقعیِ تصویر، نه درصد و نه یک مقیاسِ دیگر) باشند.
+
+برایِ هرکدام از ردیف‌های رنگ در تصویر:
+- name: دقیقاً همان متنِ نامِ رنگ که کنارش نوشته شده (مثلاً «Chic»، «Crimson Suede»، یک کدِ عددی). ترجمه نکن، از خودت اسم نساز.
+- x، y: مختصاتِ پیکسلیِ دقیقِ «مرکزِ» همان دایره/مربعِ رنگی (نه متن، نه تیکِ انتخاب‌شده، نه هیچ چیزِ دیگر) — این نقطه باید کاملاً وسطِ ناحیه‌ی تخت‌رنگ باشد، جایی که مطمئنی فقط همان یک رنگ است (نه لبه، نه سایه).
+
+اگر تصویر اصلاً چنین لیستی نداشت، آرایه‌ی خالی برگردان. فقط یک JSON معتبر و بدون Markdown، دقیقاً با این ساختار برگردان:
+{"swatches":[{"name":"","x":0,"y":0}]}`;
+}
+
+// نمونه‌برداریِ دقیقِ رنگِ پیکسل از خودِ عکسِ اصلی، حولِ نقطه‌ای که Gemini پیشنهاد داده — به‌جایِ
+// یک پیکسلِ تنها (که ممکن است دقیقاً روی نویز یا لبه بیفتد)، میانگینِ یک پنجره‌ی کوچک گرفته
+// می‌شود و پیکسل‌هایی که خیلی با میانگین فرق دارند (احتمالاً لبه/سایه) کنار گذاشته می‌شوند.
+function sampleAverageColorHex(image, cx, cy, radius = 6) {
+  const width = image.bitmap.width;
+  const height = image.bitmap.height;
+  const px = Math.max(0, Math.min(width - 1, Math.round(cx)));
+  const py = Math.max(0, Math.min(height - 1, Math.round(cy)));
+  const samples = [];
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dy = -radius; dy <= radius; dy++) {
+      const x = px + dx;
+      const y = py + dy;
+      if (x < 0 || y < 0 || x >= width || y >= height) continue;
+      const { r, g, b } = Jimp.intToRGBA(image.getPixelColor(x, y));
+      samples.push([r, g, b]);
+    }
+  }
+  if (samples.length === 0) return '';
+  const avg = samples.reduce((acc, s) => [acc[0] + s[0], acc[1] + s[1], acc[2] + s[2]], [0, 0, 0]).map((v) => v / samples.length);
+  // حذفِ نمونه‌هایی که خیلی از میانگینِ اولیه فاصله دارند (لبه/سایه/انعکاس) و محاسبه‌ی دوباره —
+  // این باعث می‌شود رنگِ نهایی دقیقاً همان رنگِ اصلیِ سوآچ باشد، نه یک رنگِ مخلوط‌شده با لبه‌اش.
+  const THRESH = 40;
+  const filtered = samples.filter(([r, g, b]) => Math.abs(r - avg[0]) < THRESH && Math.abs(g - avg[1]) < THRESH && Math.abs(b - avg[2]) < THRESH);
+  const finalSet = filtered.length >= samples.length * 0.4 ? filtered : samples;
+  const finalAvg = finalSet.reduce((acc, s) => [acc[0] + s[0], acc[1] + s[1], acc[2] + s[2]], [0, 0, 0]).map((v) => Math.round(v / finalSet.length));
+  const toHex = (n) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, '0');
+  return `#${toHex(finalAvg[0])}${toHex(finalAvg[1])}${toHex(finalAvg[2])}`.toUpperCase();
+}
+
+app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, res) => {
+  if (!Jimp) return res.status(500).json({ error: 'پکیجِ jimp روی سرور نصب نشده — این ابزار نیاز به آن دارد (npm install jimp)' });
+  if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
+  const imageBase64 = req.body && req.body.imageBase64;
+  if (!imageBase64 || typeof imageBase64 !== 'string') return res.status(400).json({ error: 'تصویر معتبر نیست' });
+  const match = imageBase64.match(/^data:(image\/(?:png|jpe?g|webp));base64,(.+)$/i);
+  if (!match) return res.status(400).json({ error: 'فرمتِ تصویر پشتیبانی نمی‌شود (فقط png، jpg، webp)' });
+  const approxBytes = Math.ceil((match[2].length * 3) / 4);
+  if (approxBytes > 12 * 1024 * 1024) return res.status(413).json({ error: 'حجمِ تصویر بیش از حد مجاز است (حداکثر ۱۲ مگابایت)' });
+
+  try {
+    const buffer = Buffer.from(match[2], 'base64');
+    const image = await Jimp.read(buffer);
+    const width = image.bitmap.width;
+    const height = image.bitmap.height;
+
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+    const aiRes = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [
+          { inline_data: { mime_type: match[1], data: match[2] } },
+          { text: buildSwatchLocatorPrompt(width, height) },
+        ] }],
+        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+      }),
+    });
+    const aiData = await aiRes.json().catch(() => ({}));
+    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) ? friendlyAiError(new Error(aiData.error.message)) : `خطا در ارتباط با Gemini (${aiRes.status})` });
+    const textBlock = (aiData.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((c) => c.text || '').join('').trim();
+    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    const parsed = parseJsonObject(textBlock);
+    const rawSwatches = Array.isArray(parsed && parsed.swatches) ? parsed.swatches : [];
+
+    if (rawSwatches.length === 0) {
+      return res.json({ variants: [], imageNote: 'هیچ لیستِ رنگی روی این عکس تشخیص داده نشد — مطمئن شو اسکرین‌شات کاملِ ردیف‌های رنگ (دایره + اسمِ کنارش) را شامل می‌شود.' });
+    }
+
+    // برایِ هر سوآچِ پیدا‌شده: رنگِ دقیق را مستقیماً از پیکسل‌هایِ خودِ عکس می‌خوانیم (نه از حدسِ
+    // Gemini)، و یک تصویرِ کوچکِ برش‌خورده (crop) از همان ناحیه را هم به‌عنوانِ آواتارِ آن رنگ
+    // در Cloudinary آپلود می‌کنیم — دقیقاً همان چیزی که مدیر روی عکسِ خودش دیده، بدونِ هیچ افتی.
+    const CROP_SIZE = 28;
+    const variants = [];
+    for (const sw of rawSwatches.slice(0, 60)) {
+      const name = String((sw && sw.name) || '').trim().slice(0, 80);
+      const x = Number(sw && sw.x);
+      const y = Number(sw && sw.y);
+      if (!name || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+
+      const hex = sampleAverageColorHex(image, x, y, 6);
+
+      let croppedImageUrl = '';
+      try {
+        const cropX = Math.max(0, Math.min(width - CROP_SIZE, Math.round(x - CROP_SIZE / 2)));
+        const cropY = Math.max(0, Math.min(height - CROP_SIZE, Math.round(y - CROP_SIZE / 2)));
+        const cropped = image.clone().crop(cropX, cropY, Math.min(CROP_SIZE, width), Math.min(CROP_SIZE, height));
+        const cropBuffer = await cropped.getBufferAsync(Jimp.MIME_PNG);
+        const cropDataUri = `data:image/png;base64,${cropBuffer.toString('base64')}`;
+        const uploaded = await uploadDataUriToCloudinary(cropDataUri);
+        croppedImageUrl = uploaded.url;
+      } catch (e) {
+        console.warn(`آپلودِ عکسِ برش‌خورده‌ی رنگِ «${name}» ناموفق بود:`, e.message);
+      }
+
+      variants.push({ label: name, hex, image: croppedImageUrl });
+    }
+
+    const imageNote = `${variants.length.toLocaleString('fa-IR')} رنگ از روی عکس پیدا و رنگشان مستقیماً از پیکسل‌هایِ خودِ عکس (بدونِ حدسِ هوش مصنوعی) خوانده شد — لطفاً قبل از ذخیره یک نگاهِ سریع بینداز.`;
+    res.json({ variants, imageNote });
+  } catch (e) {
+    console.error('extract-variants-from-image error:', e);
+    res.status(502).json({ error: friendlyAiError(e) });
+  }
+});
 
 app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, res) => {
   const url = validateProductUrl(req.body && req.body.url);
