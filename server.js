@@ -521,7 +521,28 @@ async function searchWebPages(query) {
 }
 
 async function searchProductImageCandidates(query) {
-	async function searchProductVideoCandidates(query) {
+  const pageUrls = await searchWebPages(query);
+  const found = [];
+  for (const pageUrl of pageUrls) {
+    if (found.length >= 6) break;
+    try {
+      const pr = await fetch(pageUrl, {
+        method: 'GET',
+        redirect: 'follow',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)', 'Accept': 'text/html,application/xhtml+xml' },
+      });
+      if (!pr.ok) continue;
+      const contentType = pr.headers.get('content-type') || '';
+      if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) continue;
+      const html = await pr.text();
+      const imgUrl = extractPrimaryImageFromHtml(html, pr.url || pageUrl);
+      if (imgUrl) found.push({ url: imgUrl, source: pageUrl });
+    } catch (e) { /* این صفحه جواب نداد یا عکسی نداشت — سراغ صفحه‌ی بعدی */ }
+  }
+  return found;
+}
+
+async function searchProductVideoCandidates(query) {
   const pageUrls = await searchWebPages(query);
   const found = [];
   for (const pageUrl of pageUrls) {
@@ -552,7 +573,6 @@ async function searchProductImageCandidates(query) {
   }
   return found;
 }
-
 app.post('/api/ai/search-product-video', auth, requireAdmin, async (req, res) => {
   const query = ((req.body && req.body.query) || '').trim();
   if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
@@ -581,26 +601,6 @@ app.post('/api/ai/search-product-video', auth, requireAdmin, async (req, res) =>
     res.status(502).json({ error: friendlyAiError(e) });
   }
 });
-  const pageUrls = await searchWebPages(query);
-  const found = [];
-  for (const pageUrl of pageUrls) {
-    if (found.length >= 6) break;
-    try {
-      const pr = await fetch(pageUrl, {
-        method: 'GET',
-        redirect: 'follow',
-        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)', 'Accept': 'text/html,application/xhtml+xml' },
-      });
-      if (!pr.ok) continue;
-      const contentType = pr.headers.get('content-type') || '';
-      if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) continue;
-      const html = await pr.text();
-      const imgUrl = extractPrimaryImageFromHtml(html, pr.url || pageUrl);
-      if (imgUrl) found.push({ url: imgUrl, source: pageUrl });
-    } catch (e) { /* این صفحه جواب نداد یا عکسی نداشت — سراغ صفحه‌ی بعدی */ }
-  }
-  return found;
-}
 
 app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) => {
   const query = ((req.body && req.body.query) || '').trim();
