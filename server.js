@@ -521,6 +521,66 @@ async function searchWebPages(query) {
 }
 
 async function searchProductImageCandidates(query) {
+	async function searchProductVideoCandidates(query) {
+  const pageUrls = await searchWebPages(query);
+  const found = [];
+  for (const pageUrl of pageUrls) {
+    if (found.length >= 6) break;
+    try {
+      const pr = await fetch(pageUrl, {
+        method: 'GET',
+        redirect: 'follow',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)', 'Accept': 'text/html,application/xhtml+xml' },
+      });
+      if (!pr.ok) continue;
+      const contentType = pr.headers.get('content-type') || '';
+      if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) continue;
+      const html = await pr.text();
+      // دنبالِ src مستقیمِ ویدیو (mp4/webm) در تگ‌های <video> یا <source>، یا در متاتگِ og:video می‌گردیم.
+      const patterns = [
+        /<video[^>]+src=["']([^"']+\.(?:mp4|webm))["']/i,
+        /<source[^>]+src=["']([^"']+\.(?:mp4|webm))["']/i,
+        /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
+      ];
+      let videoUrl = null;
+      for (const re of patterns) {
+        const m = html.match(re);
+        if (m && m[1]) { try { videoUrl = new URL(m[1], pr.url || pageUrl).toString(); break; } catch (e) {} }
+      }
+      if (videoUrl) found.push({ url: videoUrl, source: pageUrl });
+    } catch (e) { /* این صفحه جواب نداد یا ویدیویی نداشت */ }
+  }
+  return found;
+}
+
+app.post('/api/ai/search-product-video', auth, requireAdmin, async (req, res) => {
+  const query = ((req.body && req.body.query) || '').trim();
+  if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
+  try {
+    const candidates = await searchProductVideoCandidates(query);
+    if (candidates.length === 0) return res.json({ results: [] });
+    const mirrored = await Promise.all(
+      candidates.map(async (c) => {
+        try {
+          const r = await fetch(c.url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Referer': c.source } });
+          if (!r.ok) return null;
+          const ct = r.headers.get('content-type') || '';
+          if (!ct.startsWith('video/')) return null;
+          const buffer = Buffer.from(await r.arrayBuffer());
+          if (buffer.length > 30 * 1024 * 1024) return null;
+          const mime = ct.split(';')[0];
+          const dataUri = `data:${mime};base64,${buffer.toString('base64')}`;
+          const uploaded = await uploadDataUriToCloudinary(dataUri);
+          return { url: uploaded.url, source: c.source || '' };
+        } catch (e) { return null; }
+      })
+    );
+    res.json({ results: mirrored.filter(Boolean) });
+  } catch (e) {
+    console.error('search-product-video error:', e);
+    res.status(502).json({ error: friendlyAiError(e) });
+  }
+});
   const pageUrls = await searchWebPages(query);
   const found = [];
   for (const pageUrl of pageUrls) {
