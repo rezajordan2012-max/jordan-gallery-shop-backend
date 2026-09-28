@@ -1742,7 +1742,18 @@ function sampleModalColorHexFromBox(image, rect) {
   const toHex = (n) => Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
   return `#${toHex(best.r / best.count)}${toHex(best.g / best.count)}${toHex(best.b / best.count)}`.toUpperCase();
 }
-
+// عکسِ مربعیِ برش‌خورده را به یک دایره‌ی واقعی تبدیل می‌کند — پیکسل‌های بیرونِ شعاع را کاملاً
+// شفاف می‌کند تا خروجی، مستقل از هر CSSای، همیشه یک PNG دایره‌ایِ واقعی باشد.
+function applyCircularMask(img) {
+  const w = img.bitmap.width;
+  const h = img.bitmap.height;
+  const cx = w / 2, cy = h / 2, r = Math.min(w, h) / 2;
+  img.scan(0, 0, w, h, function (x, y, idx) {
+    const dx = x - cx + 0.5, dy = y - cy + 0.5;
+    if (Math.sqrt(dx * dx + dy * dy) > r) this.bitmap.data[idx + 3] = 0;
+  });
+  return img;
+}
 app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, res) => {
   if (!Jimp) return res.status(500).json({ error: 'پکیجِ jimp روی سرور نصب نشده — این ابزار نیاز به آن دارد (npm install jimp)' });
   if (!GEMINI_API_KEY) return res.status(500).json({ error: 'کلید GEMINI_API_KEY روی سرور تنظیم نشده است' });
@@ -1802,11 +1813,17 @@ app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, 
       try {
         const marginX = Math.max(1, Math.round(rect.w * 0.12));
         const marginY = Math.max(1, Math.round(rect.h * 0.12));
-        const cropX = Math.max(0, rect.x + marginX);
-        const cropY = Math.max(0, rect.y + marginY);
-        const cropW = Math.max(CROP_MIN, Math.min(CROP_MAX, rect.w - marginX * 2, width - cropX));
-        const cropH = Math.max(CROP_MIN, Math.min(CROP_MAX, rect.h - marginY * 2, height - cropY));
-        const cropped = image.clone().crop(cropX, cropY, cropW, cropH);
+        const innerW = Math.max(CROP_MIN, Math.min(CROP_MAX, rect.w - marginX * 2));
+        const innerH = Math.max(CROP_MIN, Math.min(CROP_MAX, rect.h - marginY * 2));
+        // برایِ اینکه ماسکِ دایره‌ای کاملاً گرد باشد (نه بیضی)، برشِ نهایی را مربعی می‌کنیم —
+        // کوچک‌ترینِ دو بُعد را انتخاب و دورِ همان مرکزِ قبلی نگه می‌داریم.
+        const size = Math.max(CROP_MIN, Math.min(innerW, innerH, width, height));
+        const centerX = rect.x + rect.w / 2;
+        const centerY = rect.y + rect.h / 2;
+        const cropX = Math.max(0, Math.min(width - size, Math.round(centerX - size / 2)));
+        const cropY = Math.max(0, Math.min(height - size, Math.round(centerY - size / 2)));
+        const cropped = image.clone().crop(cropX, cropY, size, size);
+        applyCircularMask(cropped);
         const cropBuffer = await cropped.getBufferAsync(Jimp.MIME_PNG);
         const cropDataUri = `data:image/png;base64,${cropBuffer.toString('base64')}`;
         const uploaded = await uploadDataUriToCloudinary(cropDataUri);
