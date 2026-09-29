@@ -1744,13 +1744,33 @@ function sampleModalColorHexFromBox(image, rect) {
 }
 // عکسِ مربعیِ برش‌خورده را به یک دایره‌ی واقعی تبدیل می‌کند — پیکسل‌های بیرونِ شعاع را کاملاً
 // شفاف می‌کند تا خروجی، مستقل از هر CSSای، همیشه یک PNG دایره‌ایِ واقعی باشد.
+// همون ماسکِ دایره‌ای، ولی با یک گذارِ نرمِ چندپیکسلی دورِ لبه (نه یک برشِ خشنِ دو-حالته) —
+// این باعث می‌شود لبه‌ی دایره صاف و صیقلی دیده شود (مثلِ یک آیکونِ حرفه‌ای)، نه دندونه‌دار/
+// پیکسلی. هر پیکسل بسته به فاصله‌اش از مرزِ دایره، بینِ کاملاً مات و کاملاً شفاف، به‌آرامی
+// تغییرِ شفافیت می‌دهد.
 function applyCircularMask(img) {
   const w = img.bitmap.width;
   const h = img.bitmap.height;
   const cx = w / 2, cy = h / 2, r = Math.min(w, h) / 2;
+  // پهنای گذارِ نرم — نسبت به اندازه‌ی خودِ عکس تنظیم می‌شود تا روی عکس‌های کوچک هم لبه‌ی
+  // نرم به نظر برسد و روی عکس‌های بزرگ‌تر هم زیادی محو/تار نشود.
+  const feather = Math.max(1, r * 0.03);
   img.scan(0, 0, w, h, function (x, y, idx) {
     const dx = x - cx + 0.5, dy = y - cy + 0.5;
-    if (Math.sqrt(dx * dx + dy * dy) > r) this.bitmap.data[idx + 3] = 0;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const alphaOriginal = this.bitmap.data[idx + 3];
+    if (dist <= r - feather) {
+      // کاملاً داخلِ دایره — شفافیتِ اصلی دست‌نخورده می‌ماند.
+      return;
+    }
+    if (dist >= r + feather) {
+      // کاملاً بیرونِ دایره — کاملاً شفاف.
+      this.bitmap.data[idx + 3] = 0;
+      return;
+    }
+    // داخلِ نوارِ گذار — کاهشِ نرم و خطیِ شفافیت از ۱۰۰٪ به ۰٪.
+    const t = (dist - (r - feather)) / (feather * 2);
+    this.bitmap.data[idx + 3] = Math.round(alphaOriginal * (1 - t));
   });
   return img;
 }
