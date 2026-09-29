@@ -1748,29 +1748,64 @@ function sampleModalColorHexFromBox(image, rect) {
 // این باعث می‌شود لبه‌ی دایره صاف و صیقلی دیده شود (مثلِ یک آیکونِ حرفه‌ای)، نه دندونه‌دار/
 // پیکسلی. هر پیکسل بسته به فاصله‌اش از مرزِ دایره، بینِ کاملاً مات و کاملاً شفاف، به‌آرامی
 // تغییرِ شفافیت می‌دهد.
-function applyCircularMask(img) {
+// ماسکِ سفارشیِ «لکه/اسمیرِ کرم‌پودر» — به‌جای دایره، یک شکلِ کپسولی می‌سازد که یک سرش (بالا-چپ)
+// گرد و پهن است و به‌آرامی، در طولِ یک محورِ مورّب، به یک نوکِ باریک در سمتِ پایین-راست ختم می‌شود
+// (دقیقاً همان شکلی که برندهای آرایشی برای نمایشِ سوآچِ رنگ استفاده می‌کنند). لبه‌ها با همان
+// تکنیکِ فدرِ نرم (نه یک برشِ خشن) صاف و صیقلی نگه داشته می‌شوند.
+function applySwatchSmearMask(img) {
   const w = img.bitmap.width;
   const h = img.bitmap.height;
-  const cx = w / 2, cy = h / 2, r = Math.min(w, h) / 2;
-  // پهنای گذارِ نرم — نسبت به اندازه‌ی خودِ عکس تنظیم می‌شود تا روی عکس‌های کوچک هم لبه‌ی
-  // نرم به نظر برسد و روی عکس‌های بزرگ‌تر هم زیادی محو/تار نشود.
-  const feather = Math.max(1, r * 0.03);
+  const S = Math.min(w, h);
+
+  // --- تنظیماتِ شکل — در صورتِ نیاز به تغییرِ ظاهر (مثلاً باریک‌تر/پهن‌تر یا زاویه‌ی دیگر)،
+  // فقط همین چند عدد را تغییر بده ---
+  const angleDeg = 40; // زاویه‌ی محورِ اصلی: از بالا-چپِ پهن به پایین-راستِ باریک
+  const R = S * 0.21; // شعاعِ بخشِ پهن/گردِ ابتدای شکل
+  const coreLen = S * 0.5; // طولِ بخشِ با عرضِ ثابت (پیش از شروعِ باریک‌شدن)
+  const totalLen = S * 0.92; // طولِ کلی تا نوکِ باریک
+  const startX = w * 0.30; // نقطه‌ی مرکزِ سرِ گردِ شکل (نسبت به گوشه‌ی بالا-چپِ تصویر)
+  const startY = h * 0.26;
+  const feather = Math.max(1, R * 0.05);
+
+  const angle = (angleDeg * Math.PI) / 180;
+  const cosA = Math.cos(angle);
+  const sinA = Math.sin(angle);
+
   img.scan(0, 0, w, h, function (x, y, idx) {
-    const dx = x - cx + 0.5, dy = y - cy + 0.5;
-    const dist = Math.sqrt(dx * dx + dy * dy);
+    const dx = x - startX + 0.5;
+    const dy = y - startY + 0.5;
+    // چرخشِ مختصات به دستگاهِ محلیِ همراستا با محورِ شکل: u طولِ مسیر، v فاصله‌ی عمود از محور.
+    const u = dx * cosA + dy * sinA;
+    const v = -dx * sinA + dy * cosA;
+
+    let boundaryDist; // مثبت یعنی داخلِ شکل، منفی یعنی بیرون — برای فدرِ نرم استفاده می‌شود
+    if (u < 0) {
+      // سرِ گردِ ابتدای شکل — یک دایره‌ی کامل با مرکز در همان نقطه‌ی شروع.
+      const dist = Math.sqrt(u * u + v * v);
+      boundaryDist = R - dist;
+    } else if (u <= coreLen) {
+      // بدنه‌ی اصلی با عرضِ ثابت.
+      boundaryDist = R - Math.abs(v);
+    } else if (u <= totalLen) {
+      // ناحیه‌ی باریک‌شونده تا نوکِ تیز.
+      const t = (u - coreLen) / (totalLen - coreLen);
+      const curR = R * (1 - Math.pow(t, 1.25));
+      boundaryDist = curR - Math.abs(v);
+    } else {
+      boundaryDist = -1; // فراتر از طولِ کلی — کاملاً بیرون از شکل
+    }
+
     const alphaOriginal = this.bitmap.data[idx + 3];
-    if (dist <= r - feather) {
-      // کاملاً داخلِ دایره — شفافیتِ اصلی دست‌نخورده می‌ماند.
+    if (boundaryDist >= feather) {
+      return; // کاملاً داخل — دست‌نخورده
+    }
+    if (boundaryDist <= -feather) {
+      this.bitmap.data[idx + 3] = 0; // کاملاً بیرون — کاملاً شفاف
       return;
     }
-    if (dist >= r + feather) {
-      // کاملاً بیرونِ دایره — کاملاً شفاف.
-      this.bitmap.data[idx + 3] = 0;
-      return;
-    }
-    // داخلِ نوارِ گذار — کاهشِ نرم و خطیِ شفافیت از ۱۰۰٪ به ۰٪.
-    const t = (dist - (r - feather)) / (feather * 2);
-    this.bitmap.data[idx + 3] = Math.round(alphaOriginal * (1 - t));
+    // نوارِ باریکِ گذار — کاهشِ نرمِ شفافیت برای لبه‌ی صاف و صیقلی.
+    const t2 = (boundaryDist + feather) / (feather * 2);
+    this.bitmap.data[idx + 3] = Math.round(alphaOriginal * t2);
   });
   return img;
 }
@@ -1843,7 +1878,7 @@ app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, 
         const cropX = Math.max(0, Math.min(width - size, Math.round(centerX - size / 2)));
         const cropY = Math.max(0, Math.min(height - size, Math.round(centerY - size / 2)));
         const cropped = image.clone().crop(cropX, cropY, size, size);
-        applyCircularMask(cropped);
+        applySwatchSmearMask(cropped);
         const cropBuffer = await cropped.getBufferAsync(Jimp.MIME_PNG);
         const cropDataUri = `data:image/png;base64,${cropBuffer.toString('base64')}`;
         const uploaded = await uploadDataUriToCloudinary(cropDataUri);
