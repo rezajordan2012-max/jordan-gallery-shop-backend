@@ -553,6 +553,128 @@ async function searchProductVideoCandidates(query) {
         redirect: 'follow',
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)', 'Accept': 'text/html,application/xhtml+xml' },
       });
+      // از HTMLِ خامِ یک صفحه (پس از رندرِ کاملِ JS توسطِ مرورگرِ هدلس)، تمامِ عکس‌های موجود روی صفحه
+// (نه فقط عکسِ اصلی) را استخراج می‌کند — برایِ ابزارِ «جستجو با لینکِ مستقیمِ صفحه».
+function extractAllImageCandidatesFromHtml(html, baseUrl) {
+  const candidates = [];
+  const seen = new Set();
+  function addCandidate(rawSrc, alt) {
+    if (!rawSrc || /^data:image\/gif/i.test(rawSrc)) return;
+    let resolved;
+    try { resolved = new URL(rawSrc, baseUrl).toString(); } catch (e) { return; }
+    if (seen.has(resolved)) return;
+    seen.add(resolved);
+    candidates.push({ url: resolved, label: (alt || '').trim().slice(0, 80) });
+  }
+  let m;
+  const sourceRe = /<source[^>]*>/gi;
+  while ((m = sourceRe.exec(html)) && candidates.length < 60) {
+    const tag = m[0];
+    const srcsetMatch = tag.match(/\ssrcset=["']([^"']+)["']/i);
+    const srcMatch = tag.match(/\ssrc=["']([^"']+)["']/i);
+    addCandidate(srcsetMatch ? pickLargestFromSrcset(srcsetMatch[1]) : (srcMatch ? srcMatch[1] : ''), '');
+  }
+  const imgRe = /<img[^>]*>/gi;
+  while ((m = imgRe.exec(html)) && candidates.length < 60) {
+    const tag = m[0];
+    const srcsetMatch = tag.match(/\sdata-srcset=["']([^"']+)["']/i) || tag.match(/\ssrcset=["']([^"']+)["']/i);
+    const srcMatch =
+      tag.match(/\ssrc=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-src=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-original=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-lazy(?:-src)?=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-zoom-image=["']([^"']+)["']/i) ||
+      tag.match(/\sdata-large[_-]?image=["']([^"']+)["']/i);
+    const altMatch = tag.match(/\salt=["']([^"']*)["']/i) || tag.match(/\stitle=["']([^"']*)["']/i);
+    addCandidate(srcsetMatch ? pickLargestFromSrcset(srcsetMatch[1]) : (srcMatch ? srcMatch[1] : ''), altMatch ? altMatch[1] : '');
+  }
+  return candidates.slice(0, 60);
+}
+
+// ابزارِ جدید: مدیر مستقیماً لینکِ صفحه‌ی محصول را می‌دهد (نه یک عبارتِ جستجو) — سرور با همان
+// مرورگرِ هدلسِ موجود صفحه را کاملاً رندر می‌کند (پس سوآچ‌های CSS/SVG-محورِ سایت‌هایی مثلِ
+// SHEGLAM هم شناسایی می‌شوند)، تمامِ عکس‌های صفحه را جمع می‌کند، و برایِ انتخابِ مدیر آپلود می‌کند.
+app.post('/api/ai/extract-images-from-url', auth, requireAdmin, async (req, res) => {
+  const url = validateProductUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'لینک معتبر نیست' });
+  try {
+    const page = await fetchProductPageAndSwatches(url);
+    const candidates = [];
+    const seen = new Set();
+    (page.domSwatches || []).forEach((sw) => {
+      if (sw && sw.imageUrl && !seen.has(sw.imageUrl)) {
+        seen.add(sw.imageUrl);
+        candidates.push({ rawUrl: sw.imageUrl, label: sw.label || '' });
+      }
+    });
+    extractAllImageCandidatesFromHtml(page.html, page.finalUrl).forEach((c) => {
+      if (!seen.has(c.url)) { seen.add(c.url); candidates.push({ rawUrl: c.url, label: c.label }); }
+    });
+    const limited = candidates.slice(0, 40);
+    const refererOrigin = (() => { try { return new URL(page.finalUrl).origin; } catch (e) { return page.finalUrl; } })();
+    const mirrored = [];
+    const BATCH = 6;
+    for (let i = 0; i < limited.length; i += BATCH) {
+      const batch = limited.slice(i, i + BATCH);
+      const results = await Promise.all(batch.map(async (c) => {
+        try {
+          const { url: uploadedUrl } = await mirrorRemoteImageToCloudinary(c.rawUrl, { referer: refererOrigin, skipBackgroundRemoval: true });
+          return uploadedUrl ? { url: uploadedUrl, source: c.label || '' } : null;
+        } catch (e) { return null; }
+      }));
+      mirrored.push(...results.filter(Boolean));
+    }
+    res.json({ results: mirrored });
+  } catch (e) {
+    console.error('extract-images-from-url error:', e);
+    res.status(502).json({ error: friendlyAiError(e) });
+  }
+});
+
+app.post('/api/ai/extract-videos-from-url', auth, requireAdmin, async (req, res) => {
+  const url = validateProductUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'لینک معتبر نیست' });
+  try {
+    const page = await fetchProductPage(url);
+    const html = page.html;
+    const patterns = [
+      /<video[^>]+src=["']([^"']+)["']/gi,
+      /<source[^>]+src=["']([^"']+\.(?:mp4|webm))["']/gi,
+      /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/gi,
+    ];
+    const found = [];
+    const seen = new Set();
+    patterns.forEach((re) => {
+      let m;
+      while ((m = re.exec(html)) && found.length < 20) {
+        try {
+          const resolved = new URL(m[1], page.finalUrl).toString();
+          if (!seen.has(resolved)) { seen.add(resolved); found.push(resolved); }
+        } catch (e) {}
+      }
+    });
+    const refererOrigin = (() => { try { return new URL(page.finalUrl).origin; } catch (e) { return page.finalUrl; } })();
+    const mirrored = [];
+    for (const videoUrl of found.slice(0, 10)) {
+      try {
+        const r = await fetch(videoUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Referer': refererOrigin } });
+        if (!r.ok) continue;
+        const ct = r.headers.get('content-type') || '';
+        if (!ct.startsWith('video/')) continue;
+        const buffer = Buffer.from(await r.arrayBuffer());
+        if (buffer.length > 30 * 1024 * 1024) continue;
+        const mime = ct.split(';')[0];
+        const dataUri = `data:${mime};base64,${buffer.toString('base64')}`;
+        const uploaded = await uploadDataUriToCloudinary(dataUri);
+        mirrored.push({ url: uploaded.url, source: videoUrl });
+      } catch (e) { /* رد شو */ }
+    }
+    res.json({ results: mirrored });
+  } catch (e) {
+    console.error('extract-videos-from-url error:', e);
+    res.status(502).json({ error: friendlyAiError(e) });
+  }
+});
       if (!pr.ok) continue;
       const contentType = pr.headers.get('content-type') || '';
       if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) continue;
