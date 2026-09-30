@@ -553,6 +553,25 @@ async function searchProductVideoCandidates(query) {
         redirect: 'follow',
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)', 'Accept': 'text/html,application/xhtml+xml' },
       });
+      if (!pr.ok) continue;
+      const ct = pr.headers.get('content-type') || '';
+      if (!ct.includes('text/html') && !ct.includes('application/xhtml+xml')) continue;
+      const html = await pr.text();
+      const patterns = [
+        /<video[^>]+src=["']([^"']+\.(?:mp4|webm))["']/i,
+        /<source[^>]+src=["']([^"']+\.(?:mp4|webm))["']/i,
+        /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
+      ];
+      for (const re of patterns) {
+        const m = html.match(re);
+        if (m && m[1]) {
+          try { found.push({ url: new URL(m[1], pr.url || pageUrl).toString(), source: pageUrl }); break; } catch (e) {}
+        }
+      }
+    } catch (e) { /* رد شو */ }
+  }
+  return found;
+}
       // از HTMLِ خامِ یک صفحه (پس از رندرِ کاملِ JS توسطِ مرورگرِ هدلس)، تمامِ عکس‌های موجود روی صفحه
 // (نه فقط عکسِ اصلی) را استخراج می‌کند — برایِ ابزارِ «جستجو با لینکِ مستقیمِ صفحه».
 function extractAllImageCandidatesFromHtml(html, baseUrl) {
@@ -619,7 +638,7 @@ app.post('/api/ai/extract-images-from-url', auth, requireAdmin, async (req, res)
       const results = await Promise.all(batch.map(async (c) => {
         try {
           const { url: uploadedUrl } = await mirrorRemoteImageToCloudinary(c.rawUrl, { referer: refererOrigin, skipBackgroundRemoval: true });
-          return uploadedUrl ? { url: uploadedUrl, source: c.label || '' } : null;
+          return uploadedUrl ? { url: uploadedUrl, label: c.label || '', source: c.label || '' } : null;
         } catch (e) { return null; }
       }));
       mirrored.push(...results.filter(Boolean));
