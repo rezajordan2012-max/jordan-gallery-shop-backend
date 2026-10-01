@@ -572,7 +572,8 @@ async function searchProductVideoCandidates(query) {
   }
   return found;
 }
-      function extractAllImageCandidatesFromHtml(html, baseUrl) {
+
+function extractAllImageCandidatesFromHtml(html, baseUrl) {
   const candidates = [];
   const seen = new Set();
   function addCandidate(rawSrc, alt) {
@@ -607,6 +608,88 @@ async function searchProductVideoCandidates(query) {
   }
   return candidates.slice(0, 60);
 }
+
+app.post('/api/ai/extract-images-from-url', auth, requireAdmin, async (req, res) => {
+  const url = validateProductUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'لینک معتبر نیست' });
+  try {
+    const page = await fetchProductPageAndSwatches(url);
+    const candidates = [];
+    const seen = new Set();
+    (page.domSwatches || []).forEach((sw) => {
+      if (sw && sw.imageUrl && !seen.has(sw.imageUrl)) {
+        seen.add(sw.imageUrl);
+        candidates.push({ rawUrl: sw.imageUrl, label: sw.label || '' });
+      }
+    });
+    extractAllImageCandidatesFromHtml(page.html, page.finalUrl).forEach((c) => {
+      if (!seen.has(c.url)) { seen.add(c.url); candidates.push({ rawUrl: c.url, label: c.label }); }
+    });
+    const limited = candidates.slice(0, 40);
+    const refererOrigin = (() => { try { return new URL(page.finalUrl).origin; } catch (e) { return page.finalUrl; } })();
+    const mirrored = [];
+    const BATCH = 6;
+    for (let i = 0; i < limited.length; i += BATCH) {
+      const batch = limited.slice(i, i + BATCH);
+      const results = await Promise.all(batch.map(async (c) => {
+        try {
+          const { url: uploadedUrl } = await mirrorRemoteImageToCloudinary(c.rawUrl, { referer: refererOrigin, skipBackgroundRemoval: true });
+          return uploadedUrl ? { url: uploadedUrl, label: c.label || '', source: c.label || '' } : null;
+        } catch (e) { return null; }
+      }));
+      mirrored.push(...results.filter(Boolean));
+    }
+    res.json({ results: mirrored });
+  } catch (e) {
+    console.error('extract-images-from-url error:', e);
+    res.status(502).json({ error: friendlyAiError(e) });
+  }
+});
+
+app.post('/api/ai/extract-videos-from-url', auth, requireAdmin, async (req, res) => {
+  const url = validateProductUrl(req.body && req.body.url);
+  if (!url) return res.status(400).json({ error: 'لینک معتبر نیست' });
+  try {
+    const page = await fetchProductPage(url);
+    const html = page.html;
+    const patterns = [
+      /<video[^>]+src=["']([^"']+)["']/gi,
+      /<source[^>]+src=["']([^"']+\.(?:mp4|webm))["']/gi,
+      /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/gi,
+    ];
+    const found = [];
+    const seen = new Set();
+    patterns.forEach((re) => {
+      let m;
+      while ((m = re.exec(html)) && found.length < 20) {
+        try {
+          const resolved = new URL(m[1], page.finalUrl).toString();
+          if (!seen.has(resolved)) { seen.add(resolved); found.push(resolved); }
+        } catch (e) {}
+      }
+    });
+    const refererOrigin = (() => { try { return new URL(page.finalUrl).origin; } catch (e) { return page.finalUrl; } })();
+    const mirrored = [];
+    for (const videoUrl of found.slice(0, 10)) {
+      try {
+        const r = await fetch(videoUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Referer': refererOrigin } });
+        if (!r.ok) continue;
+        const ct = r.headers.get('content-type') || '';
+        if (!ct.startsWith('video/')) continue;
+        const buffer = Buffer.from(await r.arrayBuffer());
+        if (buffer.length > 30 * 1024 * 1024) continue;
+        const mime = ct.split(';')[0];
+        const dataUri = `data:${mime};base64,${buffer.toString('base64')}`;
+        const uploaded = await uploadDataUriToCloudinary(dataUri);
+        mirrored.push({ url: uploaded.url, source: videoUrl });
+      } catch (e) { /* رد شو */ }
+    }
+    res.json({ results: mirrored });
+  } catch (e) {
+    console.error('extract-videos-from-url error:', e);
+    res.status(502).json({ error: friendlyAiError(e) });
+  }
+});
 
 app.post('/api/ai/extract-images-from-url', auth, requireAdmin, async (req, res) => {
   const url = validateProductUrl(req.body && req.body.url);
