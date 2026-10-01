@@ -609,6 +609,40 @@ function extractAllImageCandidatesFromHtml(html, baseUrl) {
   return candidates.slice(0, 60);
 }
 
+function extractImagesFromNextData(html, baseUrl) {
+  const m = String(html || '').match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+  if (!m) return [];
+  let data;
+  try { data = JSON.parse(m[1]); } catch (e) { return []; }
+  const imgRe = /^(https?:)?\/\/[^\s"']+\.(jpe?g|png|webp)(\?[^\s"']*)?$/i;
+  const out = [];
+  const seen = new Set();
+  function walk(node, depth) {
+    if (!node || depth > 16 || out.length >= 80) return;
+    if (Array.isArray(node)) { node.forEach((n) => walk(n, depth + 1)); return; }
+    if (typeof node !== 'object') return;
+    const imgs = [];
+    let name = '';
+    for (const [k, v] of Object.entries(node)) {
+      if (typeof v !== 'string') continue;
+      if (imgRe.test(v) && /img|image|pic|photo|thumb|icon|swatch|url/i.test(k)) imgs.push(v);
+      else if (!name && v.length > 0 && v.length < 60 && !/^https?:/i.test(v) && /color|colour|shade|attr_?value|value_?name|^name$|title|label/i.test(k)) name = v;
+    }
+    if (imgs.length && name && !/banner|logo|icon/i.test(name)) {
+      imgs.forEach((u) => {
+        let full;
+        try { full = new URL(u.startsWith('//') ? 'https:' + u : u, baseUrl).toString(); } catch (e) { return; }
+        if (seen.has(full)) return;
+        seen.add(full);
+        out.push({ rawUrl: full, label: name });
+      });
+    }
+    Object.values(node).forEach((v) => walk(v, depth + 1));
+  }
+  walk(data, 0);
+  return out;
+}
+
 app.post('/api/ai/extract-images-from-url', auth, requireAdmin, async (req, res) => {
   const url = validateProductUrl(req.body && req.body.url);
   if (!url) return res.status(400).json({ error: 'لینک معتبر نیست' });
@@ -622,9 +656,15 @@ app.post('/api/ai/extract-images-from-url', auth, requireAdmin, async (req, res)
         candidates.push({ rawUrl: sw.imageUrl, label: sw.label || '' });
       }
     });
-    extractAllImageCandidatesFromHtml(page.html, page.finalUrl).forEach((c) => {
-      if (!seen.has(c.url)) { seen.add(c.url); candidates.push({ rawUrl: c.url, label: c.label }); }
+    extractImagesFromNextData(page.html, page.finalUrl).forEach((c) => {
+      if (!seen.has(c.rawUrl)) { seen.add(c.rawUrl); candidates.push(c); }
     });
+    if (candidates.length === 0) {
+      extractAllImageCandidatesFromHtml(page.html, page.finalUrl).forEach((c) => {
+        if (/banner|logo/i.test(c.label || '')) return;
+        if (!seen.has(c.url)) { seen.add(c.url); candidates.push({ rawUrl: c.url, label: c.label }); }
+      });
+    }
     const limited = candidates.slice(0, 40);
     const refererOrigin = (() => { try { return new URL(page.finalUrl).origin; } catch (e) { return page.finalUrl; } })();
     const mirrored = [];
