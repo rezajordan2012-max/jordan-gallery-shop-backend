@@ -817,26 +817,7 @@ app.post('/api/ai/extract-videos-from-url', auth, requireAdmin, async (req, res)
     res.status(502).json({ error: friendlyAiError(e) });
   }
 });
-      if (!pr.ok) continue;
-      const contentType = pr.headers.get('content-type') || '';
-      if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) continue;
-      const html = await pr.text();
-      // دنبالِ src مستقیمِ ویدیو (mp4/webm) در تگ‌های <video> یا <source>، یا در متاتگِ og:video می‌گردیم.
-      const patterns = [
-        /<video[^>]+src=["']([^"']+\.(?:mp4|webm))["']/i,
-        /<source[^>]+src=["']([^"']+\.(?:mp4|webm))["']/i,
-        /<meta[^>]+property=["']og:video(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
-      ];
-      let videoUrl = null;
-      for (const re of patterns) {
-        const m = html.match(re);
-        if (m && m[1]) { try { videoUrl = new URL(m[1], pr.url || pageUrl).toString(); break; } catch (e) {} }
-      }
-      if (videoUrl) found.push({ url: videoUrl, source: pageUrl });
-    } catch (e) { /* این صفحه جواب نداد یا ویدیویی نداشت */ }
-  }
-  return found;
-}
+      
 app.post('/api/ai/search-product-video', auth, requireAdmin, async (req, res) => {
   const query = ((req.body && req.body.query) || '').trim();
   if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
