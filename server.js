@@ -504,7 +504,7 @@ async function searchWebPages(query) {
       'Accept': 'text/html,application/xhtml+xml',
     },
   });
-  if (!r.ok) throw new Error(`جستجوی وب پاسخ نداد (کد ${r.status}) — چند لحظه صبر کن و دوباره امتحان کن`);
+  if (!r.ok) throw new Error(`جستجوی وب پاسخ نداد (کد ${r.status}) — به‌جای جستجو، لینک صفحه‌ی محصول را در همین کادر بچسبان`);
   const html = await r.text();
   const urls = [];
   const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"/gi;
@@ -516,6 +516,9 @@ async function searchWebPages(query) {
       try { href = decodeURIComponent(uddgMatch[1]); } catch (e) { continue; }
     }
     if (/^https?:\/\//i.test(href)) urls.push(href);
+  }
+  if (urls.length === 0 && /anomaly|captcha|unusual traffic|robot/i.test(html)) {
+    throw new Error('موتور جستجو موقتاً درخواست‌های سرور را مسدود کرده — به‌جای جستجو، لینک صفحه‌ی محصول را بچسبان یا بعداً دوباره امتحان کن');
   }
   return [...new Set(urls)];
 }
@@ -892,20 +895,25 @@ app.post('/api/ai/search-product-image', auth, requireAdmin, async (req, res) =>
   if (!query) return res.status(400).json({ error: 'عبارتِ جستجو را وارد کن' });
   try {
     const candidates = await searchProductImageCandidates(query);
-    if (candidates.length === 0) return res.json({ results: [] });
-    const mirrored = await Promise.all(
-      candidates.map(async (c) => {
-        try {
-          const { url } = await mirrorRemoteImageToCloudinary(c.url, { referer: c.source });
-          return url ? { url, source: c.source || '' } : null;
-        } catch (e) { return null; }
-      })
-    );
-    res.json({ results: mirrored.filter(Boolean) });
+    // فقط لینک خام برمی‌گردد؛ آپلود فقط برای عکسِ انتخاب‌شده انجام می‌شود (روت mirror-image)
+    res.json({ results: candidates.map((c) => ({ url: c.url, source: c.source || '' })) });
   } catch (e) {
     console.error('search-product-image error:', e);
     res.status(502).json({ error: friendlyAiError(e) });
   }
+});
+
+app.post('/api/ai/mirror-image', auth, requireAdmin, async (req, res) => {
+  const { url, referer, removeBackground } = req.body || {};
+  if (!url || typeof url !== 'string' || !/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ error: 'لینک عکس معتبر نیست' });
+  }
+  const { url: uploaded, reason } = await mirrorRemoteImageToCloudinary(url, {
+    referer: typeof referer === 'string' && /^https?:\/\//i.test(referer) ? referer : undefined,
+    skipBackgroundRemoval: !removeBackground,
+  });
+  if (!uploaded) return res.status(502).json({ error: reason || 'دانلود یا آپلود عکس ناموفق بود' });
+  res.json({ url: uploaded });
 });
 
 app.get('/api/ai/barcode-lookup', auth, requireAdmin, withDb(async (req, res) => {
@@ -2449,6 +2457,20 @@ app.post('/api/payment/request', auth, withDb(async (req, res) => {
     return res.status(400).json({ error: 'سبد خرید خالی یا نامعتبر است' });
   }
 
+  // مشخصات تحویل — سمت سرور هم اعتبارسنجی می‌شود، نه فقط در فرانت
+  const shipRaw = (req.body && req.body.shipping) || {};
+  const toLatinDigits = (s) => String(s || '')
+    .replace(/[۰-۹]/g, (d) => '۰۱۲۳۴۵۶۷۸۹'.indexOf(d))
+    .replace(/[٠-٩]/g, (d) => '٠١٢٣٤٥٦٧٨٩'.indexOf(d));
+  const shipping = {
+    fullName: String(shipRaw.fullName || '').trim().slice(0, 100),
+    phone: toLatinDigits(shipRaw.phone).replace(/[\s-]/g, '').slice(0, 20),
+    address: String(shipRaw.address || '').trim().slice(0, 500),
+  };
+  if (shipping.fullName.length < 3) return res.status(400).json({ error: 'نام گیرنده را وارد کن' });
+  if (!/^09\d{9}$/.test(shipping.phone)) return res.status(400).json({ error: 'شماره موبایل معتبر نیست' });
+  if (shipping.address.length < 10) return res.status(400).json({ error: 'آدرس کامل را وارد کن' });
+
   // قیمت‌ها فقط از دیتابیس خوانده می‌شود؛ price و amount ارسالی مرورگر نادیده گرفته می‌شود.
   const dbForPricing = await readDB();
   const globalPct = Number(dbForPricing.settings && dbForPricing.settings.globalDiscountPercent) || 0;
@@ -2482,7 +2504,7 @@ app.post('/api/payment/request', auth, withDb(async (req, res) => {
       body: JSON.stringify({
         merchant_id: ZARINPAL_MERCHANT_ID,
         amount: total,
-        currency: 'IRT', // ← اضافه شد: قیمت‌های سایت به تومان هستند
+        currency: 'IRT',
         callback_url: CALLBACK_URL,
         description: String(description || 'خرید از فروشگاه').slice(0, 200),
       }),
@@ -2496,6 +2518,7 @@ app.post('/api/payment/request', auth, withDb(async (req, res) => {
         user_id: req.user.id,
         items: orderItems,
         amount: total,
+        shipping,
         authority,
         ref_id: null,
         status: 'pending',
