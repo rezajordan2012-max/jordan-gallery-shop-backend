@@ -151,7 +151,9 @@ function auth(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (!req.user || String(req.user.email || '').toLowerCase() !== ADMIN_EMAIL) {
+  // مقایسه‌ی دقیق (بدون lowercase): ایمیل ذخیره‌شده‌ی ادمین باید دقیقاً همان ADMIN_EMAIL (با حروف کوچک) باشد.
+  // حساب‌هایی مثل Rezajordan2012@gmail.com ادمین حساب نمی‌شوند.
+  if (!req.user || String(req.user.email || '') !== ADMIN_EMAIL) {
     return res.status(403).json({ error: 'اجازه دسترسی به این بخش را نداری' });
   }
   next();
@@ -176,13 +178,17 @@ function noCache(req, res, next) {
 }
 
 app.post('/api/auth/register', withDb(async (req, res) => {
-  const { email, password, fullName } = req.body || {};
-  if (!email || !password || password.length < 6) return res.status(400).json({ error: 'ایمیل و رمز عبور (حداقل ۶ کاراکتر) الزامی است' });
+  const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+  const password = String((req.body && req.body.password) || '');
+  const fullName = String((req.body && req.body.fullName) || '').trim().slice(0, 100);
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 6) {
+    return res.status(400).json({ error: 'ایمیل معتبر و رمز عبور (حداقل ۶ کاراکتر) الزامی است' });
+  }
   const db = await readDB();
-  const exists = db.users.find((u) => u.email === email);
+  const exists = db.users.find((u) => String(u.email || '').trim().toLowerCase() === email);
   if (exists) return res.status(409).json({ error: 'این ایمیل قبلاً ثبت شده است' });
   const hash = await bcrypt.hash(password, 10);
-  const user = { id: db.nextUserId++, email, password_hash: hash, full_name: fullName || '', created_at: new Date().toISOString() };
+  const user = { id: db.nextUserId++, email, password_hash: hash, full_name: fullName, created_at: new Date().toISOString() };
   db.users.push(user);
   await writeDB(db);
   const token = jwt.sign({ id: user.id, email }, JWT_SECRET, { expiresIn: '7d' });
@@ -190,12 +196,19 @@ app.post('/api/auth/register', withDb(async (req, res) => {
 }));
 
 app.post('/api/auth/login', withDb(async (req, res) => {
-  const { email, password } = req.body || {};
+  const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+  const password = String((req.body && req.body.password) || '');
   const db = await readDB();
-  const user = db.users.find((u) => u.email === email);
+  // کاربران قدیمی ممکن است با حروف بزرگ ثبت شده باشند؛ تطبیق بدون حساسیت به حروف،
+  // و حساب با ایمیل دقیقاً کوچک (حساب اصلی) اولویت دارد
+  const candidates = db.users
+    .filter((u) => String(u.email || '').trim().toLowerCase() === email)
+    .sort((a, b) => (b.email === email ? 1 : 0) - (a.email === email ? 1 : 0));
+  let user = null;
+  for (const u of candidates) {
+    if (await bcrypt.compare(password, u.password_hash)) { user = u; break; }
+  }
   if (!user) return res.status(401).json({ error: 'ایمیل یا رمز عبور اشتباه است' });
-  const ok = await bcrypt.compare(password, user.password_hash);
-  if (!ok) return res.status(401).json({ error: 'ایمیل یا رمز عبور اشتباه است' });
   const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
   res.json({ token, user: { id: user.id, email: user.email, fullName: user.full_name, createdAt: user.created_at || null } });
 }));
