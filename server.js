@@ -2443,21 +2443,71 @@ app.get('/api/orders', auth, noCache, withDb(async (req, res) => {
 }));
 
 app.post('/api/payment/request', auth, withDb(async (req, res) => {
-  const { items, amount, description } = req.body || {};
-  if (!amount || amount < 1000) return res.status(400).json({ error: 'مبلغ نامعتبر است' });
+  const { items, description } = req.body || {};
   if (!ZARINPAL_MERCHANT_ID) return res.status(500).json({ error: 'ZARINPAL_MERCHANT_ID تنظیم نشده است' });
+  if (!Array.isArray(items) || items.length === 0 || items.length > 50) {
+    return res.status(400).json({ error: 'سبد خرید خالی یا نامعتبر است' });
+  }
+
+  // قیمت‌ها فقط از دیتابیس خوانده می‌شود؛ price و amount ارسالی مرورگر نادیده گرفته می‌شود.
+  const dbForPricing = await readDB();
+  const globalPct = Number(dbForPricing.settings && dbForPricing.settings.globalDiscountPercent) || 0;
+  const orderItems = [];
+  let total = 0;
+  for (const line of items) {
+    const product = (dbForPricing.products || []).find((p) => p.id === (line && line.id));
+    const qty = Math.floor(Number(line && line.qty));
+    if (!product || !Number.isFinite(qty) || qty < 1 || qty > 50) {
+      return res.status(400).json({ error: 'یکی از محصولات سبد خرید نامعتبر یا حذف شده است — صفحه را رفرش کن و دوباره امتحان کن' });
+    }
+    const basePrice = Number(product.price);
+    if (!Number.isFinite(basePrice) || basePrice <= 0) {
+      return res.status(400).json({ error: 'قیمت یکی از محصولات نامعتبر است' });
+    }
+    const own = Number(product.discountPercent);
+    const pct = own > 0 ? Math.min(own, 90) : (globalPct > 0 ? Math.min(globalPct, 90) : 0);
+    const unitPrice = pct > 0 ? Math.round((basePrice * (1 - pct / 100)) / 10) * 10 : basePrice;
+    total += unitPrice * qty;
+    const clientName = String((line && line.name) || '');
+    const name = clientName.startsWith(product.name) ? clientName.slice(0, 200) : product.name;
+    orderItems.push({ id: product.id, name, qty, price: unitPrice });
+  }
+  total = Math.round(total);
+  if (!Number.isFinite(total) || total < 1000) return res.status(400).json({ error: 'مبلغ نامعتبر است' });
+
   try {
-    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/request.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount, callback_url: CALLBACK_URL, description: description || 'خرید از فروشگاه' }) });
+    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/request.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        merchant_id: ZARINPAL_MERCHANT_ID,
+        amount: total,
+        callback_url: CALLBACK_URL,
+        description: String(description || 'خرید از فروشگاه').slice(0, 200),
+      }),
+    });
     const data = await zRes.json();
     if (data.data && data.data.code === 100) {
-      const authority = data.data.authority; const db = await readDB();
-      db.orders.push({ id: db.nextOrderId++, user_id: req.user.id, items: items || [], amount, authority, ref_id: null, status: 'pending', created_at: new Date().toISOString() });
-      await writeDB(db); return res.json({ paymentUrl: `https://www.zarinpal.com/pg/StartPay/${authority}` });
+      const authority = data.data.authority;
+      const db = await readDB();
+      db.orders.push({
+        id: db.nextOrderId++,
+        user_id: req.user.id,
+        items: orderItems,
+        amount: total,
+        authority,
+        ref_id: null,
+        status: 'pending',
+        created_at: new Date().toISOString(),
+      });
+      await writeDB(db);
+      return res.json({ paymentUrl: `https://www.zarinpal.com/pg/StartPay/${authority}` });
     }
     res.status(400).json({ error: 'خطا در اتصال به درگاه پرداخت', detail: data });
-  } catch (e) { res.status(500).json({ error: 'خطای سرور در ارتباط با درگاه' }); }
+  } catch (e) {
+    res.status(500).json({ error: 'خطای سرور در ارتباط با درگاه' });
+  }
 }));
-
 app.get('/payment/callback', async (req, res) => {
   const { Authority, Status } = req.query; let db;
   try { db = await readDB(); } catch { return res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
