@@ -2482,6 +2482,7 @@ app.post('/api/payment/request', auth, withDb(async (req, res) => {
       body: JSON.stringify({
         merchant_id: ZARINPAL_MERCHANT_ID,
         amount: total,
+        currency: 'IRT', // ← اضافه شد: قیمت‌های سایت به تومان هستند
         callback_url: CALLBACK_URL,
         description: String(description || 'خرید از فروشگاه').slice(0, 200),
       }),
@@ -2515,7 +2516,16 @@ app.get('/payment/callback', async (req, res) => {
   if (!order) return res.redirect(`${FRONTEND_URL}/payment/result?status=notfound`);
   if (Status !== 'OK') { order.status = 'canceled'; await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=canceled`); }
   try {
-    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/verify.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ merchant_id: ZARINPAL_MERCHANT_ID, amount: order.amount, authority: Authority }) });
+    const zRes = await fetch('https://api.zarinpal.com/pg/v4/payment/verify.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        merchant_id: ZARINPAL_MERCHANT_ID,
+        amount: order.amount,
+        currency: 'IRT', // ← اضافه شد: هم‌واحد با درخواست پرداخت
+        authority: Authority,
+      }),
+    });
     const data = await zRes.json();
     if (data.data && (data.data.code === 100 || data.data.code === 101)) { order.status = 'paid'; order.ref_id = String(data.data.ref_id); await writeDB(db); return res.redirect(`${FRONTEND_URL}/payment/result?status=success&ref=${data.data.ref_id}`); }
     order.status = 'failed'; await writeDB(db); res.redirect(`${FRONTEND_URL}/payment/result?status=failed`);
