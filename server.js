@@ -1721,7 +1721,7 @@ async function extractSwatchesViaDom(page) {
         const small = all.filter((el) => {
           if (el.children.length > 2) return false; // فقط عناصرِ برگ یا نزدیک‌به‌برگ
           const r = el.getBoundingClientRect();
-          if (r.width < 14 || r.width > 72 || r.height < 14 || r.height > 72) return false;
+          if (r.width < 14 || r.width > 120 || r.height < 14 || r.height > 120) return false;
           const ratio = r.width / r.height;
           if (ratio < 0.55 || ratio > 1.8) return false; // تقریباً مربعی/دایره‌ای، نه یک آیکونِ کشیده
           return true;
@@ -1833,7 +1833,9 @@ async function extractSwatchesViaDom(page) {
         if (!imageUrl && !hex) return; // نه عکس دارد نه رنگِ قابل‌تشخیص — احتمالاً سوآچِ واقعی نیست
 
         seen.add(dedupeKey);
-        results.push({ label: finalLabel, hex, imageUrl });
+        const shotId = results.length;
+        try { visual.setAttribute('data-jg-swatch', String(shotId)); } catch (e) {}
+        results.push({ label: finalLabel, hex, imageUrl, shotId });
       });
 
       return results;
@@ -1850,7 +1852,23 @@ async function extractSwatchesViaDom(page) {
 // و هم، برای مواقعی که آن روش چیزی پیدا نکرد، متنِ HTML برای مسیرِ قدیمیِ مبتنی‌بر Gemini آماده
 // بماند. اگر مرورگرِ هدلس در دسترس نبود، دقیقاً مثلِ قبل با fetchِ سبک ادامه می‌دهد (domSwatches
 // در آن حالت همیشه خالی است، چون بدونِ اجرای جاوااسکریپت امکانِ خواندنِ computed style نیست).
-async function fetchProductPageAndSwatches(url) {
+async function attachSwatchScreenshots(page, swatches) {
+  let shots = 0;
+  for (const sw of (swatches || []).slice(0, 60)) {
+    if (sw.imageUrl || sw.shotId === undefined) continue;
+    try {
+      const el = await page.$(`[data-jg-swatch="${sw.shotId}"]`);
+      if (!el) continue;
+      const buf = await el.screenshot({ type: 'png' });
+      if (buf && buf.length > 100) {
+        sw.imageUrl = `data:image/png;base64,${Buffer.from(buf).toString('base64')}`;
+        shots += 1;
+      }
+    } catch (e) { /* این مورد قابل اسکرین‌شات نبود */ }
+  }
+  return shots;
+}
+async function fetchProductPageAndSwatches(url, opts = {}) {
   if (HEADLESS_BROWSER_ENABLED) {
     try {
       const browser = await getBrowserInstance();
@@ -1864,7 +1882,8 @@ async function fetchProductPageAndSwatches(url) {
           await new Promise((resolve) => setTimeout(resolve, 1200));
           await expandColorSwatches(page);
           const domSwatches = await extractSwatchesViaDom(page);
-          const html = await page.content();
+          if (opts.captureSwatches) await attachSwatchScreenshots(page, domSwatches);
+const html = await page.content();
           const finalUrl = page.url();
           return { html, finalUrl, domSwatches };
         } finally {
@@ -2210,7 +2229,7 @@ app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, re
   const url = validateProductUrl(req.body && req.body.url);
   if (!url) return res.status(400).json({ error: 'لینک محصول معتبر نیست' });
   try {
-    const page = await fetchProductPageAndSwatches(url);
+  const page = await fetchProductPageAndSwatches(url, { captureSwatches: true });
     let rawVariants = [];
     let method = 'dom';
     // روشِ اصلی و دقیق‌تر: خواندنِ مستقیمِ رنگ‌های واقعاً رندرشده از خودِ صفحه (کارِ درست برایِ
