@@ -2224,7 +2224,62 @@ app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, 
     res.status(502).json({ error: friendlyAiError(e) });
   }
 });
-
+function extractSwatchPairsFromHtml(html, baseUrl) {
+  const src = String(html || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+    .replace(/<svg[\s\S]*?<\/svg>/gi, ' ');
+  const decode = (s) => String(s).replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'").replace(/\s+/g, ' ').trim();
+  const tokens = [];
+  const re = /<img\b[^>]*>|<[^>]+>|[^<]+/gi;
+  let m;
+  while ((m = re.exec(src))) {
+    const t = m[0];
+    if (/^<img\b/i.test(t)) {
+      const sm = t.match(/\sdata-src=["']([^"']+)["']/i) || t.match(/\ssrc=["']([^"']+)["']/i);
+      if (sm) tokens.push({ img: sm[1].replace(/&amp;/gi, '&') });
+    } else if (t.charAt(0) !== '<') {
+      const x = decode(t);
+      if (x) tokens.push({ text: x });
+    }
+  }
+  function build(textFirst) {
+    const out = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const tk = tokens[i];
+      if (!tk.img) continue;
+      const nb = textFirst ? tokens[i - 1] : tokens[i + 1];
+      if (!nb || !nb.text || nb.text.length < 2 || nb.text.length > 60) continue;
+      const wm = tk.img.match(/[?&](?:width|w)=(\d+)/i);
+      if (!wm || Number(wm[1]) > 96) continue;
+      out.push({ label: nb.text, raw: tk.img, width: Number(wm[1]) });
+    }
+    return out;
+  }
+  function best(pairs) {
+    const byW = {};
+    pairs.forEach((p) => { (byW[p.width] = byW[p.width] || []).push(p); });
+    let top = [];
+    Object.values(byW).forEach((g) => { if (g.length > top.length) top = g; });
+    return top;
+  }
+  let top = best(build(true));
+  if (top.length < 4) top = best(build(false));
+  if (top.length < 4) return [];
+  const seen = new Set();
+  const result = [];
+  for (const p of top) {
+    const key = p.label.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    let url;
+    try { url = new URL(p.raw, baseUrl).toString(); } catch (e) { continue; }
+    url = url.replace(/([?&](?:width|w))=\d+/i, '$1=240');
+    result.push({ label: p.label, hex: '', imageUrl: url });
+  }
+  return result;
+}
 app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, res) => {
   const url = validateProductUrl(req.body && req.body.url);
   if (!url) return res.status(400).json({ error: 'لینک محصول معتبر نیست' });
@@ -2236,8 +2291,12 @@ app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, re
     // سایت‌هایی مثلِ SHEGLAM/Shopify که رنگِ سوآچ فقط با CSS تنظیم می‌شود، نه متن). اگر این روش
     // چیزی پیدا نکرد (مثلاً ساختارِ سایت خیلی غیرِمعمول بود)، به‌جای دست خالی برگرداندن، به روشِ
     // قدیمی (خواندنِ متنِ صفحه با Gemini) برمی‌گردیم.
+    const htmlPairs = (page.domSwatches && page.domSwatches.length >= 2) ? [] : extractSwatchPairsFromHtml(page.html, page.finalUrl);
     if (page.domSwatches && page.domSwatches.length >= 2) {
       rawVariants = page.domSwatches;
+    } else if (htmlPairs.length >= 4) {
+      method = 'html';
+      rawVariants = htmlPairs;
     } else {
       method = 'ai';
       const text = stripHtmlForGemini(page.html);
@@ -2253,7 +2312,7 @@ app.post('/api/ai/extract-variants-from-url', auth, requireAdmin, async (req, re
     // پیامِ تشخیصی: هم می‌گوید از کدام روش استفاده شد، هم اینکه از چند عکسِ پیشنهادی چندتا واقعاً
     // دانلود/آپلود شد — این‌طور مدیر همیشه می‌داند دقیقاً چه اتفاقی افتاده، نه فقط یک نتیجه‌ی خام.
     let imageNote = null;
-    const methodLabel = method === 'dom' ? 'مستقیم از ساختارِ صفحه' : 'با هوش مصنوعی از متنِ صفحه';
+        const methodLabel = method === 'dom' ? 'مستقیم از ساختارِ صفحه' : method === 'html' ? 'از کدِ HTMLِ صفحه' : 'با هوش مصنوعی از متنِ صفحه';
     const positionalNote = positionalCount > 0 ? ` (توجه: اسمِ ${positionalCount.toLocaleString('fa-IR')} موردشان جایی در صفحه پیدا نشد و به‌طورِ موقت «رنگ ۱، رنگ ۲...» گذاشته شد — لطفاً دستی نام‌گذاری‌شان کن)` : '';
     if (variants.length === 0) {
       imageNote = 'هیچ رنگی روی این صفحه پیدا نشد — می‌تونی رنگ‌ها رو دستی از پایین اضافه کنی.';
