@@ -510,30 +510,65 @@ async function identifyBarcodeWithGemini(code) {
 // extractPrimaryImageFromHtml که «ورود محصول با لینک» استفاده می‌کند، عکسِ اصلیِ هرکدام از آن
 // صفحات را درمی‌آوریم.
 async function searchWebPages(query) {
-  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-  const r = await fetch(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; JordanGalleryProductImporter/1.0)',
-      'Accept': 'text/html,application/xhtml+xml',
-    },
-  });
-  if (!r.ok) throw new Error(`جستجوی وب پاسخ نداد (کد ${r.status}) — به‌جای جستجو، لینک صفحه‌ی محصول را در همین کادر بچسبان`);
-  const html = await r.text();
-  const urls = [];
-  const re = /<a[^>]+class="result__a"[^>]+href="([^"]+)"/gi;
-  let m;
-  while ((m = re.exec(html)) && urls.length < 10) {
-    let href = m[1];
-    const uddgMatch = href.match(/[?&]uddg=([^&]+)/);
-    if (uddgMatch) {
-      try { href = decodeURIComponent(uddgMatch[1]); } catch (e) { continue; }
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml',
+    'Accept-Language': 'en-US,en;q=0.9',
+  };
+  async function getHtml(url, options) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const r = await fetch(url, { ...(options || {}), headers: { ...headers, ...((options && options.headers) || {}) }, signal: ctrl.signal });
+      if (!r.ok) throw new Error(`کد ${r.status}`);
+      return await r.text();
+    } finally { clearTimeout(timer); }
+  }
+  function fromDuckDuckGo(html) {
+    const urls = [];
+    const re = /href="([^"]*[?&]uddg=[^"&]+[^"]*)"/gi;
+    let m;
+    while ((m = re.exec(html)) && urls.length < 10) {
+      const um = m[1].match(/[?&]uddg=([^&"]+)/);
+      if (!um) continue;
+      try {
+        const href = decodeURIComponent(um[1]);
+        if (/^https?:\/\//i.test(href)) urls.push(href);
+      } catch (e) { /* رد شو */ }
     }
-    if (/^https?:\/\//i.test(href)) urls.push(href);
+    return urls;
   }
-  if (urls.length === 0 && /anomaly|captcha|unusual traffic|robot/i.test(html)) {
-    throw new Error('موتور جستجو موقتاً درخواست‌های سرور را مسدود کرده — به‌جای جستجو، لینک صفحه‌ی محصول را بچسبان یا بعداً دوباره امتحان کن');
+  function fromBing(html) {
+    const urls = [];
+    const re = /<li class="b_algo"[\s\S]*?<h2[^>]*>\s*<a[^>]+href="([^"]+)"/gi;
+    let m;
+    while ((m = re.exec(html)) && urls.length < 10) {
+      let href = m[1].replace(/&amp;/g, '&');
+      const bm = href.match(/[?&]u=a1([A-Za-z0-9_-]+)/);
+      if (bm) {
+        try { href = Buffer.from(bm[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'); } catch (e) { continue; }
+      }
+      if (/^https?:\/\//i.test(href)) urls.push(href);
+    }
+    return urls;
   }
-  return [...new Set(urls)];
+  const q = encodeURIComponent(query);
+  const providers = [
+    { name: 'DuckDuckGo', run: async () => fromDuckDuckGo(await getHtml('https://html.duckduckgo.com/html/', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: `q=${q}` })) },
+    { name: 'DuckDuckGo-Lite', run: async () => fromDuckDuckGo(await getHtml(`https://lite.duckduckgo.com/lite/?q=${q}`)) },
+    { name: 'Bing', run: async () => fromBing(await getHtml(`https://www.bing.com/search?q=${q}&setlang=en&count=15`)) },
+  ];
+  const errors = [];
+  for (const p of providers) {
+    try {
+      const urls = await p.run();
+      if (urls.length > 0) return [...new Set(urls)];
+      errors.push(`${p.name}: نتیجه‌ای نداد`);
+    } catch (e) {
+      errors.push(`${p.name}: ${e && e.name === 'AbortError' ? 'مهلت تمام شد' : (e && e.message) || 'خطا'}`);
+    }
+  }
+  throw new Error(`جستجوی وب انجام نشد (${errors.join(' | ')}) — لینک صفحه‌ی محصول را بچسبان`);
 }
 
 async function searchProductImageCandidates(query) {
@@ -2529,8 +2564,7 @@ app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
     scentScore: p.scentScore !== undefined ? (Number(p.scentScore) || 0) : (old.scentScore || 0), scentRatings: p.scentRatings !== undefined ? (Number(p.scentRatings) || 0) : (old.scentRatings || 0),
     longevityScore: p.longevityScore !== undefined ? (Number(p.longevityScore) || 0) : (old.longevityScore || 0), longevityRatings: p.longevityRatings !== undefined ? (Number(p.longevityRatings) || 0) : (old.longevityRatings || 0),
     sillageScore: p.sillageScore !== undefined ? (Number(p.sillageScore) || 0) : (old.sillageScore || 0), sillageRatings: p.sillageRatings !== undefined ? (Number(p.sillageRatings) || 0) : (old.sillageRatings || 0),
-    perfumer: p.perfumer !== undefined ? p.perfumer : (old.perfumer || ''), countryOfOrigin: p.countryOfOrigin !== undefined ? p.countryOfOrigin : (old.countryOfOrigin || ''), yearMade: p.yearMade !== undefined ? p.yearMade : (old.yearMade || ''), fragranticaRating: p.fragranticaRating !== undefined ? p.fragranticaRating : (old.fragranticaRating || ''), volume: p.volume !== undefined ? p.volume : (old.volume || ''),volume: p.volume !== undefined ? p.volume : (old.volume || ''),
-    volumeUnit: p.volumeUnit !== undefined ? (p.volumeUnit === 'g' ? 'g' : 'ml') : (old.volumeUnit || 'ml'),barcode: p.barcode !== undefined ? p.barcode : (old.barcode || ''),
+    perfumer: p.perfumer !== undefined ? p.perfumer : (old.perfumer || ''), countryOfOrigin: p.countryOfOrigin !== undefined ? p.countryOfOrigin : (old.countryOfOrigin || ''), yearMade: p.yearMade !== undefined ? p.yearMade : (old.yearMade || ''), fragranticaRating: p.fragranticaRating !== undefined ? p.fragranticaRating : (old.fragranticaRating || ''), volume: p.volume !== undefined ? p.volume : (old.volume || ''),volume: p.volume !== undefined ? p.volume : (old.volume || ''),barcode: p.barcode !== undefined ? p.barcode : (old.barcode || ''),
     discountPercent: p.discountPercent !== undefined ? (Number(p.discountPercent) || 0) : old.discountPercent, image: p.image ?? old.image, imageFit: p.imageFit !== undefined ? (p.imageFit === 'cover' ? 'cover' : 'contain') : (old.imageFit || 'contain'), imagePosX: p.imagePosX !== undefined ? (Number(p.imagePosX) || 50) : (old.imagePosX ?? 50), imagePosY: p.imagePosY !== undefined ? (Number(p.imagePosY) || 50) : (old.imagePosY ?? 50), imageZoom: p.imageZoom !== undefined ? (Number(p.imageZoom) || 1) : (old.imageZoom ?? 1),
   };
   if (Array.isArray(p.variants) && p.variants.length > 0) updated.variants = p.variants;
