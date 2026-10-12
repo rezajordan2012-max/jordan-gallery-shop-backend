@@ -2691,6 +2691,174 @@ app.get('/payment/callback', async (req, res) => {
   } catch { res.redirect(`${FRONTEND_URL}/payment/result?status=error`); }
 });
 
+// ============================================================
+// مرورگر راه‌دور برای ادمین: سایت مبدأ را با Chromium واقعی باز می‌کند، اسکرین‌شات می‌فرستد،
+// کلیک/اسکرول را اجرا می‌کند و عکس/رنگِ نقطه‌ی انتخاب‌شده را روی Cloudinary آپلود می‌کند.
+// هیچ هوش مصنوعی یا سهمیه‌ای مصرف نمی‌شود.
+// ============================================================
+const browseSessions = new Map();
+const BROWSE_VIEWPORT = { width: 412, height: 760, deviceScaleFactor: 1, isMobile: true, hasTouch: true };
+const BROWSE_IDLE_MS = 4 * 60 * 1000;
+const BROWSE_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function destroyBrowseSession(sid) {
+  const s = browseSessions.get(sid);
+  if (!s) return;
+  browseSessions.delete(sid);
+  await s.page.close().catch(() => {});
+}
+const browseCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [sid, s] of browseSessions) if (now - s.last > BROWSE_IDLE_MS) destroyBrowseSession(sid);
+}, 60000);
+if (browseCleanupTimer.unref) browseCleanupTimer.unref();
+
+function isPrivateHost(h) {
+  return /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|\[::1\])/i.test(String(h || ''));
+}
+async function browseShot(page) {
+  const buf = await page.screenshot({ type: 'jpeg', quality: 55 });
+  return `data:image/jpeg;base64,${Buffer.from(buf).toString('base64')}`;
+}
+function getBrowseSession(sid) {
+  const s = browseSessions.get(String(sid || ''));
+  if (s) s.last = Date.now();
+  return s || null;
+}
+
+app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
+  if (!HEADLESS_BROWSER_ENABLED) return res.status(503).json({ error: 'مرورگر هدلس روی سرور فعال نیست (puppeteer-core و @sparticuz/chromium باید نصب باشند)' });
+  const u = validateProductUrl(req.body && req.body.url);
+  if (!u || isPrivateHost(u.hostname)) return res.status(400).json({ error: 'لینک معتبر نیست' });
+  try {
+    for (const sid of [...browseSessions.keys()]) await destroyBrowseSession(sid);
+    const browser = await getBrowserInstance();
+    if (!browser) return res.status(503).json({ error: 'مرورگر هدلس بالا نیامد — /api/ai/headless-status را چک کن' });
+    const page = await browser.newPage();
+    page.on('dialog', (d) => d.dismiss().catch(() => {}));
+    await page.setViewport(BROWSE_VIEWPORT);
+    await page.setUserAgent(BROWSE_UA);
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
+    const sid = crypto.randomBytes(8).toString('hex');
+    browseSessions.set(sid, { page, last: Date.now() });
+    try {
+      await page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+    } catch (e) {
+      if (!/timeout/i.test(e.message || '')) { await destroyBrowseSession(sid); throw e; }
+    }
+    await sleepMs(1800);
+    res.json({ sid, shot: await browseShot(page), url: page.url(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
+  } catch (e) {
+    console.error('browse/open error:', e.message);
+    res.status(502).json({ error: 'باز کردن سایت ممکن نشد: ' + (e.message || 'خطای نامشخص') });
+  }
+});
+
+app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
+  const s = getBrowseSession(req.body && req.body.sid);
+  if (!s) return res.status(410).json({ error: 'نشست مرورگر بسته شده — دوباره لینک را باز کن' });
+  const { type } = req.body || {};
+  try {
+    if (type === 'click') {
+      const x = Number(req.body.x), y = Number(req.body.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'مختصات نامعتبر' });
+      await s.page.mouse.click(x, y);
+      await sleepMs(1300);
+    } else if (type === 'scroll') {
+      const dy = Math.max(-2000, Math.min(2000, Number(req.body.dy) || 0));
+      await s.page.evaluate((d) => window.scrollBy(0, d), dy);
+      await sleepMs(700);
+    } else if (type === 'back') {
+      await s.page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
+      await sleepMs(1000);
+    } else {
+      return res.status(400).json({ error: 'عملیات نامعتبر' });
+    }
+    res.json({ shot: await browseShot(s.page), url: s.page.url() });
+  } catch (e) {
+    console.error('browse/action error:', e.message);
+    res.status(502).json({ error: e.message || 'اجرای عملیات ناموفق بود' });
+  }
+});
+
+app.post('/api/browse/pick', auth, requireAdmin, async (req, res) => {
+  const s = getBrowseSession(req.body && req.body.sid);
+  if (!s) return res.status(410).json({ error: 'نشست مرورگر بسته شده — دوباره لینک را باز کن' });
+  const x = Number(req.body.x), y = Number(req.body.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'مختصات نامعتبر' });
+  const removeBackground = !!req.body.removeBackground;
+  try {
+    const info = await s.page.evaluate((px, py) => {
+      const urlFrom = (str) => { const m = str && str.match(/url\(["']?(.*?)["']?\)/); return m ? m[1] : ''; };
+      const toHex = (c) => {
+        const m = String(c || '').match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\)/i);
+        if (!m || (m[4] !== undefined && Number(m[4]) === 0)) return '';
+        return '#' + [m[1], m[2], m[3]].map((n) => Number(n).toString(16).padStart(2, '0')).join('').toUpperCase();
+      };
+      const labelOf = (start) => {
+        let el = start;
+        for (let i = 0; i < 5 && el; i++, el = el.parentElement) {
+          const attrs = ['aria-label', 'title', 'data-value', 'data-color-name', 'data-color', 'data-shade', 'data-name', 'alt'];
+          for (const a of attrs) { const v = el.getAttribute && el.getAttribute(a); if (v && v.trim() && v.length < 60) return v.trim(); }
+          const inner = el.querySelector && el.querySelector('img[alt]');
+          if (inner && inner.alt && inner.alt.length < 60) return inner.alt.trim();
+          const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (t && t.length <= 30) return t;
+        }
+        return '';
+      };
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const els = document.elementsFromPoint(px, py).filter((e) => e !== document.documentElement && e !== document.body).slice(0, 10);
+      const rectOf = (el) => { const r = el.getBoundingClientRect(); return { x: r.left + window.scrollX, y: r.top + window.scrollY, width: r.width, height: r.height }; };
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width >= vw * 0.98 && r.height >= vh * 0.9) continue;
+        let u = '';
+        if (el.tagName === 'IMG') u = el.currentSrc || el.src;
+        if (!u) u = urlFrom(getComputedStyle(el).backgroundImage);
+        if (!u && r.width <= 700 && el.querySelector) { const i = el.querySelector('img'); if (i) u = i.currentSrc || i.src; }
+        if (u) return { imageUrl: u, rect: rectOf(el), hex: '', label: labelOf(el) };
+      }
+      for (const el of els) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 6 || r.height < 6 || r.width > 180 || r.height > 180) continue;
+        let hex = toHex(getComputedStyle(el).backgroundColor);
+        if (!hex) { const sh = el.querySelector && el.querySelector('svg circle, svg path, svg rect'); if (sh) hex = toHex(getComputedStyle(sh).fill); }
+        if (hex) return { imageUrl: '', rect: rectOf(el), hex, label: labelOf(el) };
+      }
+      return { imageUrl: '', rect: null, hex: '', label: '' };
+    }, x, y);
+
+    let url = null;
+    let reason = null;
+    if (info.imageUrl && !/^blob:/i.test(info.imageUrl)) {
+      let abs = info.imageUrl;
+      try { if (!/^data:/i.test(abs)) abs = new URL(abs, s.page.url()).toString(); } catch (e) {}
+      let origin = s.page.url();
+      try { origin = new URL(s.page.url()).origin; } catch (e) {}
+      const r = await mirrorRemoteImageToCloudinary(abs, { referer: origin, skipBackgroundRemoval: !removeBackground });
+      url = r.url; reason = r.reason;
+    }
+    if (!url && info.rect && info.rect.width >= 4 && info.rect.height >= 4) {
+      const clip = { x: Math.max(0, info.rect.x), y: Math.max(0, info.rect.y), width: Math.min(info.rect.width, 900), height: Math.min(info.rect.height, 900) };
+      const buf = await s.page.screenshot({ type: 'png', clip });
+      const up = await uploadDataUriToCloudinary(`data:image/png;base64,${Buffer.from(buf).toString('base64')}`);
+      url = up.url;
+    }
+    if (!url) return res.status(404).json({ error: reason ? `عکس دانلود نشد: ${reason}` : 'روی این نقطه عکس یا رنگی پیدا نشد — دقیق‌تر روی خودِ عکس یا دایره‌ی رنگ بزن' });
+    res.json({ url, label: info.label || '', hex: info.hex || '' });
+  } catch (e) {
+    console.error('browse/pick error:', e.message);
+    res.status(502).json({ error: e.message || 'انتخاب عکس ناموفق بود' });
+  }
+});
+
+app.post('/api/browse/close', auth, requireAdmin, async (req, res) => {
+  await destroyBrowseSession(String((req.body && req.body.sid) || ''));
+  res.json({ ok: true });
+});
+
 app.get('/', (req, res) => res.send('Store API is running'));
 
 const PORT = process.env.PORT || 4000;
