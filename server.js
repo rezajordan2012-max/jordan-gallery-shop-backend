@@ -2718,7 +2718,7 @@ function isPrivateHost(h) {
   return /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|\[::1\])/i.test(String(h || ''));
 }
 async function browseShot(page) {
-  const buf = await page.screenshot({ type: 'jpeg', quality: 55 });
+  const buf = await page.screenshot({ type: 'jpeg', quality: 40, optimizeForSpeed: true });
   return `data:image/jpeg;base64,${Buffer.from(buf).toString('base64')}`;
 }
 function getBrowseSession(sid) {
@@ -2738,6 +2738,16 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     const page = await browser.newPage();
     page.on('dialog', (d) => d.dismiss().catch(() => {}));
     await page.setViewport(BROWSE_VIEWPORT);
+        await page.setRequestInterception(true);
+    page.on('request', (r) => {
+      const t = r.resourceType();
+      const u = r.url();
+      if (t === 'font' || t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat/i.test(u)) {
+        r.abort().catch(() => {});
+      } else {
+        r.continue().catch(() => {});
+      }
+    });
     await page.setUserAgent(BROWSE_UA);
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
     const sid = crypto.randomBytes(8).toString('hex');
@@ -2764,14 +2774,14 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
       const x = Number(req.body.x), y = Number(req.body.y);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'مختصات نامعتبر' });
       await s.page.mouse.click(x, y);
-      await sleepMs(1300);
+      await sleepMs(700);
     } else if (type === 'scroll') {
       const dy = Math.max(-2000, Math.min(2000, Number(req.body.dy) || 0));
       await s.page.evaluate((d) => window.scrollBy(0, d), dy);
-      await sleepMs(700);
+      await sleepMs(350);
     } else if (type === 'back') {
       await s.page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
-      await sleepMs(1000);
+      await sleepMs(1800);
     } else {
       return res.status(400).json({ error: 'عملیات نامعتبر' });
     }
