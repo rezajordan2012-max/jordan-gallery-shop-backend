@@ -57,7 +57,9 @@ const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 // 1) Product page URL -> Gemini -> structured product fields
 // 2) Product image -> Gemini -> structured product fields
 // ============================================================
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_KEYS = [...new Set(((process.env.GEMINI_API_KEYS || '') + ',' + (process.env.GEMINI_API_KEY || '')).split(',').map((k) => k.trim()).filter(Boolean))];
+const GEMINI_API_KEY = GEMINI_KEYS[0];
+let geminiKeyIdx = 0;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
@@ -1951,14 +1953,16 @@ function isTransientGeminiError(message) {
 }
 
 async function callGeminiText(prompt, { retries = 3, baseDelayMs = 1500 } = {}) {
-  if (!GEMINI_API_KEY) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
+  if (GEMINI_KEYS.length === 0) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
   const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const maxAttempts = Math.max(retries + 1, GEMINI_KEYS.length * 2);
   let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const key = GEMINI_KEYS[geminiKeyIdx % GEMINI_KEYS.length];
     try {
       const r = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
         body: JSON.stringify({
           contents: [{ role: 'user', parts: [{ text: prompt }] }],
           generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
@@ -1968,10 +1972,16 @@ async function callGeminiText(prompt, { retries = 3, baseDelayMs = 1500 } = {}) 
       if (!r.ok) {
         const message = (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini';
         const err = new Error(message);
-        if (attempt < retries && isTransientGeminiError(message)) {
+        if (r.status === 429 || /quota|rate.?limit|exhausted/i.test(message)) {
+          geminiKeyIdx += 1; // کلید بعدی
           lastErr = err;
-          await new Promise((resolve) => setTimeout(resolve, baseDelayMs * Math.pow(2, attempt)));
-          continue; // یک بارِ دیگر امتحان کن
+          continue;
+        }
+        if (isTransientGeminiError(message)) {
+          lastErr = err;
+          geminiKeyIdx += 1;
+          await new Promise((resolve) => setTimeout(resolve, baseDelayMs * Math.pow(2, Math.min(attempt, 3))));
+          continue;
         }
         throw err;
       }
@@ -1979,17 +1989,12 @@ async function callGeminiText(prompt, { retries = 3, baseDelayMs = 1500 } = {}) 
       if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
       return parseJsonObject(text);
     } catch (e) {
-      if (attempt < retries && isTransientGeminiError(e.message)) {
-        lastErr = e;
-        await new Promise((resolve) => setTimeout(resolve, baseDelayMs * Math.pow(2, attempt)));
-        continue;
-      }
+      if (e && /fetch failed/i.test(e.message || '')) { lastErr = e; geminiKeyIdx += 1; continue; }
       throw e;
     }
   }
   throw lastErr || new Error('خطا در ارتباط با Gemini');
 }
-
 function buildGeminiProductPrompt(sourceText, sourceUrl) {
   return `تو مسئول استخراج اطلاعات دقیق محصول برای پنل مدیریت فروشگاه هستی.
 منبع: ${sourceUrl}
