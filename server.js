@@ -2776,8 +2776,23 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
       await s.page.mouse.click(x, y);
       await sleepMs(700);
     } else if (type === 'scroll') {
-      const dy = Math.max(-2000, Math.min(2000, Number(req.body.dy) || 0));
-      await s.page.evaluate((d) => window.scrollBy(0, d), dy);
+            const dy = Math.max(-3000, Math.min(3000, Number(req.body.dy) || 0));
+      const cx = Math.round(BROWSE_VIEWPORT.width / 2);
+      const cy = Math.round(BROWSE_VIEWPORT.height / 2);
+      await s.page.mouse.move(cx, cy);
+      await s.page.mouse.wheel({ deltaY: dy });
+      // اگر چرخ ماوس اثری نداشت (سایت‌های خاص)، با خودِ پنجره و نزدیک‌ترین المانِ اسکرول‌پذیر هم امتحان می‌کنیم
+      await s.page.evaluate((d, x, y) => {
+        const before = window.scrollY;
+        window.scrollBy(0, d);
+        if (window.scrollY !== before) return;
+        let el = document.elementFromPoint(x, y);
+        while (el && el !== document.body) {
+          const st = getComputedStyle(el);
+          if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 4) { el.scrollTop += d; return; }
+          el = el.parentElement;
+        }
+      }, dy, cx, cy);
       await sleepMs(350);
     } else if (type === 'back') {
       await s.page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
