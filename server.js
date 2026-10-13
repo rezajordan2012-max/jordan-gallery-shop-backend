@@ -2698,7 +2698,7 @@ app.get('/payment/callback', async (req, res) => {
 // ============================================================
 const browseSessions = new Map();
 const BROWSE_VIEWPORT = { width: 412, height: 760, deviceScaleFactor: 1, isMobile: true, hasTouch: true };
-const BROWSE_IDLE_MS = 4 * 60 * 1000;
+const BROWSE_IDLE_MS = 12 * 60 * 1000;
 const BROWSE_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
