@@ -339,22 +339,10 @@ app.post('/api/ai/extract-product', auth, requireAdmin, async (req, res) => {
   const approxBytes = Math.ceil((match[2].length * 3) / 4);
   if (approxBytes > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
   try {
-    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-    const aiRes = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [
-          { inline_data: { mime_type: match[1], data: match[2] } },
-          { text: buildProductExtractionPrompt() },
-        ] }],
-        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
-      }),
-    });
-    const aiData = await aiRes.json().catch(() => ({}));
-    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) ? friendlyAiError(new Error(aiData.error.message)) : `خطا در ارتباط با Gemini (${aiRes.status})` });
-    const textBlock = (aiData.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((c) => c.text || '').join('').trim();
-    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    const textBlock = await callGeminiParts([
+      { inline_data: { mime_type: match[1], data: match[2] } },
+      { text: buildProductExtractionPrompt() },
+    ]);
     res.json(parseJsonObject(textBlock));
   } catch (e) {
     console.error('Gemini image extraction error:', e);
@@ -484,22 +472,10 @@ async function lookupOpenFacts(code) {
 
 async function identifyBarcodeWithGemini(code) {
   if (!GEMINI_API_KEY) return null;
-  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-  const instruction = `کد بارکد زیر متعلق به یک محصول است: ${code}
+    const instruction = `کد بارکد زیر متعلق به یک محصول است: ${code}
 با جستجوی وب، محصول واقعی متناظر را با اطمینان شناسایی کن. اگر مطمئن نیستی حدس نزن و found را false بگذار.
 فقط یک JSON معتبر و بدون Markdown برگردان، دقیقاً با این ساختار: {"found":true,"isPerfume":false,"name":"","nameEn":"","brand":"","imageUrl":"","description":"","properties":"","ingredients":"","volume":"","concentration":"","topNotes":"","middleNotes":"","baseNotes":"","mainAccords":"","perfumer":"","countryOfOrigin":"","yearMade":""}`;
-  const r = await fetch(endpoint, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts: [{ text: instruction }] }],
-      tools: [{ google_search: {} }],
-    }),
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error((data && data.error && data.error.message) ? friendlyAiError(new Error(data.error.message)) : `خطا در ارتباط با Gemini (${r.status})`);
-  const text = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
-  if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
+  const text = await callGeminiParts([{ text: instruction }], { useSearch: true, json: false });
   const parsed = parseJsonObject(text);
   if (!parsed || !parsed.found || !parsed.name) return null;
   return parsed;
@@ -1995,6 +1971,40 @@ async function callGeminiText(prompt, { retries = 3, baseDelayMs = 1500 } = {}) 
   }
   throw lastErr || new Error('خطا در ارتباط با Gemini');
 }
+// نسخه‌ی چرخشی برای درخواست‌هایی که تصویر دارند (parts دلخواه)
+async function callGeminiParts(parts, { useSearch = false, json = true } = {}) {
+  if (GEMINI_KEYS.length === 0) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
+  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
+  const maxAttempts = Math.max(4, GEMINI_KEYS.length * 2);
+  let lastErr;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const key = GEMINI_KEYS[geminiKeyIdx % GEMINI_KEYS.length];
+    try {
+      const body = { contents: [{ role: 'user', parts }] };
+      if (json) body.generationConfig = { temperature: 0.1, responseMimeType: 'application/json' };
+      if (useSearch) body.tools = [{ google_search: {} }];
+      const r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body) });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const message = (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini';
+        const err = new Error(message);
+        if (r.status === 429 || /quota|rate.?limit|exhausted/i.test(message) || isTransientGeminiError(message)) {
+          geminiKeyIdx += 1; lastErr = err;
+          if (isTransientGeminiError(message)) await new Promise((x) => setTimeout(x, 1500));
+          continue;
+        }
+        throw err;
+      }
+      const text = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
+      if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
+      return text;
+    } catch (e) {
+      if (e && /fetch failed/i.test(e.message || '')) { lastErr = e; geminiKeyIdx += 1; continue; }
+      throw e;
+    }
+  }
+  throw lastErr || new Error('خطا در ارتباط با Gemini');
+}
 function buildGeminiProductPrompt(sourceText, sourceUrl) {
   return `تو مسئول استخراج اطلاعات دقیق محصول برای پنل مدیریت فروشگاه هستی.
 منبع: ${sourceUrl}
@@ -2199,22 +2209,10 @@ app.post('/api/ai/extract-variants-from-image', auth, requireAdmin, async (req, 
     const width = image.bitmap.width;
     const height = image.bitmap.height;
 
-    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-    const aiRes = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [
-          { inline_data: { mime_type: match[1], data: match[2] } },
-          { text: buildSwatchLocatorPrompt() },
-        ] }],
-        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
-      }),
-    });
-    const aiData = await aiRes.json().catch(() => ({}));
-    if (!aiRes.ok) return res.status(502).json({ error: (aiData && aiData.error && aiData.error.message) ? friendlyAiError(new Error(aiData.error.message)) : `خطا در ارتباط با Gemini (${aiRes.status})` });
-    const textBlock = (aiData.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((c) => c.text || '').join('').trim();
-    if (!textBlock) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    const textBlock = await callGeminiParts([
+      { inline_data: { mime_type: match[1], data: match[2] } },
+      { text: buildSwatchLocatorPrompt() },
+    ]);
     const parsed = parseJsonObject(textBlock);
     const rawSwatches = Array.isArray(parsed && parsed.swatches) ? parsed.swatches : [];
 
@@ -2421,20 +2419,11 @@ app.post('/api/ai/extract-product-from-image', auth, requireAdmin, async (req, r
   const approxBytes = Math.ceil((match[2].length * 3) / 4);
   if (approxBytes > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
   try {
-    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
     const prompt = buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار.', 'image');
-    const r = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ inline_data: { mime_type: match[1], data: match[2] } }, { text: prompt }] }],
-        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
-      }),
-    });
-    const data = await r.json();
-    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) ? friendlyAiError(new Error(data.error.message)) : 'خطا در ارتباط با Gemini' });
-    const text = (data.candidates || []).flatMap((c) => c.content && c.content.parts || []).map((p) => p.text || '').join('').trim();
-    if (!text) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    const text = await callGeminiParts([
+      { inline_data: { mime_type: match[1], data: match[2] } },
+      { text: prompt },
+    ]);
     res.json(parseJsonObject(text));
   } catch (e) {
     console.error('Gemini image extraction error:', e);
@@ -2481,22 +2470,10 @@ app.post('/api/ai/analyze-perfume-image', auth, requireAdmin, async (req, res) =
   if (!match) return res.status(400).json({ error: 'فرمت تصویر پشتیبانی نمی‌شود (فقط png، jpg، jpeg، webp)' });
   if (Math.ceil((match[2].length * 3) / 4) > 10 * 1024 * 1024) return res.status(413).json({ error: 'حجم تصویر بیش از حد مجاز است (حداکثر ۱۰ مگابایت)' });
   try {
-    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-    const r = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [
-          { inline_data: { mime_type: match[1], data: match[2] } },
-          { text: buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار و هرگز حدس نزن.', 'image') },
-        ] }],
-        generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
-      }),
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) return res.status(502).json({ error: (data && data.error && data.error.message) ? friendlyAiError(new Error(data.error.message)) : `خطا در ارتباط با Gemini (${r.status})` });
-    const resultText = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
-    if (!resultText) return res.status(502).json({ error: 'پاسخ نامعتبر از Gemini دریافت شد' });
+    const resultText = await callGeminiParts([
+      { inline_data: { mime_type: match[1], data: match[2] } },
+      { text: buildGeminiProductPrompt('اطلاعات باید مستقیماً از تصویر پیوست‌شده استخراج شود. اگر چیزی دیده نمی‌شود، خالی بگذار و هرگز حدس نزن.', 'image') },
+    ]);
     res.json(parseJsonObject(resultText));
   } catch (e) {
     console.error('Gemini perfume image error:', e);
