@@ -398,6 +398,7 @@ function friendlyAiError(err) {
     return raw.slice(0, 200).trim() + '…';
   }
   return raw || 'خطای نامشخصی رخ داد';
+    console.error('GEMINI RAW ERROR:', raw);
 }
 
 // Existing Fraganty endpoints.
