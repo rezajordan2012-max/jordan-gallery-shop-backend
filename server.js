@@ -60,7 +60,14 @@ const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 const GEMINI_KEYS = [...new Set(((process.env.GEMINI_API_KEYS || '') + ',' + (process.env.GEMINI_API_KEY || '')).split(',').map((k) => k.trim()).filter(Boolean))];
 const GEMINI_API_KEY = GEMINI_KEYS[0];
 let geminiKeyIdx = 0;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
+const GEMINI_MODELS = [...new Set([
+  ...String(process.env.GEMINI_MODEL || '').split(',').map((m) => m.trim()).filter(Boolean),
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.0-flash',
+])];
+const GEMINI_MODEL = GEMINI_MODELS[0];
+let geminiModelIdx = 0;
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -1929,75 +1936,46 @@ function isTransientGeminiError(message) {
   return /high demand|overloaded|unavailable|503|try again later/i.test(String(message || ''));
 }
 
-async function callGeminiText(prompt, { retries = 3, baseDelayMs = 1500 } = {}) {
+// هسته‌ی مشترک: بین مدل‌ها و کلیدها می‌چرخد
+// - شلوغی/۵۰۳ یا «مدل پیدا نشد» ← مدل بعدی
+// - سهمیه/۴۲۹ ← کلید بعدی (و اگر همه‌ی کلیدها تمام شد، مدل بعدی)
+async function callGeminiRaw(body) {
   if (GEMINI_KEYS.length === 0) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
-  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-  const maxAttempts = Math.max(retries + 1, GEMINI_KEYS.length * 2);
+  const maxAttempts = Math.min(14, GEMINI_MODELS.length * GEMINI_KEYS.length + 3);
   let lastErr;
+  let keyTries = 0;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const model = GEMINI_MODELS[geminiModelIdx % GEMINI_MODELS.length];
     const key = GEMINI_KEYS[geminiKeyIdx % GEMINI_KEYS.length];
+    const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(model)}:generateContent`;
     try {
       const r = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
-        }),
+        body: JSON.stringify(body),
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) {
         const message = (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini';
         const err = new Error(message);
+        lastErr = err;
+        if (r.status === 404 || (/not found|not supported/i.test(message) && /model/i.test(message))) {
+          geminiModelIdx += 1; keyTries = 0; continue;
+        }
         if (r.status === 429 || /quota|rate.?limit|exhausted/i.test(message)) {
-          geminiKeyIdx += 1; // کلید بعدی
-          lastErr = err;
+          geminiKeyIdx += 1; keyTries += 1;
+          if (keyTries >= GEMINI_KEYS.length) { geminiModelIdx += 1; keyTries = 0; }
           continue;
         }
-        if (isTransientGeminiError(message)) {
-          lastErr = err;
-          geminiKeyIdx += 1;
-          await new Promise((resolve) => setTimeout(resolve, baseDelayMs * Math.pow(2, Math.min(attempt, 3))));
-          continue;
-        }
-        throw err;
-      }
-      const text = (data.candidates || []).flatMap((c) => c.content && c.content.parts || []).map((p) => p.text || '').join('').trim();
-      if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
-      return parseJsonObject(text);
-    } catch (e) {
-      if (e && /fetch failed/i.test(e.message || '')) { lastErr = e; geminiKeyIdx += 1; continue; }
-      throw e;
-    }
-  }
-  throw lastErr || new Error('خطا در ارتباط با Gemini');
-}
-// نسخه‌ی چرخشی برای درخواست‌هایی که تصویر دارند (parts دلخواه)
-async function callGeminiParts(parts, { useSearch = false, json = true } = {}) {
-  if (GEMINI_KEYS.length === 0) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
-  const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(GEMINI_MODEL)}:generateContent`;
-  const maxAttempts = Math.max(4, GEMINI_KEYS.length * 2);
-  let lastErr;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const key = GEMINI_KEYS[geminiKeyIdx % GEMINI_KEYS.length];
-    try {
-      const body = { contents: [{ role: 'user', parts }] };
-      if (json) body.generationConfig = { temperature: 0.1, responseMimeType: 'application/json' };
-      if (useSearch) body.tools = [{ google_search: {} }];
-      const r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body) });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        const message = (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini';
-        const err = new Error(message);
-        if (r.status === 429 || /quota|rate.?limit|exhausted/i.test(message) || isTransientGeminiError(message)) {
-          geminiKeyIdx += 1; lastErr = err;
-          if (isTransientGeminiError(message)) await new Promise((x) => setTimeout(x, 1500));
+        if (r.status === 503 || r.status === 500 || isTransientGeminiError(message)) {
+          geminiModelIdx += 1; keyTries = 0;
+          await new Promise((x) => setTimeout(x, 700));
           continue;
         }
         throw err;
       }
       const text = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
-      if (!text) throw new Error('پاسخ نامعتبر از Gemini دریافت شد');
+      if (!text) { lastErr = new Error('پاسخ نامعتبر از Gemini دریافت شد'); geminiModelIdx += 1; continue; }
       return text;
     } catch (e) {
       if (e && /fetch failed/i.test(e.message || '')) { lastErr = e; geminiKeyIdx += 1; continue; }
@@ -2005,6 +1983,21 @@ async function callGeminiParts(parts, { useSearch = false, json = true } = {}) {
     }
   }
   throw lastErr || new Error('خطا در ارتباط با Gemini');
+}
+
+async function callGeminiText(prompt) {
+  const text = await callGeminiRaw({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+  });
+  return parseJsonObject(text);
+}
+
+async function callGeminiParts(parts, { useSearch = false, json = true } = {}) {
+  const body = { contents: [{ role: 'user', parts }] };
+  if (json) body.generationConfig = { temperature: 0.1, responseMimeType: 'application/json' };
+  if (useSearch) body.tools = [{ google_search: {} }];
+  return callGeminiRaw(body);
 }
 function buildGeminiProductPrompt(sourceText, sourceUrl) {
   return `تو مسئول استخراج اطلاعات دقیق محصول برای پنل مدیریت فروشگاه هستی.
