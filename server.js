@@ -1988,6 +1988,21 @@ async function callGeminiRaw(body) {
   }
   throw lastErr || new Error('خطا در ارتباط با Gemini');
 }
+async function callGeminiText(prompt) {
+  const text = await callGeminiRaw({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
+  });
+  return parseJsonObject(text);
+}
+
+async function callGeminiParts(parts, { useSearch = false, json = true } = {}) {
+  const body = { contents: [{ role: 'user', parts }] };
+  if (json) body.generationConfig = { temperature: 0.1, responseMimeType: 'application/json' };
+  if (useSearch) body.tools = [{ google_search: {} }];
+  return callGeminiRaw(body);
+}
+
 function buildGeminiProductPrompt(sourceText, sourceUrl) {
   return `تو مسئول استخراج اطلاعات دقیق محصول برای پنل مدیریت فروشگاه هستی.
 منبع: ${sourceUrl}
