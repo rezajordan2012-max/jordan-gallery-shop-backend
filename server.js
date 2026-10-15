@@ -2756,24 +2756,41 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
       await s.page.mouse.click(x, y);
       await sleepMs(700);
     } else if (type === 'scroll') {
-            const dy = Math.max(-3000, Math.min(3000, Number(req.body.dy) || 0));
-      const cx = Math.round(BROWSE_VIEWPORT.width / 2);
-      const cy = Math.round(BROWSE_VIEWPORT.height / 2);
-      await s.page.mouse.move(cx, cy);
-      await s.page.mouse.wheel({ deltaY: dy });
-      // اگر چرخ ماوس اثری نداشت (سایت‌های خاص)، با خودِ پنجره و نزدیک‌ترین المانِ اسکرول‌پذیر هم امتحان می‌کنیم
-      await s.page.evaluate((d, x, y) => {
-        const before = window.scrollY;
-        window.scrollBy(0, d);
-        if (window.scrollY !== before) return;
-        let el = document.elementFromPoint(x, y);
-        while (el && el !== document.body) {
-          const st = getComputedStyle(el);
-          if (/(auto|scroll)/.test(st.overflowY) && el.scrollHeight > el.clientHeight + 4) { el.scrollTop += d; return; }
-          el = el.parentElement;
+                  const dy = Math.max(-4000, Math.min(4000, Number(req.body.dy) || 0));
+      await s.page.evaluate(async (d) => {
+        // خاموش کردن اسکرول نرم سایت تا حرکت فوری و دقیق باشد
+        if (!document.getElementById('__nosmooth')) {
+          const st = document.createElement('style');
+          st.id = '__nosmooth';
+          st.textContent = 'html,body,*{scroll-behavior:auto !important}';
+          document.head.appendChild(st);
         }
-      }, dy, cx, cy);
-      await sleepMs(350);
+        // اگر خودِ صفحه اسکرول ندارد، بزرگ‌ترین المانِ اسکرول‌پذیر را پیدا می‌کنیم
+        const rootEl = document.scrollingElement || document.documentElement;
+        let target = null;
+        if (!(rootEl.scrollHeight > window.innerHeight + 8)) {
+          let best = 0;
+          document.querySelectorAll('*').forEach((el) => {
+            const cs = getComputedStyle(el);
+            if (!/(auto|scroll)/.test(cs.overflowY)) return;
+            if (el.scrollHeight <= el.clientHeight + 8) return;
+            const area = el.clientWidth * el.clientHeight;
+            if (area > best) { best = area; target = el; }
+          });
+        }
+        const get = () => (target ? target.scrollTop : window.scrollY);
+        const before = get();
+        if (target) target.scrollTop = before + d; else window.scrollTo(0, before + d);
+        // صبر تا موقعیت ثابت شود (حداکثر ~۱ ثانیه)
+        let last = -1, same = 0;
+        for (let i = 0; i < 12 && same < 2; i++) {
+          await new Promise((r) => setTimeout(r, 80));
+          const now = get();
+          same = now === last ? same + 1 : 0;
+          last = now;
+        }
+      }, dy);
+      await sleepMs(350); // فرصت برای بارگذاریِ تنبلِ عکس‌ها
     } else if (type === 'back') {
       await s.page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
       await sleepMs(1800);
