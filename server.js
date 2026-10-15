@@ -60,14 +60,12 @@ const REMOVEBG_API_KEY = process.env.REMOVEBG_API_KEY;
 const GEMINI_KEYS = [...new Set(((process.env.GEMINI_API_KEYS || '') + ',' + (process.env.GEMINI_API_KEY || '')).split(',').map((k) => k.trim()).filter(Boolean))];
 const GEMINI_API_KEY = GEMINI_KEYS[0];
 let geminiKeyIdx = 0;
-const GEMINI_MODELS = [...new Set([
-  ...String(process.env.GEMINI_MODEL || '').split(',').map((m) => m.trim()).filter(Boolean),
-  'gemini-2.5-flash',
-  'gemini-2.5-flash-lite',
-  'gemini-2.0-flash',
-])];
-const GEMINI_MODEL = GEMINI_MODELS[0];
-let geminiModelIdx = 0;
+const GEMINI_ENV_MODELS = String(process.env.GEMINI_MODEL || '').split(',').map((m) => m.trim()).filter(Boolean);
+const GEMINI_STATIC_FALLBACK = ['gemini-3.8-flash', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+const GEMINI_MODEL = GEMINI_ENV_MODELS[0] || GEMINI_STATIC_FALLBACK[0];
+let geminiDiscovered = [];
+let geminiDiscoveredAt = 0;
+let geminiLastGoodModel = '';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -398,7 +396,7 @@ function friendlyAiError(err) {
   // خطای «مدل پیدا نشد» — معمولاً یعنی مقدارِ GEMINI_MODEL روی Render دقیقاً با شناسه‌ی رسمیِ
   // مدل در Google AI Studio یکی نیست (مثلاً gemini-3.5-flash اگر هنوز روی حسابِ شما فعال/منتشر
   // نشده باشد). با همین پیام، مدیر می‌داند دقیقاً کجا را باید چک کند.
-  if (/not found|404|is not supported|not_found/i.test(raw) && /model/i.test(raw)) {
+  if (/not found|404|is not supported|not_found|no longer available/i.test(raw) && /model/i.test(raw)) {
     return `مدلِ هوش مصنوعیِ تنظیم‌شده (GEMINI_MODEL="${GEMINI_MODEL}") پیدا نشد یا برای این کلید فعال نیست — در Google AI Studio (aistudio.google.com) شناسهٔ دقیقِ مدلی که به آن دسترسی داری را ببین (مثلاً gemini-2.5-flash یا gemini-2.0-flash) و همان را در متغیرِ محیطیِ GEMINI_MODEL روی Render قرار بده.`;
   }
   if (raw.length > 220) {
@@ -1936,68 +1934,59 @@ function isTransientGeminiError(message) {
   return /high demand|overloaded|unavailable|503|try again later/i.test(String(message || ''));
 }
 
+// فهرست مدل‌های Flash فعالِ حساب را از خودِ گوگل می‌گیرد (۱ ساعت کش می‌شود)
+async function discoverGeminiModels() {
+  if (geminiDiscovered.length && Date.now() - geminiDiscoveredAt < 3600 * 1000) return geminiDiscovered;
+  try {
+    const r = await fetch(`${GEMINI_BASE_URL}?pageSize=200`, { headers: { 'x-goog-api-key': GEMINI_KEYS[0] } });
+    const d = await r.json().catch(() => ({}));
+    const ver = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [0, 0])[1]);
+    const list = (d.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
+      .map((m) => String(m.name || '').replace(/^models\//, ''))
+      .filter((n) => /^gemini-\d+(\.\d+)?-flash(-lite)?$/.test(n))
+      .sort((a, b) => (ver(b) - ver(a)) || ((/lite/.test(a) ? 1 : 0) - (/lite/.test(b) ? 1 : 0)));
+    if (list.length) { geminiDiscovered = list; geminiDiscoveredAt = Date.now(); }
+  } catch (e) { /* اگر نشد، از فهرست ثابت استفاده می‌شود */ }
+  return geminiDiscovered;
+}
+
 // هسته‌ی مشترک: بین مدل‌ها و کلیدها می‌چرخد
-// - شلوغی/۵۰۳ یا «مدل پیدا نشد» ← مدل بعدی
+// - مدلِ حذف‌شده/پیدا‌نشد/شلوغ ← مدل بعدی
 // - سهمیه/۴۲۹ ← کلید بعدی (و اگر همه‌ی کلیدها تمام شد، مدل بعدی)
 async function callGeminiRaw(body) {
   if (GEMINI_KEYS.length === 0) throw new Error('کلید GEMINI_API_KEY روی سرور تنظیم نشده است');
-  const maxAttempts = Math.min(14, GEMINI_MODELS.length * GEMINI_KEYS.length + 3);
+  const found = await discoverGeminiModels();
+  const models = [...new Set([geminiLastGoodModel, ...GEMINI_ENV_MODELS, ...found, ...GEMINI_STATIC_FALLBACK].filter(Boolean))].slice(0, 6);
   let lastErr;
-  let keyTries = 0;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const model = GEMINI_MODELS[geminiModelIdx % GEMINI_MODELS.length];
-    const key = GEMINI_KEYS[geminiKeyIdx % GEMINI_KEYS.length];
+  for (const model of models) {
     const endpoint = `${GEMINI_BASE_URL}/${encodeURIComponent(model)}:generateContent`;
-    try {
-      const r = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify(body),
-      });
-      const data = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        const message = (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini';
-        const err = new Error(message);
-        lastErr = err;
-        if (r.status === 404 || (/not found|not supported/i.test(message) && /model/i.test(message))) {
-          geminiModelIdx += 1; keyTries = 0; continue;
-        }
-        if (r.status === 429 || /quota|rate.?limit|exhausted/i.test(message)) {
-          geminiKeyIdx += 1; keyTries += 1;
-          if (keyTries >= GEMINI_KEYS.length) { geminiModelIdx += 1; keyTries = 0; }
-          continue;
-        }
-        if (r.status === 503 || r.status === 500 || isTransientGeminiError(message)) {
-          geminiModelIdx += 1; keyTries = 0;
-          await new Promise((x) => setTimeout(x, 700));
-          continue;
-        }
-        throw err;
+    for (let k = 0; k < GEMINI_KEYS.length; k++) {
+      const key = GEMINI_KEYS[geminiKeyIdx % GEMINI_KEYS.length];
+      let r, data;
+      try {
+        r = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key }, body: JSON.stringify(body) });
+        data = await r.json().catch(() => ({}));
+      } catch (e) {
+        lastErr = e; geminiKeyIdx += 1; continue;
       }
-      const text = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
-      if (!text) { lastErr = new Error('پاسخ نامعتبر از Gemini دریافت شد'); geminiModelIdx += 1; continue; }
-      return text;
-    } catch (e) {
-      if (e && /fetch failed/i.test(e.message || '')) { lastErr = e; geminiKeyIdx += 1; continue; }
-      throw e;
+      if (r.ok) {
+        const text = (data.candidates || []).flatMap((c) => (c.content && c.content.parts) || []).map((p) => p.text || '').join('').trim();
+        if (text) { geminiLastGoodModel = model; return text; }
+        lastErr = new Error('پاسخ نامعتبر از Gemini دریافت شد');
+        break; // مدل بعدی
+      }
+      const message = (data && data.error && data.error.message) || 'خطا در ارتباط با Gemini';
+      lastErr = new Error(message);
+      if (r.status === 429 || /quota|rate.?limit|exhausted/i.test(message)) { geminiKeyIdx += 1; continue; } // کلید بعدی
+      if (r.status === 404 || r.status === 500 || r.status === 503 || isTransientGeminiError(message) || /no longer available|not found|not supported|deprecated|retired/i.test(message)) {
+        if (geminiLastGoodModel === model) geminiLastGoodModel = '';
+        break; // مدل بعدی
+      }
+      throw lastErr; // خطای واقعی (مثلاً کلید نامعتبر یا درخواست اشتباه)
     }
   }
   throw lastErr || new Error('خطا در ارتباط با Gemini');
-}
-
-async function callGeminiText(prompt) {
-  const text = await callGeminiRaw({
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: { temperature: 0.1, responseMimeType: 'application/json' },
-  });
-  return parseJsonObject(text);
-}
-
-async function callGeminiParts(parts, { useSearch = false, json = true } = {}) {
-  const body = { contents: [{ role: 'user', parts }] };
-  if (json) body.generationConfig = { temperature: 0.1, responseMimeType: 'application/json' };
-  if (useSearch) body.tools = [{ google_search: {} }];
-  return callGeminiRaw(body);
 }
 function buildGeminiProductPrompt(sourceText, sourceUrl) {
   return `تو مسئول استخراج اطلاعات دقیق محصول برای پنل مدیریت فروشگاه هستی.
