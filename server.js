@@ -2003,6 +2003,57 @@ async function callGeminiParts(parts, { useSearch = false, json = true } = {}) {
   return callGeminiRaw(body);
 }
 
+// «Smells similar» در Parfumo: اولین عطرِ فهرست (عکس + نام + طولِ نوار) را از HTML می‌خواند
+function extractSimilarFromHtml(html, baseUrl) {
+  try {
+    const h = String(html || '');
+    const idx = h.search(/Smells\s+similar/i);
+    if (idx < 0) return null;
+    const chunk = h.slice(idx, idx + 30000);
+    const imgRe = /<img\b[^>]*>/gi;
+    let m, img = null;
+    while ((m = imgRe.exec(chunk))) {
+      const tag = m[0];
+      const srcM = tag.match(/\b(?:data-src|data-lazy-src|data-original|src)=["']([^"']+)["']/i);
+      const src = srcM ? srcM[1] : '';
+      if (!src || /^data:/i.test(src) || /icon|logo|avatar|sprite|pixel|blank|flag/i.test(src)) continue;
+      img = { tag, src, pos: m.index };
+      break;
+    }
+    if (!img) return null;
+    let src = img.src;
+    try { src = new URL(src, baseUrl).toString(); } catch (e) { return null; }
+    const after = chunk.slice(img.pos, img.pos + 2500);
+    const altM = img.tag.match(/\balt=["']([^"']*)["']/i) || img.tag.match(/\btitle=["']([^"']*)["']/i);
+    let name = altM ? altM[1].trim() : '';
+    if (!name) {
+      const text = after.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, '\n').split(/\n+/).map((t) => t.replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim()).filter(Boolean);
+      name = text[0] || '';
+    }
+    name = name.replace(/\s+/g, ' ').slice(0, 120);
+    if (!name) return null;
+    const wM = after.match(/width:\s*([\d.]+)\s*%/i);
+    let percent = wM ? Math.round(Number(wM[1])) : 0;
+    if (!(percent > 0 && percent <= 100)) percent = 0;
+    return { name, percent, imageUrl: src };
+  } catch (e) { return null; }
+}
+
+async function attachSimilarPerfume(product, page) {
+  try {
+    const sim = extractSimilarFromHtml(page.html, page.finalUrl);
+    if (!sim) return;
+    product.similarName = sim.name;
+    product.similarPercent = sim.percent || '';
+    let origin = page.finalUrl;
+    try { origin = new URL(page.finalUrl).origin; } catch (e) {}
+    const r = await mirrorRemoteImageToCloudinary(sim.imageUrl, { referer: origin, skipBackgroundRemoval: true });
+    product.similarImage = (r && r.url) || '';
+  } catch (e) {
+    console.error('similar perfume extraction failed:', e.message);
+  }
+}
+
 function buildGeminiProductPrompt(sourceText, sourceUrl) {
   return `تو مسئول استخراج اطلاعات دقیق محصول برای پنل مدیریت فروشگاه هستی.
 منبع: ${sourceUrl}
@@ -2387,6 +2438,7 @@ app.post('/api/ai/extract-product-from-url', auth, requireAdmin, async (req, res
     applyRatingBarsToProduct(product, bars);
     if (mainAccordsFound) product.mainAccords = mainAccordsFound;
     const refererOriginForMain = (() => { try { return new URL(page.finalUrl).origin; } catch (e) { return page.finalUrl; } })();
+    await attachSimilarPerfume(product, page);
     const variantResult = await mirrorVariantImages(product.variants, page.finalUrl);
     product.variants = variantResult.variants;
     const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
@@ -2442,6 +2494,7 @@ app.post('/api/ai/import-product-url', auth, requireAdmin, async (req, res) => {
     applyRatingBarsToProduct(product, bars);
     if (mainAccordsFound) product.mainAccords = mainAccordsFound;
     const refererOriginForMain2 = (() => { try { return new URL(page.finalUrl).origin; } catch (e) { return page.finalUrl; } })();
+    await attachSimilarPerfume(product, page);
     const variantResult2 = await mirrorVariantImages(product.variants, page.finalUrl);
     product.variants = variantResult2.variants;
     const rawImageUrl = extractPrimaryImageFromHtml(page.html, page.finalUrl);
@@ -2521,6 +2574,7 @@ app.post('/api/products', auth, requireAdmin, withDb(async (req, res) => {
     id, name: p.name, nameEn: p.nameEn || '', brand: p.brand || '', category: p.category || 'perfume', subcategory: p.subcategory || '', type: p.type || '',
     facets: (p.facets && typeof p.facets === 'object') ? p.facets : {}, price: Number(p.price), description: p.description || '', properties: p.properties || '', ingredients: p.ingredients || '',
     topNotes: p.topNotes || '', middleNotes: p.middleNotes || '', baseNotes: p.baseNotes || '', mainAccords: p.mainAccords || '',
+    similarName: p.similarName || '', similarPercent: Number.isFinite(Number(p.similarPercent)) ? Math.max(0, Math.min(100, Number(p.similarPercent))) : 0, similarImage: p.similarImage || '',
     scentScore: Number.isFinite(Number(p.scentScore)) ? Number(p.scentScore) : 0, scentRatings: Number.isFinite(Number(p.scentRatings)) ? Number(p.scentRatings) : 0,
     longevityScore: Number.isFinite(Number(p.longevityScore)) ? Number(p.longevityScore) : 0, longevityRatings: Number.isFinite(Number(p.longevityRatings)) ? Number(p.longevityRatings) : 0,
     sillageScore: Number.isFinite(Number(p.sillageScore)) ? Number(p.sillageScore) : 0, sillageRatings: Number.isFinite(Number(p.sillageRatings)) ? Number(p.sillageRatings) : 0,
@@ -2544,6 +2598,9 @@ app.put('/api/products/:id', auth, requireAdmin, withDb(async (req, res) => {
     price: p.price !== undefined ? Number(p.price) : old.price, description: p.description ?? old.description, properties: p.properties !== undefined ? p.properties : old.properties,
     ingredients: p.ingredients !== undefined ? p.ingredients : old.ingredients, topNotes: p.topNotes !== undefined ? p.topNotes : (old.topNotes || ''), middleNotes: p.middleNotes !== undefined ? p.middleNotes : (old.middleNotes || ''), baseNotes: p.baseNotes !== undefined ? p.baseNotes : (old.baseNotes || ''),
     mainAccords: p.mainAccords !== undefined ? p.mainAccords : (old.mainAccords || ''),
+    similarName: p.similarName !== undefined ? p.similarName : (old.similarName || ''),
+    similarPercent: p.similarPercent !== undefined ? (Math.max(0, Math.min(100, Number(p.similarPercent) || 0))) : (old.similarPercent || 0),
+    similarImage: p.similarImage !== undefined ? p.similarImage : (old.similarImage || ''),
     scentScore: p.scentScore !== undefined ? (Number(p.scentScore) || 0) : (old.scentScore || 0), scentRatings: p.scentRatings !== undefined ? (Number(p.scentRatings) || 0) : (old.scentRatings || 0),
     longevityScore: p.longevityScore !== undefined ? (Number(p.longevityScore) || 0) : (old.longevityScore || 0), longevityRatings: p.longevityRatings !== undefined ? (Number(p.longevityRatings) || 0) : (old.longevityRatings || 0),
     sillageScore: p.sillageScore !== undefined ? (Number(p.sillageScore) || 0) : (old.sillageScore || 0), sillageRatings: p.sillageRatings !== undefined ? (Number(p.sillageRatings) || 0) : (old.sillageRatings || 0),
