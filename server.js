@@ -2734,7 +2734,7 @@ app.get('/payment/callback', async (req, res) => {
 // هیچ هوش مصنوعی یا سهمیه‌ای مصرف نمی‌شود.
 // ============================================================
 const browseSessions = new Map();
-const BROWSE_VIEWPORT = { width: 412, height: 760, deviceScaleFactor: 1, isMobile: true, hasTouch: true };
+const BROWSE_VIEWPORT = { width: 412, height: 760, deviceScaleFactor: 1.5, isMobile: true, hasTouch: true };
 const BROWSE_IDLE_MS = 12 * 60 * 1000;
 const BROWSE_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -2755,7 +2755,8 @@ function isPrivateHost(h) {
   return /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|\[::1\])/i.test(String(h || ''));
 }
 async function browseShot(page) {
-  const buf = await page.screenshot({ type: 'jpeg', quality: 40, optimizeForSpeed: true });
+  // کیفیتِ بالاتر + وضوحِ ۱.۵ برابر تا صفحه کامل و خوانا دیده شود (قبلاً کیفیت ۴۰ و وضوحِ ۱ بود)
+  const buf = await page.screenshot({ type: 'jpeg', quality: 62, optimizeForSpeed: true, captureBeyondViewport: false });
   return `data:image/jpeg;base64,${Buffer.from(buf).toString('base64')}`;
 }
 function getBrowseSession(sid) {
@@ -2779,7 +2780,7 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     page.on('request', (r) => {
       const t = r.resourceType();
       const u = r.url();
-      if (t === 'font' || t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat/i.test(u)) {
+      if (t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat/i.test(u)) {
         r.abort().catch(() => {});
       } else {
         r.continue().catch(() => {});
@@ -2811,7 +2812,9 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
       const x = Number(req.body.x), y = Number(req.body.y);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'مختصات نامعتبر' });
       await s.page.mouse.click(x, y);
-      await sleepMs(700);
+      // به‌جای ۷۰۰ms صبرِ ثابت: تا آرام شدنِ شبکه صبر می‌کنیم (حداکثر ۱.۵ ثانیه) و بلافاصله اسکرین‌شات می‌گیریم
+      await s.page.waitForNetworkIdle({ idleTime: 180, timeout: 1500 }).catch(() => {});
+      await sleepMs(120);
     } else if (type === 'scroll') {
                   const dy = Math.max(-4000, Math.min(4000, Number(req.body.dy) || 0));
       await s.page.evaluate(async (d) => {
@@ -2840,14 +2843,15 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
         if (target) target.scrollTop = before + d; else window.scrollTo(0, before + d);
         // صبر تا موقعیت ثابت شود (حداکثر ~۱ ثانیه)
         let last = -1, same = 0;
-        for (let i = 0; i < 12 && same < 2; i++) {
-          await new Promise((r) => setTimeout(r, 80));
+        for (let i = 0; i < 8 && same < 1; i++) {
+          await new Promise((r) => setTimeout(r, 45));
           const now = get();
           same = now === last ? same + 1 : 0;
           last = now;
         }
       }, dy);
-      await sleepMs(350); // فرصت برای بارگذاریِ تنبلِ عکس‌ها
+      // فرصتِ کوتاه برای بارگذاریِ تنبلِ عکس‌ها (تا پایانِ دانلودها، حداکثر ۶۰۰ms)
+      await s.page.waitForNetworkIdle({ idleTime: 120, timeout: 600 }).catch(() => {});
     } else if (type === 'back') {
       await s.page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
       await sleepMs(1800);
@@ -2921,7 +2925,9 @@ app.post('/api/browse/pick', auth, requireAdmin, async (req, res) => {
     }
     if (!url && info.rect && info.rect.width >= 4 && info.rect.height >= 4) {
       const clip = { x: Math.max(0, info.rect.x), y: Math.max(0, info.rect.y), width: Math.min(info.rect.width, 900), height: Math.min(info.rect.height, 900) };
-      const buf = await s.page.screenshot({ type: 'png', clip });
+      // کلیپِ کوچک (سوآچ رنگ) به‌صورت PNG کوچک و سریع آپلود می‌شود
+      clip.width = Math.min(clip.width, 400); clip.height = Math.min(clip.height, 400);
+      const buf = await s.page.screenshot({ type: 'png', clip, optimizeForSpeed: true });
       const up = await uploadDataUriToCloudinary(`data:image/png;base64,${Buffer.from(buf).toString('base64')}`);
       url = up.url;
     }
