@@ -2757,16 +2757,17 @@ function isPrivateHost(h) {
 const BROWSE_PAD = 360; // پیکسلِ CSS اضافه بالا و پایینِ دید که همراهِ اسکرین‌شات فرستاده می‌شود
 // اسکرین‌شات را کمی بزرگ‌تر از دید می‌گیرد (بالا و پایین) تا هنگام اسکرول، کلاینت فوراً محتوای کنار را نشان بدهد
 // و هیچ بخشی از صفحه خالی/ناپدید نشود. خروجی: { shot, pad: { top, bottom } }
-async function browseShot(page) {
+async function browseShot(page, wantPad) {
   const opts = { type: 'jpeg', quality: 58, optimizeForSpeed: true };
   let pad = { top: 0, bottom: 0 };
   let buf = null;
   try {
     const m = await page.evaluate(() => {
       const r = document.scrollingElement || document.documentElement;
-      return { y: Math.round(window.scrollY), h: Math.round(r.scrollHeight), ih: window.innerHeight, iw: window.innerWidth };
+      return { y: Math.round(window.scrollY), h: Math.round(r.scrollHeight), ih: window.innerHeight, iw: window.innerWidth, sc: (window.visualViewport && window.visualViewport.scale) || 1 };
     });
-    if (m && m.h > m.ih + 8) {
+    // فقط وقتی کلاینت درخواست کرده و عرضِ صفحه دقیقاً برابرِ دیدِ ۴۱۲ است (وگرنه مختصاتِ کلیک جابه‌جا می‌شد)
+    if (wantPad && m && Math.abs(m.iw - BROWSE_VIEWPORT.width) <= 2 && Math.abs(m.sc - 1) < 0.02 && m.h > m.ih + 8) {
       const top = Math.max(0, Math.min(BROWSE_PAD, m.y));
       const bottom = Math.max(0, Math.min(BROWSE_PAD, m.h - m.y - m.ih));
       if (top || bottom) {
@@ -2815,7 +2816,7 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
       if (!/timeout/i.test(e.message || '')) { await destroyBrowseSession(sid); throw e; }
     }
     await sleepMs(1800);
-    res.json({ sid, ...(await browseShot(page)), url: page.url(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
+    res.json({ sid, ...(await browseShot(page, !!(req.body && req.body.pad))), url: page.url(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
   } catch (e) {
     console.error('browse/open error:', e.message);
     res.status(502).json({ error: 'باز کردن سایت ممکن نشد: ' + (e.message || 'خطای نامشخص') });
@@ -2877,7 +2878,7 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
     } else {
       return res.status(400).json({ error: 'عملیات نامعتبر' });
     }
-    res.json({ ...(await browseShot(s.page)), url: s.page.url() });
+    res.json({ ...(await browseShot(s.page, !!(req.body && req.body.pad))), url: s.page.url() });
   } catch (e) {
     console.error('browse/action error:', e.message);
     res.status(502).json({ error: e.message || 'اجرای عملیات ناموفق بود' });
