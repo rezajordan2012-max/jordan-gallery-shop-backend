@@ -2754,6 +2754,8 @@ if (browseCleanupTimer.unref) browseCleanupTimer.unref();
 function isPrivateHost(h) {
   return /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.0\.0\.0|\[::1\])/i.test(String(h || ''));
 }
+const BROWSE_PAD_ENABLED = false; // اسکرین‌شاتِ بزرگ‌تر از دید (captureBeyondViewport) روی بعضی سایت‌ها سفید یا بسیار کند بود؛ فعلاً خاموش است
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 const BROWSE_PAD = 360; // پیکسلِ CSS اضافه بالا و پایینِ دید که همراهِ اسکرین‌شات فرستاده می‌شود
 // اسکرین‌شات را کمی بزرگ‌تر از دید می‌گیرد (بالا و پایین) تا هنگام اسکرول، کلاینت فوراً محتوای کنار را نشان بدهد
 // و هیچ بخشی از صفحه خالی/ناپدید نشود. خروجی: { shot, pad: { top, bottom } }
@@ -2761,14 +2763,14 @@ const BROWSE_PAD = 360; // پیکسلِ CSS اضافه بالا و پایینِ 
 // فقط تا آرام شدنِ تغییراتِ صفحه (DOM) صبر می‌کنیم؛ حداکثر ~۵۰۰ms. اگر کلیک باعثِ رفتن به صفحه‌ی دیگر شد، تا لودِ آن صبر می‌کنیم.
 async function settlePage(page, quietMs, maxMs) {
   try {
-    await page.evaluate((q, m) => new Promise((resolve) => {
+    await withTimeout(page.evaluate((q, m) => new Promise((resolve) => {
       let t = null;
       const end = () => { try { mo.disconnect(); } catch (e) {} clearTimeout(t); clearTimeout(cap); resolve(); };
       const mo = new MutationObserver(() => { clearTimeout(t); t = setTimeout(end, q); });
       mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
       t = setTimeout(end, q);
       const cap = setTimeout(end, m);
-    }), quietMs, maxMs);
+    }), quietMs, maxMs), maxMs + 2500);
   } catch (e) {
     // زمینه‌ی صفحه عوض شده (ناوبری) — کوتاه صبر می‌کنیم تا صفحه‌ی جدید بالا بیاید
     await page.waitForFunction('document.readyState !== "loading"', { timeout: 4000 }).catch(() => {});
@@ -2781,12 +2783,12 @@ async function browseShot(page, wantPad) {
   let pad = { top: 0, bottom: 0 };
   let buf = null;
   try {
-    const m = await page.evaluate(() => {
+    const m = !BROWSE_PAD_ENABLED ? null : await page.evaluate(() => {
       const r = document.scrollingElement || document.documentElement;
       return { y: Math.round(window.scrollY), h: Math.round(r.scrollHeight), ih: window.innerHeight, iw: window.innerWidth, sc: (window.visualViewport && window.visualViewport.scale) || 1 };
     });
     // فقط وقتی کلاینت درخواست کرده و عرضِ صفحه دقیقاً برابرِ دیدِ ۴۱۲ است (وگرنه مختصاتِ کلیک جابه‌جا می‌شد)
-    if (wantPad && m && Math.abs(m.iw - BROWSE_VIEWPORT.width) <= 2 && Math.abs(m.sc - 1) < 0.02 && m.h > m.ih + 8) {
+    if (BROWSE_PAD_ENABLED && wantPad && m && Math.abs(m.iw - BROWSE_VIEWPORT.width) <= 2 && Math.abs(m.sc - 1) < 0.02 && m.h > m.ih + 8) {
       const top = Math.max(0, Math.min(BROWSE_PAD, m.y));
       const bottom = Math.max(0, Math.min(BROWSE_PAD, m.h - m.y - m.ih));
       if (top || bottom) {
@@ -2795,7 +2797,11 @@ async function browseShot(page, wantPad) {
       }
     }
   } catch (e) { buf = null; pad = { top: 0, bottom: 0 }; }
-  if (!buf) buf = await page.screenshot({ ...opts, captureBeyondViewport: false });
+  if (!buf) {
+    buf = await withTimeout(page.screenshot({ ...opts, captureBeyondViewport: false }), 12000);
+    // اسکرین‌شاتِ تقریباً خالی (مثلاً وسطِ ناوبری): یک بار بعد از مکثِ کوتاه دوباره می‌گیریم
+    if (buf && buf.length < 4000) { await sleepMs(600); buf = await withTimeout(page.screenshot({ ...opts, captureBeyondViewport: false }), 12000); }
+  }
   return { shot: `data:image/jpeg;base64,${Buffer.from(buf).toString('base64')}`, pad };
 }
 function getBrowseSession(sid) {
@@ -2880,11 +2886,11 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
         };
       }, x, y);
       if (sel && sel.options.length) return res.json({ select: sel, url: s.page.url() });
-      await s.page.mouse.click(x, y);
+      await withTimeout(s.page.mouse.click(x, y), 6000).catch(() => {});
       await settlePage(s.page, 110, 500);
     } else if (type === 'scroll') {
                   const dy = Math.max(-4000, Math.min(4000, Number(req.body.dy) || 0));
-      await s.page.evaluate(async (d) => {
+      await withTimeout(s.page.evaluate(async (d) => {
         // خاموش کردن اسکرول نرم سایت تا حرکت فوری و دقیق باشد
         if (!document.getElementById('__nosmooth')) {
           const st = document.createElement('style');
@@ -2916,7 +2922,7 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
           same = now === last ? same + 1 : 0;
           last = now;
         }
-      }, dy);
+      }, dy), 8000).catch(() => {});
       // فرصتِ کوتاه برای بارگذاریِ تنبلِ عکس‌ها (تا پایانِ دانلودها، حداکثر ۶۰۰ms)
       await sleepMs(130);
     } else if (type === 'select') {
