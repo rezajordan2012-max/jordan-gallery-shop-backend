@@ -2874,27 +2874,39 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     page.on('request', (r) => {
       const t = r.resourceType();
       const ru = r.url();
-      if (t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat|criteo|taboola|outbrain|newrelic|nr-data|fullstory|quantserve|scorecardresearch/i.test(ru)) {
+      if (t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat|criteo|taboola|outbrain|newrelic|nr-data|fullstory|quantserve|scorecardresearch|go-mpulse|demdex|adobedtm|optimizely|bazaarvoice|yotpo|klaviyo|attentive|tapad|cookielaw|onetrust|cookiebot|trustarc|usercentrics|osano|pinterest|adnxs|adsystem|bing\.com\/bat|ads-twitter|linkedin\.com\/px|intercom|zendesk|livechat|tidio|drift\.com/i.test(ru)) {
         r.abort().catch(() => {});
       } else {
         r.continue().catch(() => {});
       }
     });
+    // انیمیشن‌ها را تقریباً صفر می‌کنیم (CPU کمتر، فریم‌های کمتر، رندر سریع‌تر)؛ نه کاملاً حذف تا رویدادهای animationend/transitionend بیایند
+    await page.evaluateOnNewDocument(() => {
+      const add = () => {
+        const st = document.createElement('style');
+        st.textContent = '*,*::before,*::after{animation-duration:.001s!important;animation-delay:0s!important;animation-iteration-count:1!important;transition-duration:.001s!important;transition-delay:0s!important;scroll-behavior:auto!important}';
+        (document.head || document.documentElement).appendChild(st);
+      };
+      if (document.documentElement) add();
+      else new MutationObserver((m, o) => { if (document.documentElement) { o.disconnect(); add(); } }).observe(document, { childList: true });
+    }).catch(() => {});
     await page.setUserAgent(BROWSE_UA);
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
     const sid = crypto.randomBytes(8).toString('hex');
     browseSessions.set(sid, { page, last: Date.now() });
+    if (req.body && req.body.live) {
+      // حالتِ زنده: منتظرِ لودِ صفحه نمی‌مانیم؛ ناوبری در پس‌زمینه شروع می‌شود و پیشرفتِ لود از جریانِ زنده دیده می‌شود
+      page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      console.log('browse/open live', u.hostname, 'in', Date.now() - t0, 'ms');
+      setTimeout(() => { dismissCookieBanner(page).catch(() => {}); }, 4000);
+      setTimeout(() => { dismissCookieBanner(page).catch(() => {}); }, 9000);
+      return res.json({ sid, shot: '', url: u.toString(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
+    }
     stage = 'goto';
     try {
       await page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 20000 });
     } catch (e) {
       if (!/timeout/i.test(e.message || '')) { await destroyBrowseSession(sid); throw e; }
-    }
-    if (req.body && req.body.live) {
-      // حالتِ زنده: همین‌جا پاسخ می‌دهیم؛ صفحه هنگامِ لود شدن از طریقِ جریانِ زنده دیده می‌شود (مثلِ مرورگرِ واقعی)
-      console.log('browse/open live', u.hostname, 'in', Date.now() - t0, 'ms');
-      setTimeout(() => { dismissCookieBanner(page).catch(() => {}); }, 3000);
-      return res.json({ sid, shot: '', url: page.url(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
     }
     stage = 'settle';
     await settlePage(page, 250, 1400);
@@ -3116,7 +3128,7 @@ app.post('/api/browse/stream', auth, requireAdmin, async (req, res) => {
       if (closed) return;
       try { await cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }); } catch (e) {}
     });
-    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 60, maxWidth: BROWSE_VIEWPORT.width, maxHeight: BROWSE_VIEWPORT.height, everyNthFrame: 1 });
+    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 55, maxWidth: BROWSE_VIEWPORT.width, maxHeight: BROWSE_VIEWPORT.height, everyNthFrame: 2 });
   } catch (e) {
     console.error('browse/stream error:', e.message);
     try { res.write('event: fail\ndata: ' + JSON.stringify({ error: e.message }) + '\n\n'); } catch (e2) {}
@@ -3159,9 +3171,10 @@ app.post('/api/browse/input', auth, requireAdmin, async (req, res) => {
       const dy = Math.max(-3000, Math.min(3000, Number(b.dy) || 0));
       const x = Math.max(1, Math.min(BROWSE_VIEWPORT.width - 1, Number(b.x) || 200));
       const y = Math.max(1, Math.min(BROWSE_VIEWPORT.height - 1, Number(b.y) || 300));
-      if (!dy) return res.json({ ok: true });
+      const dx = Math.max(-3000, Math.min(3000, Number(b.dx) || 0));
+      if (!dy && !dx) return res.json({ ok: true });
       await s.page.mouse.move(x, y);
-      await s.page.mouse.wheel({ deltaY: dy });
+      await s.page.mouse.wheel({ deltaX: dx, deltaY: dy });
       return res.json({ ok: true });
     }
     if (b.kind === 'tap') {
@@ -3169,7 +3182,9 @@ app.post('/api/browse/input', auth, requireAdmin, async (req, res) => {
       if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'مختصات نامعتبر' });
       const probe = await probeBrowseTarget(s.page, x, y).catch(() => null);
       if (probe) return res.json({ ok: true, ...probe, url: s.page.url() });
-      await s.page.mouse.click(x, y);
+      // ضربه‌ی واقعیِ لمسی (touchstart/touchend + click) مثلِ گوشی؛ اگر خطا داد، کلیکِ ماوس
+      await s.page.mouse.move(x, y).catch(() => {});
+      try { await s.page.touchscreen.tap(x, y); } catch (e) { await s.page.mouse.click(x, y); }
       return res.json({ ok: true, url: s.page.url() });
     }
     if (b.kind === 'select') {
