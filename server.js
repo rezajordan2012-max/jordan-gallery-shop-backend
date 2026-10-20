@@ -2804,6 +2804,12 @@ function getBrowseSession(sid) {
   return s || null;
 }
 
+// گرم کردنِ مرورگر: وقتی پنجره‌ی «مرورگر سایت مبدأ» باز می‌شود، Chromium همان لحظه بالا می‌آید تا موقع «باز کن» منتظر راه‌اندازی نمانیم
+app.post('/api/browse/warm', auth, requireAdmin, (req, res) => {
+  if (HEADLESS_BROWSER_ENABLED) getBrowserInstance().catch(() => {});
+  res.json({ ok: true });
+});
+
 app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
   if (!HEADLESS_BROWSER_ENABLED) return res.status(503).json({ error: 'مرورگر هدلس روی سرور فعال نیست (puppeteer-core و @sparticuz/chromium باید نصب باشند)' });
   const u = validateProductUrl(req.body && req.body.url);
@@ -2819,7 +2825,7 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     try {
       const cdp = page.createCDPSession ? await page.createCDPSession() : await page.target().createCDPSession();
       await cdp.send('Network.enable');
-      await cdp.send('Network.setBlockedURLs', { urls: ['*google-analytics*', '*googletagmanager*', '*doubleclick*', '*facebook.net*', '*hotjar*', '*clarity.ms*', '*tiktok*', '*snapchat*', '*.mp4*', '*.webm*', '*.m3u8*'] });
+      await cdp.send('Network.setBlockedURLs', { urls: ['*google-analytics*', '*googletagmanager*', '*doubleclick*', '*facebook.net*', '*hotjar*', '*clarity.ms*', '*tiktok*', '*snapchat*', '*pinterest*', '*criteo*', '*adsystem*', '*adnxs*', '*taboola*', '*outbrain*', '*segment.io*', '*segment.com*', '*newrelic*', '*nr-data*', '*hotjar*', '*fullstory*', '*quantserve*', '*scorecardresearch*', '*.mp4*', '*.webm*', '*.m3u8*'] });
     } catch (e) {
       await page.setRequestInterception(true);
       page.on('request', (r) => {
@@ -2834,11 +2840,11 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     const sid = crypto.randomBytes(8).toString('hex');
     browseSessions.set(sid, { page, last: Date.now() });
     try {
-      await page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 20000 });
     } catch (e) {
       if (!/timeout/i.test(e.message || '')) { await destroyBrowseSession(sid); throw e; }
     }
-    await sleepMs(1100);
+    await settlePage(page, 250, 1400);
     res.json({ sid, ...(await browseShot(page, !!(req.body && req.body.pad))), url: page.url(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
   } catch (e) {
     console.error('browse/open error:', e.message);
