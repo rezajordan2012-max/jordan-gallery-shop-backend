@@ -3182,9 +3182,35 @@ app.post('/api/browse/input', auth, requireAdmin, async (req, res) => {
       if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'مختصات نامعتبر' });
       const probe = await probeBrowseTarget(s.page, x, y).catch(() => null);
       if (probe) return res.json({ ok: true, ...probe, url: s.page.url() });
-      // ضربه‌ی واقعیِ لمسی (touchstart/touchend + click) مثلِ گوشی؛ اگر خطا داد، کلیکِ ماوس
+      // آیا زیرِ انگشت یک «گزینه‌ی منوی کشوییِ سفارشی» (li / role=option ...) است؟ (مثلِ منوی رنگ‌ها در MAC)
+      const optMarked = await s.page.evaluate((px, py) => {
+        document.querySelectorAll('[data-__opt]').forEach((n) => n.removeAttribute('data-__opt'));
+        const el = document.elementsFromPoint(px, py).find((e) => e.closest && e.closest('[role="option"],[role="menuitem"],[role="listbox"] *,li[data-value],[data-value],[class*="option" i],[class*="dropdown" i] li,[class*="select" i] li'));
+        if (!el) return false;
+        const t = el.closest('[role="option"],[role="menuitem"],li,[data-value]') || el;
+        t.setAttribute('data-__opt', '1');
+        return true;
+      }, x, y).catch(() => false);
+      // کلیکِ شبیهِ انسان: اول حرکتِ نشانگر (hover)، بعد فشار، مکثِ کوتاه، رها کردن
       await s.page.mouse.move(x, y).catch(() => {});
-      try { await s.page.touchscreen.tap(x, y); } catch (e) { await s.page.mouse.click(x, y); }
+      await sleepMs(30);
+      await s.page.mouse.down().catch(() => {});
+      await sleepMs(45);
+      await s.page.mouse.up().catch(() => {});
+      if (optMarked) {
+        // اگر بعد از ضربه همان گزینه هنوز روی صفحه است (منو بسته نشده/انتخاب ثبت نشده)، رویدادهای کاملِ pointer/mouse/click را مستقیم روی همان گزینه اجرا می‌کنیم
+        await sleepMs(450);
+        await s.page.evaluate(() => {
+          const t = document.querySelector('[data-__opt]');
+          if (!t) return;
+          t.removeAttribute('data-__opt');
+          if (!t.isConnected || !t.offsetParent) return; // منو بسته شده = ضربه موفق بود
+          const r = t.getBoundingClientRect();
+          const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+          const fire = (type, C) => t.dispatchEvent(new C(type, { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: /down$/.test(type) ? 1 : 0 }));
+          fire('pointerdown', PointerEvent); fire('mousedown', MouseEvent); fire('pointerup', PointerEvent); fire('mouseup', MouseEvent); fire('click', MouseEvent);
+        }).catch(() => {});
+      }
       return res.json({ ok: true, url: s.page.url() });
     }
     if (b.kind === 'select') {
