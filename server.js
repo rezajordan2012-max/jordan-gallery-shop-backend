@@ -2734,7 +2734,7 @@ app.get('/payment/callback', async (req, res) => {
 // هیچ هوش مصنوعی یا سهمیه‌ای مصرف نمی‌شود.
 // ============================================================
 const browseSessions = new Map();
-const BROWSE_VIEWPORT = { width: 412, height: 760, deviceScaleFactor: 1.5, isMobile: true, hasTouch: true };
+const BROWSE_VIEWPORT = { width: 412, height: 760, deviceScaleFactor: 1, isMobile: true, hasTouch: true };
 const BROWSE_IDLE_MS = 12 * 60 * 1000;
 const BROWSE_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -2779,7 +2779,7 @@ async function settlePage(page, quietMs, maxMs) {
 }
 
 async function browseShot(page, wantPad) {
-  const opts = { type: 'jpeg', quality: 58, optimizeForSpeed: true };
+  const opts = { type: 'jpeg', quality: 55, optimizeForSpeed: true };
   let pad = { top: 0, bottom: 0 };
   let buf = null;
   try {
@@ -2798,9 +2798,15 @@ async function browseShot(page, wantPad) {
     }
   } catch (e) { buf = null; pad = { top: 0, bottom: 0 }; }
   if (!buf) {
-    buf = await withTimeout(page.screenshot({ ...opts, captureBeyondViewport: false }), 12000);
+    // تلاشِ اول: اسکرین‌شاتِ معمولی؛ اگر صفحه سنگین/معلق باشد، تبِ مرورگر را جلو می‌آوریم و با روشِ جایگزین (fromSurface:false) دوباره می‌گیریم
+    try {
+      buf = await withTimeout(page.screenshot({ ...opts, captureBeyondViewport: false }), 15000);
+    } catch (e1) {
+      await page.bringToFront().catch(() => {});
+      buf = await withTimeout(page.screenshot({ type: 'jpeg', quality: 45, fromSurface: false, captureBeyondViewport: false }), 20000);
+    }
     // اسکرین‌شاتِ تقریباً خالی (مثلاً وسطِ ناوبری): یک بار بعد از مکثِ کوتاه دوباره می‌گیریم
-    if (buf && buf.length < 4000) { await sleepMs(600); buf = await withTimeout(page.screenshot({ ...opts, captureBeyondViewport: false }), 12000); }
+    if (buf && buf.length < 4000) { await sleepMs(600); buf = await withTimeout(page.screenshot({ ...opts, captureBeyondViewport: false }), 15000).catch(() => buf); }
   }
   return { shot: `data:image/jpeg;base64,${Buffer.from(buf).toString('base64')}`, pad };
 }
@@ -2820,41 +2826,47 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
   if (!HEADLESS_BROWSER_ENABLED) return res.status(503).json({ error: 'مرورگر هدلس روی سرور فعال نیست (puppeteer-core و @sparticuz/chromium باید نصب باشند)' });
   const u = validateProductUrl(req.body && req.body.url);
   if (!u || isPrivateHost(u.hostname)) return res.status(400).json({ error: 'لینک معتبر نیست' });
+  let stage = 'launch';
+  const t0 = Date.now();
   try {
     for (const sid of [...browseSessions.keys()]) await destroyBrowseSession(sid);
     const browser = await getBrowserInstance();
     if (!browser) return res.status(503).json({ error: 'مرورگر هدلس بالا نیامد — /api/ai/headless-status را چک کن' });
     const page = await browser.newPage();
+    await page.bringToFront().catch(() => {}); // تبِ پس‌زمینه گاهی اسکرین‌شات را معلق می‌کند
     page.on('dialog', (d) => d.dismiss().catch(() => {}));
     await page.setViewport(BROWSE_VIEWPORT);
-    // مسدودسازیِ ردیاب‌ها و ویدیو بدون عبور هر درخواست از Node (سریع‌تر از setRequestInterception)
-    try {
-      const cdp = page.createCDPSession ? await page.createCDPSession() : await page.target().createCDPSession();
-      await cdp.send('Network.enable');
-      await cdp.send('Network.setBlockedURLs', { urls: ['*google-analytics*', '*googletagmanager*', '*doubleclick*', '*facebook.net*', '*hotjar*', '*clarity.ms*', '*tiktok*', '*snapchat*', '*pinterest*', '*criteo*', '*adsystem*', '*adnxs*', '*taboola*', '*outbrain*', '*segment.io*', '*segment.com*', '*newrelic*', '*nr-data*', '*hotjar*', '*fullstory*', '*quantserve*', '*scorecardresearch*', '*.mp4*', '*.webm*', '*.m3u8*'] });
-    } catch (e) {
-      await page.setRequestInterception(true);
-      page.on('request', (r) => {
-        const t = r.resourceType();
-        const u = r.url();
-        if (t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat/i.test(u)) r.abort().catch(() => {});
-        else r.continue().catch(() => {});
-      });
-    }
+    // مسدودسازیِ ردیاب‌ها و ویدیو (همان روشِ پایدارِ قبلی؛ فونت‌ها آزاد‌اند تا آیکن‌ها درست دیده شوند)
+    await page.setRequestInterception(true);
+    page.on('request', (r) => {
+      const t = r.resourceType();
+      const ru = r.url();
+      if (t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat|criteo|taboola|outbrain|newrelic|nr-data|fullstory|quantserve|scorecardresearch/i.test(ru)) {
+        r.abort().catch(() => {});
+      } else {
+        r.continue().catch(() => {});
+      }
+    });
     await page.setUserAgent(BROWSE_UA);
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
     const sid = crypto.randomBytes(8).toString('hex');
     browseSessions.set(sid, { page, last: Date.now() });
+    stage = 'goto';
     try {
       await page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 20000 });
     } catch (e) {
       if (!/timeout/i.test(e.message || '')) { await destroyBrowseSession(sid); throw e; }
     }
+    stage = 'settle';
     await settlePage(page, 250, 1400);
-    res.json({ sid, ...(await browseShot(page, !!(req.body && req.body.pad))), url: page.url(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
+    stage = 'screenshot';
+    const tShot = Date.now();
+    const shotData = await browseShot(page, !!(req.body && req.body.pad));
+    console.log('browse/open ok', u.hostname, 'load+settle', tShot - t0, 'ms; shot', Date.now() - tShot, 'ms');
+    res.json({ sid, ...shotData, url: page.url(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
   } catch (e) {
-    console.error('browse/open error:', e.message);
-    res.status(502).json({ error: 'باز کردن سایت ممکن نشد: ' + (e.message || 'خطای نامشخص') });
+    console.error('browse/open error at stage', stage, 'after', Date.now() - t0, 'ms:', e.message);
+    res.status(502).json({ error: 'باز کردن سایت ممکن نشد: ' + (e.message || 'خطای نامشخص') + ' (مرحله: ' + stage + ')' });
   }
 });
 
