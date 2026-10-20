@@ -2831,6 +2831,26 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
     if (type === 'click') {
       const x = Number(req.body.x), y = Number(req.body.y);
       if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'مختصات نامعتبر' });
+      // اگر نقطه‌ی لمس‌شده یک منوی کشویی (select) باشد، مرورگر هدلس منوی بومی را نمی‌کشد؛ پس گزینه‌ها را برای کلاینت می‌فرستیم
+      const sel = await s.page.evaluate((px, py) => {
+        const els = document.elementsFromPoint(px, py);
+        let el = null;
+        for (const e of els) {
+          if (e.tagName === 'SELECT') { el = e; break; }
+          const c = e.closest && e.closest('select');
+          if (c) { el = c; break; }
+          const lab = e.closest && e.closest('label');
+          if (lab && lab.control && lab.control.tagName === 'SELECT') { el = lab.control; break; }
+        }
+        if (!el || el.disabled) return null;
+        document.querySelectorAll('[data-__sel]').forEach((n) => n.removeAttribute('data-__sel'));
+        el.setAttribute('data-__sel', '1');
+        return {
+          multiple: !!el.multiple,
+          options: Array.from(el.options).map((o, i) => ({ i, label: (o.textContent || '').replace(/\s+/g, ' ').trim(), selected: o.selected, disabled: o.disabled })),
+        };
+      }, x, y);
+      if (sel && sel.options.length) return res.json({ select: sel, url: s.page.url() });
       await s.page.mouse.click(x, y);
       // به‌جای ۷۰۰ms صبرِ ثابت: تا آرام شدنِ شبکه صبر می‌کنیم (حداکثر ۱.۵ ثانیه) و بلافاصله اسکرین‌شات می‌گیریم
       await s.page.waitForNetworkIdle({ idleTime: 180, timeout: 1500 }).catch(() => {});
@@ -2872,6 +2892,20 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
       }, dy);
       // فرصتِ کوتاه برای بارگذاریِ تنبلِ عکس‌ها (تا پایانِ دانلودها، حداکثر ۶۰۰ms)
       await s.page.waitForNetworkIdle({ idleTime: 120, timeout: 600 }).catch(() => {});
+    } else if (type === 'select') {
+      const idx = Number(req.body.idx);
+      if (!Number.isInteger(idx) || idx < 0) return res.status(400).json({ error: 'گزینه نامعتبر' });
+      const ok = await s.page.evaluate((i) => {
+        const el = document.querySelector('[data-__sel]');
+        if (!el || !el.options || !el.options[i]) return false;
+        el.selectedIndex = i;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }, idx);
+      if (!ok) return res.status(410).json({ error: 'منوی انتخاب دیگر در صفحه نیست — دوباره روی آن بزن' });
+      await s.page.waitForNetworkIdle({ idleTime: 180, timeout: 2000 }).catch(() => {});
+      await sleepMs(150);
     } else if (type === 'back') {
       await s.page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
       await sleepMs(1800);
