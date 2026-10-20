@@ -2899,7 +2899,7 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     browseSessions.set(sid, { page, last: Date.now() });
     if (req.body && req.body.live) {
       // حالتِ زنده: منتظرِ لودِ صفحه نمی‌مانیم؛ ناوبری در پس‌زمینه شروع می‌شود و پیشرفتِ لود از جریانِ زنده دیده می‌شود
-      page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 30000 }).catch((e) => { const ss = browseSessions.get(sid); if (ss) ss.navError = String(e && e.message || e).slice(0, 160); console.error('browse live goto error:', e && e.message); });
       console.log('browse/open live', u.hostname, 'in', Date.now() - t0, 'ms');
       setTimeout(() => { dismissCookieBanner(page).catch(() => {}); }, 4000);
       setTimeout(() => { dismissCookieBanner(page).catch(() => {}); }, 9000);
@@ -3109,10 +3109,16 @@ app.post('/api/browse/stream', auth, requireAdmin, async (req, res) => {
   let cdp = null;
   let closed = false;
   let hb = null;
+  let pump = null;
+  let stt = null;
+  let lastFrame = Date.now();
+  let pumping = false;
   const stop = async () => {
     if (closed) return;
     closed = true;
     clearInterval(hb);
+    clearInterval(pump);
+    clearInterval(stt);
     if (cdp) { try { await cdp.send('Page.stopScreencast'); } catch (e) {} try { await cdp.detach(); } catch (e) {} }
     try { res.end(); } catch (e) {}
     if (s.stream && s.stream.stop === stop) s.stream = null;
@@ -3125,6 +3131,7 @@ app.post('/api/browse/stream', auth, requireAdmin, async (req, res) => {
     cdp.on('Page.screencastFrame', async (f) => {
       if (closed) return;
       s.last = Date.now();
+      lastFrame = Date.now();
       let ok = true;
       try { ok = res.write('data: ' + JSON.stringify({ d: f.data, u: s.page.url() }) + '\n\n'); } catch (e) { stop(); return; }
       if (!ok) await new Promise((r) => res.once('drain', r)); // اگر اینترنتِ کاربر کند است، فریم‌ها روی هم تلنبار نمی‌شوند
@@ -3132,6 +3139,23 @@ app.post('/api/browse/stream', auth, requireAdmin, async (req, res) => {
       try { await cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }); } catch (e) {}
     });
     await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 55, maxWidth: BROWSE_VIEWPORT.width, maxHeight: BROWSE_VIEWPORT.height, everyNthFrame: 2 });
+    // اگر مدتی هیچ فریمی از screencast نیامد (مثلاً صفحه‌ی بدون تغییر یا مرورگرِ بدونِ رندر)، خودمان اسکرین‌شات می‌گیریم تا تصویر سفید نماند
+    pump = setInterval(async () => {
+      if (closed || pumping || Date.now() - lastFrame < 1500) return;
+      pumping = true;
+      try {
+        const b = await withTimeout(s.page.screenshot({ type: 'jpeg', quality: 50, captureBeyondViewport: false }), 6000);
+        if (!closed) { lastFrame = Date.now(); res.write('data: ' + JSON.stringify({ d: Buffer.from(b).toString('base64'), u: s.page.url() }) + '\n\n'); }
+      } catch (e) { /* بی‌اهمیت */ }
+      pumping = false;
+    }, 800);
+    // وضعیتِ صفحه برای نمایش در اپ (در حال لود؟ عنوان؟ آیا متنی دارد؟ خطای ناوبری؟)
+    stt = setInterval(async () => {
+      if (closed) return;
+      let info = { rs: 'busy', t: '', len: -1 };
+      try { info = await withTimeout(s.page.evaluate(() => ({ rs: document.readyState, t: (document.title || '').slice(0, 60), len: document.body ? (document.body.innerText || '').length : 0 })), 1200); } catch (e) { /* صفحه مشغول است */ }
+      try { res.write('event: st\ndata: ' + JSON.stringify({ ...info, u: s.page.url(), err: s.navError || '' }) + '\n\n'); } catch (e) { /* بی‌اهمیت */ }
+    }, 1500);
   } catch (e) {
     console.error('browse/stream error:', e.message);
     try { res.write('event: fail\ndata: ' + JSON.stringify({ error: e.message }) + '\n\n'); } catch (e2) {}
