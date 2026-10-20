@@ -3266,7 +3266,8 @@ app.post('/api/browse/close', auth, requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/', (req, res) => res.send('Store API is running'));
+const SERVER_VERSION = 'live-browser-v4';
+app.get('/', (req, res) => res.send('Store API is running — ' + SERVER_VERSION));
 
 // جلوگیری از افتادنِ کلِ سرور بر اثرِ خطای ناگهانیِ مرورگرِ هدلس (کرشِ تب، قطعِ CDP و ...)
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e && e.message ? e.message : e));
