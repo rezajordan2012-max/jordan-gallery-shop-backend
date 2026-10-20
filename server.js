@@ -2877,7 +2877,7 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     page.on('request', (r) => {
       const t = r.resourceType();
       const ru = r.url();
-      if (t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat|criteo|taboola|outbrain|newrelic|nr-data|fullstory|quantserve|scorecardresearch|go-mpulse|demdex|adobedtm|optimizely|bazaarvoice|yotpo|klaviyo|attentive|tapad|cookielaw|onetrust|cookiebot|trustarc|usercentrics|osano|pinterest|adnxs|adsystem|bing\.com\/bat|ads-twitter|linkedin\.com\/px|intercom|zendesk|livechat|tidio|drift\.com/i.test(ru)) {
+      if (t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat|criteo|taboola|outbrain|newrelic|nr-data|fullstory|quantserve|scorecardresearch|go-mpulse|demdex|adobedtm|optimizely|bazaarvoice|yotpo|klaviyo|attentive|tapad|cookielaw|onetrust|cookiebot|trustarc|usercentrics|osano|pinterest|adnxs|adsystem|bing\.com\/bat|ads-twitter|linkedin\.com\/px|intercom|zendesk|livechat|tidio|drift\.com|mouseflow|crazyegg|luckyorange|mixpanel|amplitude|braze|onesignal|pushengage|trustpilot|judge\.me|loox|stamped\.io|okendo|gorgias|freshchat|crisp\.chat|tawk\.to|hubspot|marketo|pardot|sentry\.io|datadog|bugsnag|rollbar|logrocket|smartlook|vwo\.com|abtasty|monetate|dynamicyield|nosto|addthis|sharethis|disqus|googlesyndication|adservice|2mdn|youtube\.com\/(embed|iframe)|vimeo/i.test(ru)) {
         r.abort().catch(() => {});
       } else {
         r.continue().catch(() => {});
@@ -3239,14 +3239,14 @@ app.post('/api/browse/input', auth, requireAdmin, async (req, res) => {
       }, x, y).catch(() => false);
       // کلیکِ شبیهِ انسان: اول حرکتِ نشانگر (hover)، بعد فشار، مکثِ کوتاه، رها کردن
       await s.page.mouse.move(x, y).catch(() => {});
-      await sleepMs(30);
+      await sleepMs(12);
       await s.page.mouse.down().catch(() => {});
-      await sleepMs(45);
+      await sleepMs(28);
       await s.page.mouse.up().catch(() => {});
       if (optMarked) {
         // اگر بعد از ضربه همان گزینه هنوز روی صفحه است (منو بسته نشده/انتخاب ثبت نشده)، رویدادهای کاملِ pointer/mouse/click را مستقیم روی همان گزینه اجرا می‌کنیم
-        await sleepMs(450);
-        await s.page.evaluate(() => {
+        // (در پس‌زمینه؛ پاسخِ ضربه منتظرِ آن نمی‌ماند تا سرعت کم نشود)
+        sleepMs(380).then(() => s.page.evaluate(() => {
           const t = document.querySelector('[data-__opt]');
           if (!t) return;
           t.removeAttribute('data-__opt');
@@ -3255,7 +3255,7 @@ app.post('/api/browse/input', auth, requireAdmin, async (req, res) => {
           const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
           const fire = (type, C) => t.dispatchEvent(new C(type, { bubbles: true, cancelable: true, clientX: cx, clientY: cy, view: window, pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, buttons: /down$/.test(type) ? 1 : 0 }));
           fire('pointerdown', PointerEvent); fire('mousedown', MouseEvent); fire('pointerup', PointerEvent); fire('mouseup', MouseEvent); fire('click', MouseEvent);
-        }).catch(() => {});
+        })).catch(() => {});
       }
       return res.json({ ok: true, url: s.page.url() });
     }
@@ -3309,7 +3309,7 @@ app.post('/api/browse/close', auth, requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-const SERVER_VERSION = 'live-browser-v4';
+const SERVER_VERSION = 'live-browser-v5';
 app.get('/', (req, res) => res.send('Store API is running — ' + SERVER_VERSION));
 
 // جلوگیری از افتادنِ کلِ سرور بر اثرِ خطای ناگهانیِ مرورگرِ هدلس (کرشِ تب، قطعِ CDP و ...)
