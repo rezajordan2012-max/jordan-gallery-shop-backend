@@ -2743,6 +2743,7 @@ async function destroyBrowseSession(sid) {
   const s = browseSessions.get(sid);
   if (!s) return;
   browseSessions.delete(sid);
+  if (s.stream) { try { await s.stream.stop(); } catch (e) {} }
   await s.page.close().catch(() => {});
 }
 const browseCleanupTimer = setInterval(() => {
@@ -2888,6 +2889,12 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
       await page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 20000 });
     } catch (e) {
       if (!/timeout/i.test(e.message || '')) { await destroyBrowseSession(sid); throw e; }
+    }
+    if (req.body && req.body.live) {
+      // حالتِ زنده: همین‌جا پاسخ می‌دهیم؛ صفحه هنگامِ لود شدن از طریقِ جریانِ زنده دیده می‌شود (مثلِ مرورگرِ واقعی)
+      console.log('browse/open live', u.hostname, 'in', Date.now() - t0, 'ms');
+      setTimeout(() => { dismissCookieBanner(page).catch(() => {}); }, 3000);
+      return res.json({ sid, shot: '', url: page.url(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
     }
     stage = 'settle';
     await settlePage(page, 250, 1400);
@@ -3071,6 +3078,142 @@ app.post('/api/browse/pick', auth, requireAdmin, async (req, res) => {
   } catch (e) {
     console.error('browse/pick error:', e.message);
     res.status(502).json({ error: e.message || 'انتخاب عکس ناموفق بود' });
+  }
+});
+
+// ============================================================
+// پخش زنده‌ی مرورگر (screencast): به‌جای اسکرین‌شاتِ جدا بعد از هر کار، Chromium خودش فریم‌های صفحه را مداوم می‌فرستد
+// (SSE روی همان اتصالِ POST) و ورودی‌ها (لمس، اسکرول با چرخ، متن، منو) جداگانه و فوری اجرا می‌شوند — مثلِ مرورگرِ واقعی.
+// ============================================================
+app.post('/api/browse/stream', auth, requireAdmin, async (req, res) => {
+  const s = getBrowseSession(req.body && req.body.sid);
+  if (!s) return res.status(410).json({ error: 'نشست مرورگر بسته شده — دوباره لینک را باز کن' });
+  res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  if (res.flushHeaders) res.flushHeaders();
+  if (s.stream) { try { await s.stream.stop(); } catch (e) {} }
+  let cdp = null;
+  let closed = false;
+  let hb = null;
+  const stop = async () => {
+    if (closed) return;
+    closed = true;
+    clearInterval(hb);
+    if (cdp) { try { await cdp.send('Page.stopScreencast'); } catch (e) {} try { await cdp.detach(); } catch (e) {} }
+    try { res.end(); } catch (e) {}
+    if (s.stream && s.stream.stop === stop) s.stream = null;
+  };
+  s.stream = { stop };
+  req.on('close', stop);
+  hb = setInterval(() => { if (!closed) { s.last = Date.now(); try { res.write(': hb\n\n'); } catch (e) {} } }, 8000);
+  try {
+    cdp = s.page.createCDPSession ? await s.page.createCDPSession() : await s.page.target().createCDPSession();
+    cdp.on('Page.screencastFrame', async (f) => {
+      if (closed) return;
+      s.last = Date.now();
+      let ok = true;
+      try { ok = res.write('data: ' + JSON.stringify({ d: f.data, u: s.page.url() }) + '\n\n'); } catch (e) { stop(); return; }
+      if (!ok) await new Promise((r) => res.once('drain', r)); // اگر اینترنتِ کاربر کند است، فریم‌ها روی هم تلنبار نمی‌شوند
+      if (closed) return;
+      try { await cdp.send('Page.screencastFrameAck', { sessionId: f.sessionId }); } catch (e) {}
+    });
+    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 60, maxWidth: BROWSE_VIEWPORT.width, maxHeight: BROWSE_VIEWPORT.height, everyNthFrame: 1 });
+  } catch (e) {
+    console.error('browse/stream error:', e.message);
+    try { res.write('event: fail\ndata: ' + JSON.stringify({ error: e.message }) + '\n\n'); } catch (e2) {}
+    stop();
+  }
+});
+
+// تشخیصِ نوعِ المانِ زیرِ انگشت: منوی کشویی (select) یا فیلدِ متن؛ مرورگرِ هدلس این دو را نمی‌کشد، پس کلاینت خودش نشان می‌دهد
+async function probeBrowseTarget(page, px, py) {
+  return page.evaluate((x, y) => {
+    const els = document.elementsFromPoint(x, y);
+    let sel = null, inp = null;
+    for (const e of els) {
+      if (!sel) {
+        if (e.tagName === 'SELECT') sel = e;
+        else { const c = e.closest && e.closest('select'); if (c) sel = c; else { const lab = e.closest && e.closest('label'); if (lab && lab.control && lab.control.tagName === 'SELECT') sel = lab.control; } }
+      }
+      if (!inp && (e.tagName === 'TEXTAREA' || (e.tagName === 'INPUT' && !/^(checkbox|radio|button|submit|image|reset|file|range|color|hidden)$/i.test(e.type || 'text')))) inp = e;
+      if (sel || inp) break;
+    }
+    document.querySelectorAll('[data-__sel],[data-__inp]').forEach((n) => { n.removeAttribute('data-__sel'); n.removeAttribute('data-__inp'); });
+    if (sel && !sel.disabled) {
+      sel.setAttribute('data-__sel', '1');
+      return { select: { multiple: !!sel.multiple, options: Array.from(sel.options).map((o, i) => ({ i, label: (o.textContent || '').replace(/\s+/g, ' ').trim(), selected: o.selected, disabled: o.disabled })) } };
+    }
+    if (inp && !inp.disabled && !inp.readOnly) {
+      inp.setAttribute('data-__inp', '1');
+      return { input: { value: inp.value || '', type: inp.type || 'text', placeholder: inp.placeholder || '', area: inp.tagName === 'TEXTAREA' } };
+    }
+    return null;
+  }, px, py);
+}
+
+app.post('/api/browse/input', auth, requireAdmin, async (req, res) => {
+  const s = getBrowseSession(req.body && req.body.sid);
+  if (!s) return res.status(410).json({ error: 'نشست مرورگر بسته شده — دوباره لینک را باز کن' });
+  const b = req.body || {};
+  try {
+    if (b.kind === 'wheel') {
+      const dy = Math.max(-3000, Math.min(3000, Number(b.dy) || 0));
+      const x = Math.max(1, Math.min(BROWSE_VIEWPORT.width - 1, Number(b.x) || 200));
+      const y = Math.max(1, Math.min(BROWSE_VIEWPORT.height - 1, Number(b.y) || 300));
+      if (!dy) return res.json({ ok: true });
+      await s.page.mouse.move(x, y);
+      await s.page.mouse.wheel({ deltaY: dy });
+      return res.json({ ok: true });
+    }
+    if (b.kind === 'tap') {
+      const x = Number(b.x), y = Number(b.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return res.status(400).json({ error: 'مختصات نامعتبر' });
+      const probe = await probeBrowseTarget(s.page, x, y).catch(() => null);
+      if (probe) return res.json({ ok: true, ...probe, url: s.page.url() });
+      await s.page.mouse.click(x, y);
+      return res.json({ ok: true, url: s.page.url() });
+    }
+    if (b.kind === 'select') {
+      const idx = Number(b.idx);
+      const ok = await s.page.evaluate((i) => {
+        const el = document.querySelector('[data-__sel]');
+        if (!el || !el.options || !el.options[i]) return false;
+        el.selectedIndex = i;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }, idx);
+      if (!ok) return res.status(410).json({ error: 'منوی انتخاب دیگر در صفحه نیست — دوباره روی آن بزن' });
+      return res.json({ ok: true });
+    }
+    if (b.kind === 'text') {
+      const value = String(b.value == null ? '' : b.value).slice(0, 2000);
+      const ok = await s.page.evaluate((v) => {
+        const el = document.querySelector('[data-__inp]');
+        if (!el) return false;
+        const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.focus();
+        return true;
+      }, value);
+      if (!ok) return res.status(410).json({ error: 'فیلد متن دیگر در صفحه نیست — دوباره روی آن بزن' });
+      if (b.submit) await s.page.keyboard.press('Enter');
+      return res.json({ ok: true });
+    }
+    if (b.kind === 'back') { await s.page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {}); return res.json({ ok: true, url: s.page.url() }); }
+    if (b.kind === 'forward') { await s.page.goForward({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {}); return res.json({ ok: true, url: s.page.url() }); }
+    if (b.kind === 'reload') { await s.page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}); return res.json({ ok: true, url: s.page.url() }); }
+    if (b.kind === 'goto') {
+      const u = validateProductUrl(b.url);
+      if (!u || isPrivateHost(u.hostname)) return res.status(400).json({ error: 'لینک معتبر نیست' });
+      await s.page.goto(u.toString(), { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      return res.json({ ok: true, url: s.page.url() });
+    }
+    return res.status(400).json({ error: 'عملیات نامعتبر' });
+  } catch (e) {
+    console.error('browse/input error:', e.message);
+    res.status(502).json({ error: e.message || 'اجرای عملیات ناموفق بود' });
   }
 });
 
