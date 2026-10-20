@@ -3163,6 +3163,25 @@ app.post('/api/browse/stream', auth, requireAdmin, async (req, res) => {
   }
 });
 
+// نسخه‌ی مطمئنِ «زنده»: کلاینت هر چند صدمیلی‌ثانیه یک اسکرین‌شاتِ ساده می‌خواهد (درخواست/پاسخِ معمولی، بدونِ اتصالِ استریم که
+// روی بعضی شبکه‌ها قطع می‌شد). اگر صفحه تغییری نکرده باشد، فقط {same:true} برمی‌گردد (ترافیکِ کم).
+app.post('/api/browse/frame', auth, requireAdmin, async (req, res) => {
+  const s = getBrowseSession(req.body && req.body.sid);
+  if (!s) return res.status(410).json({ error: 'نشست مرورگر بسته شده — دوباره لینک را باز کن' });
+  try {
+    let info = null;
+    const infoP = withTimeout(s.page.evaluate(() => ({ rs: document.readyState, t: (document.title || '').slice(0, 60), len: document.body ? (document.body.innerText || '').length : 0 })), 700).then((v) => { info = v; }).catch(() => { info = { rs: 'busy', t: '', len: -1 }; });
+    const buf = await withTimeout(s.page.screenshot({ type: 'jpeg', quality: 55, optimizeForSpeed: true, captureBeyondViewport: false }), 9000);
+    await infoP;
+    const st = { ...info, u: s.page.url(), err: s.navError || '' };
+    const etag = crypto.createHash('md5').update(buf).digest('hex');
+    if (req.body && req.body.etag === etag) return res.json({ same: true, st });
+    res.json({ d: Buffer.from(buf).toString('base64'), etag, u: s.page.url(), st });
+  } catch (e) {
+    res.status(504).json({ error: 'اسکرین‌شات دیر رسید: ' + (e && e.message ? e.message : 'خطا') });
+  }
+});
+
 // تشخیصِ نوعِ المانِ زیرِ انگشت: منوی کشویی (select) یا فیلدِ متن؛ مرورگرِ هدلس این دو را نمی‌کشد، پس کلاینت خودش نشان می‌دهد
 async function probeBrowseTarget(page, px, py) {
   return page.evaluate((x, y) => {
