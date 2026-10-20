@@ -1480,7 +1480,7 @@ async function getBrowserInstance() {
   browserInstancePromise = (async () => {
     const executablePath = await chromiumPkg.executablePath();
     return puppeteerCore.launch({
-      args: [...chromiumPkg.args, '--disable-dev-shm-usage', '--no-sandbox'],
+      args: [...chromiumPkg.args, '--disable-dev-shm-usage', '--no-sandbox', '--disable-extensions', '--disable-background-networking', '--js-flags=--max-old-space-size=256'],
       defaultViewport: { width: 1280, height: 1800 },
       executablePath,
       headless: chromiumPkg.headless !== undefined ? chromiumPkg.headless : true,
@@ -2866,6 +2866,9 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     const browser = await getBrowserInstance();
     if (!browser) return res.status(503).json({ error: 'مرورگر هدلس بالا نیامد — /api/ai/headless-status را چک کن' });
     const page = await browser.newPage();
+    // بدونِ شنونده، رویدادِ 'error' (کرشِ تب، مثلاً کمبودِ حافظه) کلِ سرور را از کار می‌انداخت
+    page.on('error', (e) => console.error('browse page crashed:', e && e.message));
+    page.on('pageerror', () => {});
     await page.bringToFront().catch(() => {}); // تبِ پس‌زمینه گاهی اسکرین‌شات را معلق می‌کند
     page.on('dialog', (d) => d.dismiss().catch(() => {}));
     await page.setViewport(BROWSE_VIEWPORT);
@@ -3264,6 +3267,10 @@ app.post('/api/browse/close', auth, requireAdmin, async (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('Store API is running'));
+
+// جلوگیری از افتادنِ کلِ سرور بر اثرِ خطای ناگهانیِ مرورگرِ هدلس (کرشِ تب، قطعِ CDP و ...)
+process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e && e.message ? e.message : e));
+process.on('uncaughtException', (e) => console.error('uncaughtException:', e && e.message ? e.message : e));
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
