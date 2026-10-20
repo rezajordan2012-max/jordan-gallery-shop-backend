@@ -2757,6 +2757,25 @@ function isPrivateHost(h) {
 const BROWSE_PAD = 360; // پیکسلِ CSS اضافه بالا و پایینِ دید که همراهِ اسکرین‌شات فرستاده می‌شود
 // اسکرین‌شات را کمی بزرگ‌تر از دید می‌گیرد (بالا و پایین) تا هنگام اسکرول، کلاینت فوراً محتوای کنار را نشان بدهد
 // و هیچ بخشی از صفحه خالی/ناپدید نشود. خروجی: { shot, pad: { top, bottom } }
+// صبرِ هوشمند بعد از کلیک: به‌جای انتظار برای «ساکت شدنِ شبکه» (که در سایت‌هایی با آنالیتیکس هر بار ۱.۵ ثانیه تلف می‌کرد)،
+// فقط تا آرام شدنِ تغییراتِ صفحه (DOM) صبر می‌کنیم؛ حداکثر ~۵۰۰ms. اگر کلیک باعثِ رفتن به صفحه‌ی دیگر شد، تا لودِ آن صبر می‌کنیم.
+async function settlePage(page, quietMs, maxMs) {
+  try {
+    await page.evaluate((q, m) => new Promise((resolve) => {
+      let t = null;
+      const end = () => { try { mo.disconnect(); } catch (e) {} clearTimeout(t); clearTimeout(cap); resolve(); };
+      const mo = new MutationObserver(() => { clearTimeout(t); t = setTimeout(end, q); });
+      mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+      t = setTimeout(end, q);
+      const cap = setTimeout(end, m);
+    }), quietMs, maxMs);
+  } catch (e) {
+    // زمینه‌ی صفحه عوض شده (ناوبری) — کوتاه صبر می‌کنیم تا صفحه‌ی جدید بالا بیاید
+    await page.waitForFunction('document.readyState !== "loading"', { timeout: 4000 }).catch(() => {});
+    await sleepMs(250);
+  }
+}
+
 async function browseShot(page, wantPad) {
   const opts = { type: 'jpeg', quality: 58, optimizeForSpeed: true };
   let pad = { top: 0, bottom: 0 };
@@ -2796,16 +2815,20 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     const page = await browser.newPage();
     page.on('dialog', (d) => d.dismiss().catch(() => {}));
     await page.setViewport(BROWSE_VIEWPORT);
-        await page.setRequestInterception(true);
-    page.on('request', (r) => {
-      const t = r.resourceType();
-      const u = r.url();
-      if (t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat/i.test(u)) {
-        r.abort().catch(() => {});
-      } else {
-        r.continue().catch(() => {});
-      }
-    });
+    // مسدودسازیِ ردیاب‌ها و ویدیو بدون عبور هر درخواست از Node (سریع‌تر از setRequestInterception)
+    try {
+      const cdp = page.createCDPSession ? await page.createCDPSession() : await page.target().createCDPSession();
+      await cdp.send('Network.enable');
+      await cdp.send('Network.setBlockedURLs', { urls: ['*google-analytics*', '*googletagmanager*', '*doubleclick*', '*facebook.net*', '*hotjar*', '*clarity.ms*', '*tiktok*', '*snapchat*', '*.mp4*', '*.webm*', '*.m3u8*'] });
+    } catch (e) {
+      await page.setRequestInterception(true);
+      page.on('request', (r) => {
+        const t = r.resourceType();
+        const u = r.url();
+        if (t === 'media' || /google-analytics|googletagmanager|doubleclick|facebook\.net|hotjar|clarity\.ms|tiktok|snapchat/i.test(u)) r.abort().catch(() => {});
+        else r.continue().catch(() => {});
+      });
+    }
     await page.setUserAgent(BROWSE_UA);
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
     const sid = crypto.randomBytes(8).toString('hex');
@@ -2815,7 +2838,7 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     } catch (e) {
       if (!/timeout/i.test(e.message || '')) { await destroyBrowseSession(sid); throw e; }
     }
-    await sleepMs(1800);
+    await sleepMs(1100);
     res.json({ sid, ...(await browseShot(page, !!(req.body && req.body.pad))), url: page.url(), width: BROWSE_VIEWPORT.width, height: BROWSE_VIEWPORT.height });
   } catch (e) {
     console.error('browse/open error:', e.message);
@@ -2852,9 +2875,7 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
       }, x, y);
       if (sel && sel.options.length) return res.json({ select: sel, url: s.page.url() });
       await s.page.mouse.click(x, y);
-      // به‌جای ۷۰۰ms صبرِ ثابت: تا آرام شدنِ شبکه صبر می‌کنیم (حداکثر ۱.۵ ثانیه) و بلافاصله اسکرین‌شات می‌گیریم
-      await s.page.waitForNetworkIdle({ idleTime: 180, timeout: 1500 }).catch(() => {});
-      await sleepMs(120);
+      await settlePage(s.page, 110, 500);
     } else if (type === 'scroll') {
                   const dy = Math.max(-4000, Math.min(4000, Number(req.body.dy) || 0));
       await s.page.evaluate(async (d) => {
@@ -2891,7 +2912,7 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
         }
       }, dy);
       // فرصتِ کوتاه برای بارگذاریِ تنبلِ عکس‌ها (تا پایانِ دانلودها، حداکثر ۶۰۰ms)
-      await s.page.waitForNetworkIdle({ idleTime: 120, timeout: 600 }).catch(() => {});
+      await sleepMs(130);
     } else if (type === 'select') {
       const idx = Number(req.body.idx);
       if (!Number.isInteger(idx) || idx < 0) return res.status(400).json({ error: 'گزینه نامعتبر' });
@@ -2904,8 +2925,7 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
         return true;
       }, idx);
       if (!ok) return res.status(410).json({ error: 'منوی انتخاب دیگر در صفحه نیست — دوباره روی آن بزن' });
-      await s.page.waitForNetworkIdle({ idleTime: 180, timeout: 2000 }).catch(() => {});
-      await sleepMs(150);
+      await settlePage(s.page, 110, 600);
     } else if (type === 'back') {
       await s.page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
       await sleepMs(1800);
