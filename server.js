@@ -2778,6 +2778,38 @@ async function settlePage(page, quietMs, maxMs) {
   }
 }
 
+// صبر تا عکس‌های داخلِ دیدِ صفحه واقعاً لود شوند (سایت‌هایی مثل MAC عکس و کارت‌ها را تنبل/با تأخیر می‌کشند و تا آن موقع سفید می‌مانند).
+// عکس‌های lazy را هم اجباراً eager می‌کنیم تا بلافاصله بارگیری شوند.
+async function waitVisibleImages(page, maxMs) {
+  try {
+    await withTimeout(page.evaluate(async (m) => {
+      const vh = window.innerHeight;
+      const imgs = Array.from(document.images).filter((i) => {
+        const r = i.getBoundingClientRect();
+        return r.width > 8 && r.bottom > -300 && r.top < vh + 300;
+      });
+      imgs.forEach((i) => { try { if (i.loading === 'lazy') i.loading = 'eager'; } catch (e) {} });
+      const pend = imgs.filter((i) => !(i.complete && i.naturalWidth > 0)).map((i) => new Promise((r) => {
+        i.addEventListener('load', r, { once: true });
+        i.addEventListener('error', r, { once: true });
+      }));
+      if (pend.length) await Promise.race([Promise.all(pend), new Promise((r) => setTimeout(r, m))]);
+    }, maxMs), maxMs + 2500);
+  } catch (e) { /* بی‌اهمیت */ }
+}
+// بستنِ خودکارِ بنرِ کوکی که نیمی از صفحه را می‌پوشاند (بهترین تلاش؛ اگر نبود چیزی تغییر نمی‌کند)
+async function dismissCookieBanner(page) {
+  try {
+    await withTimeout(page.evaluate(() => {
+      const direct = document.querySelector('#onetrust-accept-btn-handler, [id*="accept-all" i], [data-testid*="accept" i], button[aria-label*="accept all" i]');
+      if (direct) { direct.click(); return true; }
+      const btn = Array.from(document.querySelectorAll('button, a[role="button"], [role="button"]')).find((b) => /^(accept all( cookies)?|accept|i agree|agree|allow all|got it|ok)$/i.test((b.textContent || '').replace(/\s+/g, ' ').trim()));
+      if (btn) { btn.click(); return true; }
+      return false;
+    }), 2000);
+  } catch (e) { /* بی‌اهمیت */ }
+}
+
 async function browseShot(page, wantPad) {
   const opts = { type: 'jpeg', quality: 55, optimizeForSpeed: true };
   let pad = { top: 0, bottom: 0 };
@@ -2859,6 +2891,8 @@ app.post('/api/browse/open', auth, requireAdmin, async (req, res) => {
     }
     stage = 'settle';
     await settlePage(page, 250, 1400);
+    await dismissCookieBanner(page);
+    await waitVisibleImages(page, 2200);
     stage = 'screenshot';
     const tShot = Date.now();
     const shotData = await browseShot(page, !!(req.body && req.body.pad));
@@ -2900,6 +2934,7 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
       if (sel && sel.options.length) return res.json({ select: sel, url: s.page.url() });
       await withTimeout(s.page.mouse.click(x, y), 6000).catch(() => {});
       await settlePage(s.page, 110, 500);
+      await waitVisibleImages(s.page, 1200);
     } else if (type === 'scroll') {
                   const dy = Math.max(-4000, Math.min(4000, Number(req.body.dy) || 0));
       await withTimeout(s.page.evaluate(async (d) => {
@@ -2936,7 +2971,8 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
         }
       }, dy), 8000).catch(() => {});
       // فرصتِ کوتاه برای بارگذاریِ تنبلِ عکس‌ها (تا پایانِ دانلودها، حداکثر ۶۰۰ms)
-      await sleepMs(130);
+      await settlePage(s.page, 130, 700);
+      await waitVisibleImages(s.page, 1500);
     } else if (type === 'select') {
       const idx = Number(req.body.idx);
       if (!Number.isInteger(idx) || idx < 0) return res.status(400).json({ error: 'گزینه نامعتبر' });
@@ -2950,6 +2986,7 @@ app.post('/api/browse/action', auth, requireAdmin, async (req, res) => {
       }, idx);
       if (!ok) return res.status(410).json({ error: 'منوی انتخاب دیگر در صفحه نیست — دوباره روی آن بزن' });
       await settlePage(s.page, 110, 600);
+      await waitVisibleImages(s.page, 1200);
     } else if (type === 'back') {
       await s.page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
       await sleepMs(1800);
