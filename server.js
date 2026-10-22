@@ -110,7 +110,8 @@ function defaultState() {
 async function getCollection() {
   if (!mongoClientPromise) {
     const client = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 8000 });
-    mongoClientPromise = client.connect().then(() => client);
+    // اگر اتصال یک بار شکست خورد، نتیجه‌ی ناموفق برای همیشه کش نشود (وگرنه تا ری‌استارتِ سرور همه‌ی درخواست‌ها خطا می‌دهند)
+    mongoClientPromise = client.connect().then(() => client).catch((e) => { mongoClientPromise = null; try { client.close(); } catch (e2) {} throw e; });
   }
   const client = await mongoClientPromise;
   return client.db('jordan_gallery').collection('store_state');
@@ -3309,7 +3310,7 @@ app.post('/api/browse/close', auth, requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-const SERVER_VERSION = 'live-browser-v5';
+const SERVER_VERSION = 'live-browser-v6';
 app.get('/', (req, res) => res.send('Store API is running — ' + SERVER_VERSION));
 
 // جلوگیری از افتادنِ کلِ سرور بر اثرِ خطای ناگهانیِ مرورگرِ هدلس (کرشِ تب، قطعِ CDP و ...)
